@@ -1,0 +1,1252 @@
+##MD
+# 01 — Prerequisites: Linux, Networking, and Containers
+
+**Phase 1: Prerequisites**
+
+**What you will learn**
+- Linux processes and systemd — how services run on every Kubernetes node.
+- Linux **namespaces** and **cgroups** — the two kernel features that *are* containers.
+- Networking: TCP/IP, IP addresses, ports, routing, DNS, HTTP, HTTPS/TLS, firewalls, load balancing.
+- Docker: images, layers, containers, registries, Dockerfiles, multi-stage builds, container networking, volumes.
+
+**Time:** 4–6 hours (do it over 2–3 sessions).
+
+**Prerequisites:** Notebook 00 done. Docker (or Colima) is running.
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift + Enter**.
+- Your Mac is not Linux. So the Linux labs run **inside containers**. A `--privileged` container lets us use kernel features safely, without touching your Mac.
+- Labs write files to `labs/01/`.
+- Each section ends with **Check yourself**. Answer before you open the answer.
+
+**Why this notebook matters:** Most hard Kubernetes problems are really Linux or network problems. `OOMKilled` is a cgroup. A Service is iptables rules. A failing pod is often DNS. Learn these once and Kubernetes becomes much easier.
+
+##MD
+### Lab check: is the container engine running?
+Every lab in this notebook needs Docker. This cell stops if the engine is not running.
+
+##CODE
+%%bash
+mkdir -p labs/01
+docker info >/dev/null 2>&1 || { echo "STOP: Docker engine not running. Run 'colima start' or open Docker Desktop."; exit 1; }
+echo "OK: Docker engine is running"
+# Pre-pull images used in this notebook (saves waiting later).
+for img in ubuntu:24.04 nicolaka/netshoot:latest nginx:1.27 traefik/whoami:latest python:3.12-alpine golang:1.22-alpine gcr.io/distroless/static-debian12:nonroot registry:2 alpine:3.20; do
+  docker pull -q "$img" >/dev/null && echo "pulled $img"
+done
+
+##MD
+---
+# Part A — Linux
+
+## A1. Processes and systemd
+
+### What is it?
+- A **process** is a running program. It has a **PID** (process ID), an owner (user), memory, and open files.
+- **PID 1** is the first process. It starts all others and cleans up dead children.
+- **systemd** is the PID 1 on most Linux servers (RHEL, Oracle Linux, Ubuntu). It starts and watches **services** (also called **units**).
+- **journald** stores service logs. You read them with `journalctl`.
+
+### Why do we need it for Kubernetes?
+On every Kubernetes node, the **kubelet** (the node agent) and **containerd** (the container runtime) run as systemd services. When a node goes `NotReady`, the first checks are `systemctl status kubelet` and `journalctl -u kubelet`. On OKE worker nodes this is exactly what you do over SSH.
+
+### How it works
+```
+PID 1: systemd
+ ├── containerd.service   → starts container processes (your pods)
+ │     └── containerd-shim → nginx (PID 4321)  ← a container is just a process
+ ├── kubelet.service      → talks to API server, asks containerd to run pods
+ └── sshd.service
+```
+A container is **not** a small VM. It is a normal Linux process with extra isolation (see A2).
+
+### Real production scenario
+Your OKE worker node shows `NotReady`. Pods on it are being evicted. You SSH to the node. `systemctl status kubelet` says `failed`. `journalctl -u kubelet -n 50` shows `failed to load kubelet config file`. Someone edited the config. You fix it and run `systemctl restart kubelet`. The node becomes `Ready`.
+
+### Hands-on lab
+The kind node from notebook 00 is a real Linux system with systemd. We use it like an SSH session. `docker exec <container> <cmd>` runs a command inside the node container.
+
+##CODE
+%%bash
+# Which process is PID 1 inside the kind node? (Expect: systemd)
+docker exec learn-worker cat /proc/1/comm
+echo "---- systemd services that matter for Kubernetes ----"
+docker exec learn-worker systemctl is-active kubelet containerd
+echo "---- kubelet service status (first lines) ----"
+docker exec learn-worker systemctl status kubelet --no-pager | head -8
+
+##MD
+**Expected output:**
+```
+systemd
+---- systemd services that matter for Kubernetes ----
+active
+active
+---- kubelet service status (first lines) ----
+● kubelet.service - kubelet: The Kubernetes Node Agent
+     Loaded: loaded (/etc/systemd/system/kubelet.service; enabled; ...)
+     Active: active (running) since ...
+   Main PID: 2xx (kubelet)
+```
+
+Now read logs with `journalctl`. `-u` = unit, `-n` = number of lines, `--no-pager` = print directly.
+
+##CODE
+%%bash
+docker exec learn-worker journalctl -u kubelet -n 10 --no-pager
+echo "---- container processes are normal processes on the node ----"
+docker exec learn-worker sh -c 'ps -eo pid,user,comm 2>/dev/null | head -20 || ls /proc | grep -E "^[0-9]+$" | head'
+
+##MD
+**Expected output:** kubelet log lines (lines start with `I` = info, `W` = warning, `E` = error), then a process list including `systemd`, `containerd`, `kubelet`, `containerd-shim`, and processes like `kube-proxy` or `kindnetd` — those are containers, seen as plain processes.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix / command |
+|---|---|---|
+| Node `NotReady` | kubelet stopped or crashing | `systemctl status kubelet`, `journalctl -u kubelet -n 100` |
+| kubelet logs: `container runtime is down` | containerd stopped | `systemctl restart containerd` |
+| Service starts then stops | Bad config file, missing cert | `journalctl -u <svc> -b` (logs since boot) |
+| Zombie processes pile up | App runs as PID 1 in a container and does not reap children | Use an init (`tini`, `docker run --init`) or fix the app |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| `docker exec` into a kind node | SSH (or OCI Bastion) to the worker, with audited access |
+| Restart kubelet freely | Cordon and drain the node first, then restart, to avoid downtime |
+| Read logs by hand | Ship node logs (journald) to central logging (ELK, Loki, OCI Logging) |
+
+### Check yourself
+1. What is PID 1 on a normal Linux server?
+2. Which two systemd services are critical on a Kubernetes node?
+3. How do you read the last 100 kubelet log lines?
+4. Is a container a VM?
+
+<details><summary>Answer</summary>
+
+1. systemd.
+2. kubelet and the container runtime (containerd).
+3. `journalctl -u kubelet -n 100 --no-pager`.
+4. No. It is a normal Linux process with namespaces and cgroups applied.
+</details>
+
+##MD
+## A2. Namespaces and cgroups — what a container really is
+
+### What is it?
+- A **namespace** changes what a process can **see**. Types: `pid` (process list), `net` (network interfaces, IPs, routes), `mnt` (filesystems), `uts` (hostname), `ipc`, `user`, `cgroup`.
+- A **cgroup** (control group) limits what a process can **use**: CPU, memory, disk I/O, number of processes.
+
+**Container = process + namespaces (isolation) + cgroups (limits) + a filesystem image.**
+
+### Why do we need it?
+Without namespaces, every app sees every other app's processes and ports. Without cgroups, one app with a memory leak can use all RAM and crash the whole server.
+
+### How it works internally
+```
+          Linux kernel
+   ┌──────────────────────────────────────────┐
+   │  cgroup: memory.max = 256Mi, cpu.max = ½ │  ← limits (Kubernetes "limits")
+   │  ┌───────────── namespaces ────────────┐ │
+   │  │ pid: sees only its own processes    │ │
+   │  │ net: own eth0, own IP, own ports    │ │  ← isolation
+   │  │ mnt: own root filesystem (image)    │ │
+   │  │ uts: own hostname                   │ │
+   │  │      process: nginx (PID 1 inside)  │ │
+   │  └─────────────────────────────────────┘ │
+   └──────────────────────────────────────────┘
+```
+
+**Kubernetes link:**
+- A **Pod** = a group of containers that **share** the `net` namespace (same IP, talk over `localhost`) and can share volumes.
+- `resources.limits.memory` in a pod becomes a cgroup `memory.max`. Use more → the kernel kills the process → Kubernetes shows **OOMKilled**.
+- `resources.limits.cpu` becomes `cpu.max`. Use more → the process is **throttled** (slowed), not killed.
+
+### Real production scenario
+A Laravel app on your cluster restarts every 20 minutes. `kubectl describe pod` shows `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`. The memory limit is 256Mi but a report job needs 400Mi. You raise the limit and fix the job's memory use. Now you know: 137 = 128 + 9 (signal 9, SIGKILL from the kernel OOM killer).
+
+### Hands-on lab 1: namespaces
+We start a privileged Ubuntu container and use `unshare`. `unshare` runs a program in **new** namespaces.
+
+##CODE
+%%bash
+docker run --rm --privileged ubuntu:24.04 bash -c '
+apt-get update -qq >/dev/null && apt-get install -y -qq procps iproute2 >/dev/null 2>&1
+echo "== 1. Normal view: processes in this container =="
+ps -e --no-headers | wc -l
+echo "== 2. New PID namespace: the shell thinks it is PID 1 =="
+unshare --pid --fork --mount-proc bash -c "echo My PID is \$\$; ps -e"
+echo "== 3. New NET namespace: only a loopback interface, no IP, no internet =="
+unshare --net ip -brief addr
+echo "== 4. New UTS namespace: change hostname without affecting anything else =="
+unshare --uts bash -c "hostname payments-pod; echo inside: \$(hostname)"
+echo "outside: $(hostname)"
+'
+
+##MD
+**Expected output:**
+```
+== 1. Normal view: processes in this container ==
+2
+== 2. New PID namespace: the shell thinks it is PID 1 ==
+My PID is 1
+    PID TTY          TIME CMD
+      1 ?        00:00:00 bash
+      3 ?        00:00:00 ps
+== 3. New NET namespace: only a loopback interface, no IP, no internet ==
+lo               DOWN
+== 4. New UTS namespace: change hostname without affecting anything else ==
+inside: payments-pod
+outside: 3f2a1b...
+```
+You just built the core of a container by hand. Docker, containerd, and Kubernetes do the same thing with more automation.
+
+### Hands-on lab 2: cgroups
+`-m 128m` sets a memory limit. `--cpus 0.5` sets half a CPU. We read the cgroup files the kernel created.
+
+##CODE
+%%bash
+echo "== cgroup files inside a limited container =="
+docker run --rm -m 128m --cpus 0.5 alpine:3.20 sh -c '
+echo "memory.max = $(cat /sys/fs/cgroup/memory.max) bytes  (128 MiB = 134217728)"
+echo "cpu.max    = $(cat /sys/fs/cgroup/cpu.max)  (50000 of every 100000 microseconds = 0.5 CPU)"'
+
+##MD
+Now break it on purpose. The Python program tries to allocate 200 MiB inside a 64 MiB limit. The kernel kills it.
+
+##CODE
+%%bash
+docker rm -f memtest >/dev/null 2>&1
+docker run --name memtest -m 64m --memory-swap 64m python:3.12-alpine \
+  python -c "b = bytearray(200 * 1024 * 1024); print('allocated')" || true
+echo "---- what Docker recorded ----"
+docker inspect memtest --format 'OOMKilled={{.State.OOMKilled}}  ExitCode={{.State.ExitCode}}'
+docker rm memtest >/dev/null
+
+##MD
+**Expected output:**
+```
+---- what Docker recorded ----
+OOMKilled=true  ExitCode=137
+```
+In Kubernetes you see the same: `Reason: OOMKilled`, `Exit Code: 137`.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Exit code 137, `OOMKilled` | Process used more than its memory limit | Raise limit, or fix memory use. Check with `kubectl top pod` |
+| App is slow, CPU looks low on the node | CPU **throttling** from a low CPU limit | Check `cpu.stat` → `nr_throttled`; raise or remove CPU limit |
+| Java/Node app OOMKilled with "enough" limit | Runtime heap not sized to the cgroup | Set `-XX:MaxRAMPercentage` (Java) or `--max-old-space-size` (Node) |
+| `unshare: operation not permitted` | Container not privileged | Lab only: add `--privileged` |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| `--privileged` container to play with namespaces | **Never** run app pods privileged. It removes isolation (notebook 08) |
+| Manual `-m` limits | Requests and limits on every container, plus LimitRange defaults per namespace (notebook 07) |
+| One OOM, read by hand | Alert on OOMKilled and restarts (Prometheus `kube_pod_container_status_last_terminated_reason`) |
+
+### Check yourself
+1. Namespaces control what a process can ___. Cgroups control what it can ___.
+2. Which namespace do containers in the same Pod share?
+3. What exit code means "killed by the OOM killer", and why that number?
+4. What happens when a container goes over its CPU limit?
+
+<details><summary>Answer</summary>
+
+1. See; use.
+2. The network namespace (same IP, same ports, `localhost`). Also IPC, and optionally PID.
+3. 137 = 128 + signal 9 (SIGKILL).
+4. It is throttled (slowed down). It is not killed.
+</details>
+
+##MD
+---
+# Part B — Networking
+
+## B1. TCP/IP, IP addresses, ports, and routing
+
+### What is it?
+- **IP address** — the address of a network interface, e.g. `10.0.1.15`.
+- **CIDR** — a range of addresses. `10.0.0.0/16` = first 16 bits fixed = 65,536 addresses. `/24` = 256 addresses.
+- **Port** — a number (0–65535) that picks one program on a host. HTTP = 80, HTTPS = 443, SSH = 22, DNS = 53.
+- **TCP** — reliable, ordered, connection-based (3-way handshake: SYN, SYN-ACK, ACK). Used by HTTP, databases.
+- **UDP** — no connection, no retransmit, fast. Used by DNS, VXLAN overlays, metrics.
+- **Route** — a rule: "to reach network X, send packets to gateway Y via interface Z". The **default route** (`0.0.0.0/0`) is used when nothing else matches.
+
+### Why do we need it for Kubernetes?
+A Kubernetes cluster has **three** IP ranges. They must never overlap with each other or with your VCN:
+
+```
+ Node network   e.g. 10.0.10.0/24   (OCI VCN subnet for worker nodes)
+ Pod network    e.g. 10.244.0.0/16  (every pod gets an IP from here)
+ Service network e.g. 10.96.0.0/16  (virtual IPs for Services — not on any interface)
+```
+On OKE with **VCN-Native Pod Networking**, pods get real IPs from a VCN subnet. With **Flannel**, pods use an overlay range. Planning these CIDRs badly is a classic cause of "cluster can't reach the database".
+
+### How a packet travels
+```
+ App → socket (dst 10.0.20.5:3306, TCP)
+   → kernel looks up route table → "10.0.20.0/24 via 10.0.10.1 dev eth0"
+   → sends to gateway → router → DB host → port 3306 → MySQL process
+```
+
+### Real production scenario
+A new OKE cluster cannot reach an on-premises database over the VPN. `ip route` on the node is fine. You find the pod CIDR `10.244.0.0/16` overlaps the on-prem range `10.244.8.0/24`. Return traffic goes to the wrong place. The fix: rebuild with a non-overlapping pod CIDR. Lesson: plan CIDRs before building.
+
+### Hands-on lab
+`nicolaka/netshoot` is a container full of network tools. You will use it again for pod debugging in later notebooks.
+
+##CODE
+%%bash
+docker run --rm nicolaka/netshoot bash -c '
+echo "== My interfaces and IPs =="; ip -brief addr
+echo; echo "== My route table =="; ip route
+echo; echo "== Which route is used to reach 1.1.1.1? =="; ip route get 1.1.1.1
+echo; echo "== TCP test: is port 443 open on example.com? =="; nc -zv -w 3 example.com 443
+echo; echo "== A /20 network: how many addresses? =="
+python3 -c "import ipaddress as i; n=i.ip_network(\"10.0.16.0/20\"); h=list(n.hosts()); print(\"Network:\", n, \" HostMin:\", h[0], \" HostMax:\", h[-1], \" Addresses:\", n.num_addresses)"
+'
+
+##MD
+**Expected output (IPs differ):**
+```
+== My interfaces and IPs ==
+lo        UNKNOWN  127.0.0.1/8
+eth0@if9  UP       172.17.0.2/16
+== My route table ==
+default via 172.17.0.1 dev eth0
+172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.2
+== Which route is used to reach 1.1.1.1? ==
+1.1.1.1 via 172.17.0.1 dev eth0 src 172.17.0.2
+== TCP test ==
+Connection to example.com 443 port [tcp/https] succeeded!
+== A /20 network: how many addresses? ==
+Network: 10.0.16.0/20  HostMin: 10.0.16.1  HostMax: 10.0.31.254  Addresses: 4096
+```
+
+Now see listening ports. `ss -ltn` = sockets, listening, TCP, numeric.
+
+##CODE
+%%bash
+docker run --rm nicolaka/netshoot bash -c '
+python3 -m http.server 8080 >/dev/null 2>&1 &
+sleep 1
+echo "== Listening TCP ports =="; ss -ltnp
+echo; echo "== Connect to it =="; curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8080/
+'
+
+##MD
+**Expected output:** a line `LISTEN 0 5 0.0.0.0:8080 ... users:(("python3",...))`, then `HTTP 200`.
+
+### Troubleshooting
+
+| Symptom | Cause | Check |
+|---|---|---|
+| `Connection refused` | Host reachable, but nothing listens on that port | `ss -ltn` on the target |
+| `Connection timed out` | Packet dropped: firewall, security list/NSG, wrong route | `ip route get <ip>`, NSG/security list, `traceroute` |
+| `No route to host` | No route, or host down | `ip route`, gateway |
+| Works from node, not from pod | Pod CIDR not allowed in NSG / overlap | Allow pod CIDR in NSG; check CIDR plan |
+
+**Refused vs timeout** is the most useful clue in network debugging. Remember it.
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Docker default bridge 172.17.0.0/16 | Planned, documented CIDRs for nodes, pods, services, VPN, peered VCNs |
+| No firewall | Security lists and NSGs on OCI, plus Kubernetes NetworkPolicies |
+
+### Check yourself
+1. How many addresses in a `/24`? In a `/16`?
+2. What is the difference between "connection refused" and "connection timed out"?
+3. Name the three IP ranges in a Kubernetes cluster.
+4. Which protocol does DNS mostly use?
+
+<details><summary>Answer</summary>
+
+1. 256 and 65,536.
+2. Refused = the host answered, no program listens on the port. Timeout = no answer, packets are dropped (firewall, route, host down).
+3. Node network, pod network, service network.
+4. UDP port 53 (TCP for large responses).
+</details>
+
+##MD
+## B2. DNS
+
+### What is it?
+**DNS** (Domain Name System) turns names into IP addresses. Record types you must know:
+- **A** — name → IPv4 address. **AAAA** — name → IPv6.
+- **CNAME** — name → another name (alias).
+- **SRV** — name → host + port (Kubernetes creates these for Services).
+- **TTL** — how long a resolver may cache the answer.
+
+### Why do we need it?
+Apps should use names, not IPs, because IPs change. In Kubernetes, pods get new IPs every time they restart. **CoreDNS** gives every Service a name like `orders.shop.svc.cluster.local`. DNS problems are among the top causes of "the app cannot connect".
+
+### How it works
+```
+ app: connect to "orders"
+   → libc reads /etc/resolv.conf
+        nameserver 10.96.0.10              ← CoreDNS Service IP
+        search shop.svc.cluster.local svc.cluster.local cluster.local
+        options ndots:5
+   → tries orders.shop.svc.cluster.local  → CoreDNS answers 10.96.45.12
+```
+`ndots:5` means: a name with fewer than 5 dots is tried with each `search` suffix first. That is why `api.example.com` from a pod can cause several extra DNS queries.
+
+### Real production scenario
+After a migration, an app on OKE cannot reach `db-prod.internal.example`. From your laptop it resolves. From the pod, `nslookup` fails. The private DNS zone is only attached to the old VCN's resolver. You add a forwarding rule in CoreDNS (or attach the private view to the new VCN resolver). The app connects.
+
+### Hands-on lab
+
+##CODE
+%%bash
+docker run --rm nicolaka/netshoot bash -c '
+echo "== My resolver config =="; cat /etc/resolv.conf
+echo; echo "== A record =="; dig +short example.com A
+echo; echo "== Full answer with TTL =="; dig example.com A +noall +answer
+echo; echo "== CNAME chain =="; dig www.github.com +noall +answer
+echo; echo "== Ask a specific DNS server (1.1.1.1) =="; dig @1.1.1.1 +short example.com
+echo; echo "== A name that does not exist =="; dig +short does-not-exist.example.invalid; echo "exit=$? (empty answer = NXDOMAIN)"
+'
+
+##MD
+**Expected output:** `resolv.conf` with a `nameserver` line; IPs for `example.com`; an answer line like `example.com. 3600 IN A 93.184.x.x` (3600 is the TTL); `www.github.com` shows a `CNAME` to `github.com`; an empty answer for the invalid name.
+
+Docker also runs its own DNS for user-defined networks. Containers find each other **by name** — the same idea as Kubernetes Services.
+
+##CODE
+%%bash
+docker network create dnslab >/dev/null 2>&1 || true
+docker run -d --rm --name orders --network dnslab nginx:1.27 >/dev/null
+docker run --rm --network dnslab nicolaka/netshoot bash -c '
+echo "== Resolve the container name \"orders\" =="; dig +short orders
+echo "== Call it by name =="; curl -s -o /dev/null -w "HTTP %{http_code}\n" http://orders/'
+docker rm -f orders >/dev/null; docker network rm dnslab >/dev/null
+
+##MD
+**Expected output:** an IP like `172.19.0.2`, then `HTTP 200`.
+
+### Troubleshooting
+
+| Symptom | Cause | Check / fix |
+|---|---|---|
+| `could not resolve host` | Wrong nameserver, DNS down, typo | `cat /etc/resolv.conf`, `dig <name>`, `dig @<other-server> <name>` |
+| Works with IP, not name | DNS problem, not network | Always test both |
+| Old IP returned after change | Cached (TTL not expired) | Wait TTL, lower TTL before migrations |
+| Slow external lookups from pods | `ndots:5` causes many search queries | Use FQDN with a trailing dot (`api.example.com.`) or tune `dnsConfig` |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Public resolvers | Private DNS zones (OCI private views), CoreDNS forwarding to corporate DNS |
+| One DNS query | CoreDNS with 2+ replicas, NodeLocal DNSCache for heavy clusters, DNS metrics and alerts |
+
+### Check yourself
+1. What does a CNAME record do?
+2. What is TTL and why lower it before a migration?
+3. In a pod, which file decides the DNS server and search domains?
+4. Name works on laptop but not in pod. First two commands?
+
+<details><summary>Answer</summary>
+
+1. It makes one name an alias for another name.
+2. Time To Live: how long answers are cached. A low TTL makes clients pick up a new IP quickly after the change.
+3. `/etc/resolv.conf`.
+4. `cat /etc/resolv.conf` and `nslookup <name>` / `dig <name>` from inside the pod.
+</details>
+
+##MD
+## B3. HTTP, HTTPS, and TLS
+
+### What is it?
+- **HTTP** — a text protocol: request (method, path, headers, body) → response (status code, headers, body).
+- Status codes: **2xx** OK, **3xx** redirect, **4xx** client error (404 not found, 403 forbidden), **5xx** server error (502 bad gateway, 503 unavailable, 504 gateway timeout).
+- **HTTPS** = HTTP inside **TLS**. TLS encrypts traffic and proves the server identity with a **certificate**.
+- A **certificate** has a subject name (and SANs, Subject Alternative Names), a validity period, and is signed by a **CA** (Certificate Authority). Clients trust a chain: server cert → intermediate CA → root CA.
+- **SNI** (Server Name Indication) — the client sends the host name in the TLS handshake, so one IP can serve many certificates. Ingress controllers depend on this.
+
+### Why do we need it?
+Ingress controllers terminate TLS. cert-manager renews certificates. Expired certificates and wrong SANs are classic outages. Knowing 502 vs 503 vs 504 tells you *where* a request failed.
+
+### How it works
+```
+ Client                         Server (e.g. Ingress controller)
+   │── TCP handshake ─────────────►│
+   │── ClientHello (SNI=shop.example.com) ─►│
+   │◄─ ServerHello + certificate chain ─────│
+   │   client checks: name matches? not expired? trusted CA?
+   │── key exchange, encrypted from here ──►│
+   │── GET /api/orders  Host: shop.example.com ─►│
+   │◄─ HTTP/1.1 200 OK ─────────────│
+```
+
+### Real production scenario
+Monday 09:00. Users get "Your connection is not private". `openssl s_client` shows `notAfter` was yesterday. The certificate was renewed by hand last year and nobody set a reminder. The fix today: install a new certificate. The fix forever: cert-manager with automatic renewal, plus an alert 21 days before expiry.
+
+### Hands-on lab
+
+##CODE
+%%bash
+docker run --rm nicolaka/netshoot bash -c '
+echo "== Verbose HTTPS request: see TLS + HTTP headers =="
+curl -sv -o /dev/null https://example.com 2>&1 | grep -E "^\* (SSL|TLS|Server certificate|  subject|  expire|  issuer)|^> (GET|Host)|^< HTTP"
+echo; echo "== Certificate details with openssl =="
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+echo; echo "== Status codes =="
+for p in / /status/404 /status/503; do curl -s -o /dev/null -w "httpbin.org$p -> %{http_code}\n" https://httpbin.org$p; done
+'
+
+##MD
+**Expected output (shortened):**
+```
+* SSL connection using TLSv1.3 / ...
+*  subject: CN=www.example.org
+*  expire date: ...
+*  issuer: C=US; O=DigiCert Inc; CN=...
+> GET / HTTP/2
+> Host: example.com
+< HTTP/2 200
+== Certificate details ==
+subject=CN = www.example.org
+issuer=C = US, O = DigiCert Inc, CN = ...
+notBefore=...
+notAfter=...
+X509v3 Subject Alternative Name:
+    DNS:www.example.org, DNS:example.com, ...
+== Status codes ==
+httpbin.org/ -> 200
+httpbin.org/status/404 -> 404
+httpbin.org/status/503 -> 503
+```
+(If httpbin.org is slow or down, the last part may time out. That is fine.)
+
+Now make your own CA-less, **self-signed** certificate — the kind you use in labs, never in production.
+
+##CODE
+%%bash
+docker run --rm -v "$PWD/labs/01:/work" -w /work nicolaka/netshoot bash -c '
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -keyout lab.key -out lab.crt -subj "/CN=shop.local" \
+  -addext "subjectAltName=DNS:shop.local,DNS:*.shop.local" 2>/dev/null
+openssl x509 -in lab.crt -noout -subject -dates -ext subjectAltName'
+ls -l labs/01/lab.crt labs/01/lab.key
+
+##MD
+**Expected output:** `subject=CN = shop.local`, dates 30 days apart, SAN `DNS:shop.local, DNS:*.shop.local`. In notebook 04 you will put a cert like this in a Kubernetes **TLS Secret** for an Ingress.
+
+### Troubleshooting
+
+| Symptom | Meaning | Where to look |
+|---|---|---|
+| 502 Bad Gateway | Proxy/Ingress reached the backend, got a bad or no response (backend crashed, wrong port) | Backend pod logs, Service `targetPort` |
+| 503 Service Unavailable | No healthy backend (no ready pods, no endpoints) | `kubectl get endpoints`, readiness probes |
+| 504 Gateway Timeout | Backend too slow | App latency, proxy timeouts |
+| `certificate has expired` | Cert past `notAfter` | Renew; automate with cert-manager |
+| `certificate is not valid for this name` | Host not in SAN list | Reissue with correct SANs |
+| `unable to get local issuer certificate` | Missing intermediate CA in chain | Serve the full chain |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Self-signed cert, `curl -k` to ignore errors | Certificates from a trusted CA (Let's Encrypt, OCI Certificates, corporate CA) |
+| Manual renewal | cert-manager auto-renew + expiry alerts |
+| TLS ends at the app | TLS ends at the load balancer / Ingress; often mTLS inside (service mesh) for sensitive traffic |
+
+### Check yourself
+1. What is the difference between 502, 503, and 504?
+2. What is SNI and why does Ingress need it?
+3. Which certificate field must contain the host name the client uses?
+4. Which `openssl` command shows a site's certificate dates?
+
+<details><summary>Answer</summary>
+
+1. 502: backend gave a bad/no response. 503: no backend available. 504: backend too slow.
+2. The client sends the host name during the TLS handshake, so one IP (the Ingress) can present the right certificate for many hosts.
+3. Subject Alternative Name (SAN).
+4. `echo | openssl s_client -connect host:443 -servername host | openssl x509 -noout -dates`.
+</details>
+
+##MD
+## B4. Firewalls and load balancing
+
+### What is it?
+- A **firewall** allows or blocks packets by source, destination, port, and protocol. On Linux, **iptables** / **nftables** do this in the kernel (netfilter). On OCI: **security lists** (per subnet) and **NSGs** (per VNIC).
+- A **load balancer** spreads requests across many backends. **L4** works with TCP/UDP (IP + port). **L7** understands HTTP (host, path, headers) and can terminate TLS.
+- **Health checks** remove dead backends from rotation.
+
+### Why do we need it?
+- **kube-proxy** programs iptables (or IPVS) rules on every node. That is how a Service IP reaches pods. A Service *is* firewall/NAT rules.
+- A Service of type **LoadBalancer** on OKE creates an **OCI Load Balancer** or **Network Load Balancer**.
+- An **Ingress controller** is an L7 load balancer inside the cluster.
+
+### How it works
+```
+           ┌──────── L7 load balancer (nginx) ────────┐
+ client ──►│ Host: shop → round robin, health checks  │
+           └──────┬───────────────┬───────────────────┘
+                  ▼               ▼
+              backend-1       backend-2      (if one dies, health check removes it)
+```
+
+### Real production scenario
+After a security hardening change, the OKE nodes stop reaching the API server. The new NSG blocks TCP 6443 from the worker subnet. Pods keep running, but nodes go `NotReady` and nothing new can be scheduled. Restoring the rule fixes it. Lesson: know the ports Kubernetes needs (6443 API, 10250 kubelet, 12250 on OKE for worker-to-control-plane, NodePorts 30000–32767).
+
+### Hands-on lab 1: a firewall rule with iptables
+
+##CODE
+%%bash
+docker run --rm --privileged nicolaka/netshoot bash -c '
+python3 -m http.server 8080 >/dev/null 2>&1 &
+sleep 1
+echo "== Before rule ==";  curl -s -m 2 -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8080/
+iptables -A INPUT -p tcp --dport 8080 -j REJECT       # REJECT = answer "refused"
+echo "== After REJECT rule =="; curl -s -m 2 http://127.0.0.1:8080/ || echo "curl failed (refused)"
+iptables -D INPUT -p tcp --dport 8080 -j REJECT
+iptables -A INPUT -p tcp --dport 8080 -j DROP         # DROP = silently ignore
+echo "== After DROP rule (wait 2s) =="; curl -s -m 2 http://127.0.0.1:8080/ || echo "curl failed (timeout)"
+echo; iptables -L INPUT -n --line-numbers
+'
+
+##MD
+**Expected output:** `HTTP 200` first, then a refused failure, then a timeout failure, then the rule list showing `DROP tcp dpt:8080`. This shows the **refused vs timeout** difference from B1. REJECT is like a closed port. DROP is like a cloud security list that blocks traffic.
+
+### Hands-on lab 2: an L7 load balancer
+Two backends (`traefik/whoami` prints its own hostname) behind nginx. Watch requests alternate. Then kill one backend.
+
+##CODE
+%%writefile labs/01/lb.conf
+# Minimal nginx L7 load balancer config.
+upstream backends {                 # The pool of backends.
+    server web1:80 max_fails=1 fail_timeout=10s;   # Passive health check: 1 failure = out for 10s.
+    server web2:80 max_fails=1 fail_timeout=10s;
+}
+server {
+    listen 80;                      # nginx listens on port 80.
+    location / {
+        proxy_pass http://backends; # Round robin across the pool (default algorithm).
+        proxy_connect_timeout 1s;   # Fail fast when a backend is gone.
+    }
+}
+
+##CODE
+%%bash
+docker network create lblab >/dev/null 2>&1 || true
+docker run -d --rm --name web1 --network lblab traefik/whoami >/dev/null
+docker run -d --rm --name web2 --network lblab traefik/whoami >/dev/null
+docker run -d --rm --name lb --network lblab -p 8081:80 \
+  -v "$PWD/labs/01/lb.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.27 >/dev/null
+sleep 2
+echo "== 4 requests: round robin =="
+for i in 1 2 3 4; do curl -s http://localhost:8081/ | grep Hostname; done
+echo "== Kill web1, send 4 more =="
+docker rm -f web1 >/dev/null
+for i in 1 2 3 4; do curl -s http://localhost:8081/ | grep Hostname; done
+
+##MD
+**Expected output:** hostnames alternate between two container IDs. After `web1` is removed, all requests go to the remaining one (the first may be slower while nginx marks web1 failed). A Kubernetes Service does the same job, with readiness probes as the health check.
+
+##CODE
+%%bash
+docker rm -f web2 lb >/dev/null 2>&1; docker network rm lblab >/dev/null 2>&1; echo cleaned
+
+##MD
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Timeouts only from some sources | Security list/NSG allows some CIDRs only | Compare source IP with rules |
+| LB shows backends "critical" | Health check path/port wrong, or NSG blocks LB → node | Fix health check; allow LB subnet in NSG |
+| Uneven load | Long-lived connections (HTTP/2, gRPC, DB pools) stick to one backend | L7 balancing per request, or client-side balancing |
+| Works by IP, 404 via LB | L7 routing by Host header, Host missing | Send correct `Host` header |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| nginx container with static backend list | Cloud LB (OCI LB/NLB) + Ingress controller with dynamic backends from Kubernetes |
+| Passive health check only | Active health checks + readiness probes; at least 2 replicas per service across fault domains |
+| Hand-written iptables | NSGs as code (Terraform), NetworkPolicies, change review |
+
+### Check yourself
+1. REJECT vs DROP — which one gives a timeout?
+2. What is the difference between L4 and L7 load balancing?
+3. What Kubernetes component programs iptables rules for Services?
+4. On OKE, what does a Service of type LoadBalancer create?
+
+<details><summary>Answer</summary>
+
+1. DROP.
+2. L4 balances TCP/UDP connections by IP and port. L7 reads HTTP and can route by host/path, terminate TLS, retry.
+3. kube-proxy.
+4. An OCI Load Balancer (or Network Load Balancer, chosen by annotation).
+</details>
+
+##MD
+---
+# Part C — Containers with Docker
+
+## C1. Images, layers, containers, and registries
+
+### What is it?
+- **Image** — a read-only package: a filesystem (in **layers**) + metadata (default command, env, ports). Identified by `name:tag` and a **digest** (`sha256:...`, which never changes).
+- **Layer** — one filesystem change (from one Dockerfile instruction). Layers are shared and cached.
+- **Container** — a running instance of an image + a thin **writable layer** on top.
+- **Registry** — a server that stores images: Docker Hub, OCI Container Registry (OCIR, e.g. `me-jeddah-1.ocir.io`), GHCR, ACR, ECR.
+
+### Why do we need it?
+Kubernetes never builds code. It only **pulls images** and runs them. Every pod spec says `image: ...`. `ImagePullBackOff` is one of the most common pod errors, and it is almost always about the registry, the tag, or credentials.
+
+### How it works
+```
+ image nginx:1.27
+ ┌────────────────────────────┐
+ │ writable layer (container) │ ← lost when container is deleted
+ ├────────────────────────────┤
+ │ layer 3: nginx config      │  read-only, shared by all
+ │ layer 2: nginx binaries    │  containers using this image
+ │ layer 1: debian base       │
+ └────────────────────────────┘
+ pull: registry → node's containerd → unpack layers → start process
+```
+**Tags can move** (`latest`, even `1.27`). **Digests cannot.** Production deployments should pin a specific version tag, and ideally a digest.
+
+### Real production scenario
+A deployment uses `image: myapp:latest`. A developer pushes a broken build as `latest`. A node restarts, the pod is rescheduled, pulls the new `latest`, and crashes. The other replicas still run the old image. Now replicas run different code. Fix: immutable version tags (`myapp:1.4.2` or git SHA) and `imagePullPolicy: IfNotPresent`.
+
+### Hands-on lab
+
+##CODE
+%%bash
+echo "== Image size and ID =="; docker image ls nginx:1.27
+echo; echo "== Layers: one line per Dockerfile instruction =="; docker history nginx:1.27 --format '{{.Size}}\t{{.CreatedBy}}' | head -8
+echo; echo "== The digest (immutable) =="; docker image inspect nginx:1.27 --format '{{index .RepoDigests 0}}'
+echo; echo "== Default command and exposed ports =="; docker image inspect nginx:1.27 --format 'Cmd={{.Config.Cmd}} Ports={{.Config.ExposedPorts}}'
+
+##MD
+**Expected output:** size around 190 MB; a list of layers (`ADD file ... in /`, `RUN ...`, `COPY ...`); a digest like `nginx@sha256:abc...`; `Cmd=[nginx -g daemon off;] Ports=map[80/tcp:{}]`.
+
+Now see the **writable layer**: changes live only in that container.
+
+##CODE
+%%bash
+docker run -d --name c1 nginx:1.27 >/dev/null
+docker exec c1 sh -c 'echo "changed in c1" > /usr/share/nginx/html/index.html'
+echo "== What changed in c1 vs the image (A=added, C=changed) =="; docker diff c1 | head
+echo "== A new container from the same image does NOT see the change =="
+docker run --rm nginx:1.27 cat /usr/share/nginx/html/index.html | head -4
+docker rm -f c1 >/dev/null
+
+##MD
+Now run your own **registry** locally and push an image to it. We use port **5001** because macOS uses port 5000 for AirPlay.
+
+##CODE
+%%bash
+docker run -d --rm --name registry -p 5001:5000 registry:2 >/dev/null 2>&1 || echo "registry already running"
+sleep 2
+docker tag alpine:3.20 localhost:5001/team/alpine:3.20     # tag = new name pointing to same image
+docker push -q localhost:5001/team/alpine:3.20
+echo "== Registry catalog API =="; curl -s http://localhost:5001/v2/_catalog
+echo; curl -s http://localhost:5001/v2/team/alpine/tags/list
+docker rm -f registry >/dev/null
+
+##MD
+**Expected output:** `{"repositories":["team/alpine"]}` and `{"name":"team/alpine","tags":["3.20"]}`. OCIR works the same way: `docker login <region>.ocir.io`, tag as `<region>.ocir.io/<namespace>/<repo>:<tag>`, push. In Kubernetes, private registries need an **imagePullSecret** (notebook 06).
+
+### Troubleshooting
+
+| Symptom (in Kubernetes) | Cause | Fix |
+|---|---|---|
+| `ImagePullBackOff`, `not found` | Wrong name or tag | `docker pull <exact image>` to test |
+| `ImagePullBackOff`, `unauthorized` | Private registry, no/expired credentials | Create `imagePullSecret`; check OCIR auth token |
+| `ImagePullBackOff`, timeout | Node has no route to registry (no NAT/Service Gateway) | Check VCN routing; OCIR via Service Gateway |
+| `exec format error` | Image built for wrong CPU (amd64 vs arm64) | Build multi-arch: `docker buildx build --platform linux/amd64,linux/arm64` |
+| `toomanyrequests` | Docker Hub rate limit | Use a mirror/your own registry (OCIR) |
+
+The `exec format error` matters for you: your Mac is **arm64**, many OKE node pools are **amd64**. An image built on your Mac may not run on those nodes.
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Docker Hub images, `latest` tags | Images mirrored to a private registry (OCIR), pinned versions or digests |
+| No scanning | Image scanning (Trivy, OCIR scanning), signed images (notebook 08) |
+| Built on arm64 laptop | Built in CI for the node architecture(s) |
+
+### Check yourself
+1. Image vs container?
+2. Why is `latest` dangerous in production?
+3. What is the difference between a tag and a digest?
+4. You see `exec format error`. What is the likely cause?
+
+<details><summary>Answer</summary>
+
+1. An image is a read-only template. A container is a running instance with a writable layer.
+2. It can point to different code at different times. Replicas can end up running different versions, and rollbacks are unclear.
+3. A tag is a movable name. A digest is the content hash and never changes.
+4. CPU architecture mismatch (e.g. arm64 image on amd64 node).
+</details>
+
+##MD
+## C2. Dockerfiles and multi-stage builds
+
+### What is it?
+A **Dockerfile** is a recipe to build an image. Key instructions:
+- `FROM` base image · `WORKDIR` working folder · `COPY` files in · `RUN` a build command · `ENV` env var · `EXPOSE` documents a port · `USER` run as this user · `ENTRYPOINT`/`CMD` the start command.
+
+A **multi-stage build** uses several `FROM` stages. Stage 1 has compilers and tools. The final stage copies **only the result**.
+
+### Why do we need it?
+- Small images pull faster → pods start faster → faster scaling and recovery.
+- Fewer packages = fewer vulnerabilities. A final image with no shell is much harder to attack.
+- Running as a non-root `USER` is required by Kubernetes Pod Security "restricted" (notebook 08).
+
+### How it works
+```
+ Stage "build"  (golang:1.22-alpine, ~250 MB)
+   COPY source → go build → /out/app (single static binary)
+               │ COPY --from=build
+               ▼
+ Final stage  (distroless/static:nonroot, ~2 MB) + app (~7 MB)  → ~10 MB image
+```
+
+### Real production scenario
+Your team's Node.js image is 1.2 GB. Autoscaling adds nodes during a traffic spike, but new pods take 3 minutes to start because each node pulls 1.2 GB. A security scan finds 300 CVEs, mostly in build tools nobody uses at runtime. A multi-stage build cuts it to 150 MB and 10 CVEs. Pods now start in 20 seconds.
+
+### Hands-on lab: build the same app two ways
+A tiny Go web app. It prints its hostname (the pod name in Kubernetes) and a version from an env var. You will reuse this image in later notebooks.
+
+##CODE
+%%bash
+mkdir -p labs/01/app
+
+##CODE
+%%writefile labs/01/app/main.go
+// A tiny HTTP server used across the course.
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+func main() {
+	version := os.Getenv("APP_VERSION") // Set at runtime (Docker -e, Kubernetes env).
+	if version == "" {
+		version = "dev"
+	}
+	host, _ := os.Hostname() // In Kubernetes this is the pod name.
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello from %s, version %s\n", host, version)
+	})
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // Used later for liveness/readiness probes.
+		fmt.Fprintln(w, "ok")
+	})
+	log.Println("listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+##CODE
+%%writefile labs/01/app/go.mod
+module demoapp
+
+go 1.22
+
+##CODE
+%%writefile labs/01/app/Dockerfile.single
+# SINGLE-STAGE build: simple, but the final image contains the whole Go toolchain.
+FROM golang:1.22-alpine
+WORKDIR /src
+COPY . .
+RUN go build -o /app .
+EXPOSE 8080
+CMD ["/app"]
+
+##CODE
+%%writefile labs/01/app/Dockerfile
+# MULTI-STAGE build: the production pattern.
+# Note: Dockerfile comments must be on their own line (no comments at the end of an instruction).
+
+# ---- Stage 1: build (named "build", has the Go compiler) ----
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+# Copy dependency files first: this layer stays cached until go.mod changes.
+COPY go.mod ./
+RUN go mod download
+# Now copy the source code.
+COPY . .
+# CGO_ENABLED=0 -> fully static binary (no libc needed). -s -w -> strip debug info (smaller).
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/app .
+
+# ---- Stage 2: runtime (no shell, no package manager, tiny) ----
+FROM gcr.io/distroless/static-debian12:nonroot
+# Only the binary comes across from the build stage.
+COPY --from=build /out/app /app
+# Run as non-root (UID 65532).
+USER nonroot:nonroot
+# Documentation only; does not open a port.
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+
+##MD
+Build both images and compare sizes. `-t` gives the image a name. `-f` picks the Dockerfile.
+
+##CODE
+%%bash
+cd labs/01/app
+docker build -q -f Dockerfile.single -t demoapp:single . && echo "built demoapp:single"
+docker build -q -f Dockerfile        -t demoapp:1.0    . && echo "built demoapp:1.0"
+echo; docker image ls demoapp --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}'
+
+##MD
+**Expected output:**
+```
+REPOSITORY:TAG     SIZE
+demoapp:1.0        ~9MB
+demoapp:single     ~300MB
+```
+Same app. About 30× smaller.
+
+Run it. `-p 8080:8080` publishes container port 8080 on your Mac. `-e` sets the env var.
+
+##CODE
+%%bash
+docker rm -f demo >/dev/null 2>&1
+docker run -d --name demo -p 8080:8080 -e APP_VERSION=1.0 demoapp:1.0 >/dev/null
+sleep 1
+curl -s http://localhost:8080/
+curl -s http://localhost:8080/healthz
+echo "== Runs as non-root? =="; docker inspect demo --format 'User={{.Config.User}}'
+echo "== No shell inside (good for security) =="; docker exec demo sh 2>&1 | head -1
+docker rm -f demo >/dev/null
+
+##MD
+**Expected output:**
+```
+hello from 4b1c2d..., version 1.0
+ok
+== Runs as non-root? ==
+User=nonroot:nonroot
+== No shell inside (good for security) ==
+OCI runtime exec failed: exec failed: ... "sh": executable file not found in $PATH
+```
+No shell means you debug differently. In Kubernetes you use `kubectl debug` with an ephemeral container (notebook 13).
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every build re-downloads dependencies | `COPY . .` before installing deps breaks the cache | Copy dependency files first, install, then copy code |
+| `no such file or directory` running a Go binary in a small image | Binary linked to libc, image has none | `CGO_ENABLED=0` or use a base with libc |
+| Container exits immediately | `CMD` finishes (e.g. starts a daemon in background) | Run the process in foreground |
+| Permission denied writing files | Running as non-root, folder owned by root | `chown` in build stage or write to a volume |
+| Secrets found in image | `COPY .env` or `ARG TOKEN` baked in layers | Use `.dockerignore`, BuildKit secrets; never put secrets in images |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Build on laptop | Build in CI (Azure DevOps, GitHub Actions), reproducible, tagged with git SHA |
+| arm64 only | Multi-arch or node-arch builds with `buildx` |
+| No `.dockerignore` | `.dockerignore` (exclude `.git`, secrets, test data) |
+| Trust base images | Pin base image versions, scan, rebuild regularly for patches |
+
+### Check yourself
+1. Why copy `go.mod` (or `package.json`) before the rest of the code?
+2. What does `COPY --from=build` do?
+3. Why run as a non-root user?
+4. Does `EXPOSE 8080` open a port?
+
+<details><summary>Answer</summary>
+
+1. Layer caching: dependencies are only re-downloaded when the dependency file changes.
+2. Copies files from an earlier build stage into the current stage.
+3. If the app is hacked, the attacker has fewer rights. Kubernetes restricted Pod Security also requires it.
+4. No. It only documents the port. You publish ports with `-p` (Docker) or use a Service (Kubernetes).
+</details>
+
+##MD
+## C3. Container networking
+
+### What is it?
+- **bridge** (default) — containers get private IPs on a virtual switch (`docker0`). Outbound traffic is NATed through the host.
+- **user-defined bridge** — like bridge, plus **DNS by container name** (you saw this in B2).
+- **host** — container uses the host's network namespace directly.
+- **none** — no network.
+- **Port publishing** `-p host:container` — a NAT rule from host port to container port.
+- Containers can **join another container's network namespace** (`--network container:<name>`). This is exactly how a Kubernetes **Pod** works.
+
+### Why do we need it?
+Kubernetes replaces Docker networking with a **CNI plugin**, but the ideas are the same: veth pairs, bridges, NAT, DNS by name. The "shared network namespace" trick is the reason containers in one pod can talk over `localhost`.
+
+### How it works
+```
+ Host
+  eth0 (host IP) ── NAT (-p 8080:80) ──┐
+  docker0 / br-xxx bridge  172.18.0.1  │
+     ├── veth ── container A  172.18.0.2:80
+     └── veth ── container B  172.18.0.3
+                  └── container C (--network container:B) shares B's IP & ports
+                        = like 2 containers in one Pod
+```
+
+### Real production scenario
+A team runs an app container and a log-shipper sidecar. The sidecar must read metrics from the app at `localhost:9090`. In Docker they are separate, so `localhost` fails. In Kubernetes they put both in **one pod**. They share the network namespace, so `localhost:9090` works. Understanding this saves hours.
+
+### Hands-on lab
+
+##CODE
+%%bash
+docker network create netlab >/dev/null 2>&1 || true
+docker run -d --rm --name app --network netlab nginx:1.27 >/dev/null
+echo "== Container A has its own IP =="
+docker inspect app --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
+echo "== Container B joins A's network namespace: same IP, localhost works (like a Pod) =="
+docker run --rm --network container:app nicolaka/netshoot bash -c 'ip -brief addr show eth0; curl -s -o /dev/null -w "localhost:80 -> HTTP %{http_code}\n" http://localhost:80/'
+echo "== A separate container on the same network: localhost does NOT work, name does =="
+docker run --rm --network netlab nicolaka/netshoot bash -c 'curl -s -m 2 http://localhost:80/ >/dev/null || echo "localhost:80 -> refused"; curl -s -o /dev/null -w "http://app -> HTTP %{http_code}\n" http://app/'
+docker rm -f app >/dev/null; docker network rm netlab >/dev/null
+
+##MD
+**Expected output:**
+```
+== Container A has its own IP ==
+172.2x.0.2
+== Container B joins A's network namespace ... ==
+eth0@if..  UP  172.2x.0.2/16          ← same IP as A
+localhost:80 -> HTTP 200
+== A separate container ... ==
+localhost:80 -> refused
+http://app -> HTTP 200
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Containers cannot resolve each other by name | Using default `bridge` network (no DNS) | Use a user-defined network |
+| `port is already allocated` | Host port in use | Choose another host port |
+| App reachable inside container, not from host | App listens on `127.0.0.1` only | Listen on `0.0.0.0` |
+| Two containers in a pod fail: `address already in use` | Both bind the same port in a shared namespace | Use different ports per container |
+
+The `127.0.0.1` vs `0.0.0.0` mistake is very common in Kubernetes too: the pod is Running, but the Service gets "connection refused".
+
+### Lab vs Production
+
+| Lab | Production (Kubernetes) |
+|---|---|
+| Docker bridge + NAT | CNI plugin (OCI VCN-Native, Flannel, Calico, Cilium): every pod gets a routable IP |
+| `-p` port publishing | Services, Ingress, cloud load balancers |
+| Name DNS from Docker | CoreDNS Service names |
+
+### Check yourself
+1. What does `--network container:app` do, and which Kubernetes object does it imitate?
+2. Why can't containers on the default bridge use names?
+3. An app listens on `127.0.0.1:8080`. Why can't other containers reach it?
+
+<details><summary>Answer</summary>
+
+1. The new container shares the network namespace (IP, ports, localhost) of `app`. It imitates a Pod.
+2. Docker's embedded DNS is only on user-defined networks.
+3. 127.0.0.1 is only reachable from inside the same network namespace. Listen on 0.0.0.0.
+</details>
+
+##MD
+## C4. Volumes and storage
+
+### What is it?
+- The container writable layer is **temporary**: deleted with the container.
+- A **named volume** — storage managed by Docker, survives container deletion.
+- A **bind mount** — a host folder mounted into the container.
+- **tmpfs** — in-memory storage, gone at stop.
+
+### Why do we need it?
+Databases, uploads, and caches need data that survives restarts. In Kubernetes the same idea becomes **volumes**, **PersistentVolumes**, and **PersistentVolumeClaims** (notebook 05). On OKE, a PVC can create an **OCI Block Volume** automatically.
+
+### How it works
+```
+ container  /var/lib/mysql ──mount──► named volume "dbdata"  (outside the container's layers)
+ delete container → volume stays → new container mounts it → data is back
+```
+
+### Real production scenario
+A team runs MySQL in a container "for a quick test". It becomes important. One day someone runs `docker rm -f` to restart it. All data is gone — it lived in the writable layer. With a volume (or, in Kubernetes, a PVC on block storage plus backups), the data would have survived.
+
+### Hands-on lab
+
+##CODE
+%%bash
+docker volume create notes >/dev/null
+echo "== Write data into a named volume, then delete the container =="
+docker run --rm -v notes:/data alpine:3.20 sh -c 'echo "order-1001 saved $(date)" >> /data/orders.log'
+echo "== New container, same volume: data survives =="
+docker run --rm -v notes:/data alpine:3.20 cat /data/orders.log
+echo "== Without a volume: data is lost =="
+docker run --rm alpine:3.20 sh -c 'echo temp > /tmp/x'; docker run --rm alpine:3.20 sh -c 'cat /tmp/x 2>/dev/null || echo "file not found — writable layer was deleted"'
+echo "== Bind mount: read a host folder (read-only) =="
+docker run --rm -v "$PWD/labs/01/app:/src:ro" alpine:3.20 ls /src
+echo "== Where Docker keeps the volume =="; docker volume inspect notes --format '{{.Mountpoint}}'
+docker volume rm notes >/dev/null
+
+##MD
+**Expected output:** the line `order-1001 saved ...`; `file not found — writable layer was deleted`; the files `Dockerfile Dockerfile.single go.mod main.go`; a mount point like `/var/lib/docker/volumes/notes/_data` (inside the Colima/Docker VM).
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Data lost after restart | No volume; data in writable layer | Mount a volume / PVC |
+| `permission denied` on mounted folder | UID in container ≠ owner of files | Match UID, `chown`, or `fsGroup` in Kubernetes |
+| Bind mount empty on Mac | Folder not shared with the VM | Use paths under your home folder (shared by default) |
+| DB corrupted after copying volume while running | Copied files during writes | Use DB-native backup (mysqldump, snapshots with quiesce) |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Named volume on laptop disk | PVC on OCI Block Volume (CSI), replicated storage, snapshots |
+| No backups | Scheduled backups (Commvault, Velero, DB dumps) + **tested restores** |
+| One container | StatefulSet with stable storage per replica |
+
+### Check yourself
+1. What happens to files in the writable layer when the container is deleted?
+2. Named volume vs bind mount?
+3. Which Kubernetes objects replace Docker volumes for persistent data?
+
+<details><summary>Answer</summary>
+
+1. They are deleted.
+2. A named volume is managed by Docker in its own storage area. A bind mount maps a specific host path.
+3. PersistentVolume (PV) and PersistentVolumeClaim (PVC), usually created through a StorageClass and a CSI driver.
+</details>
+
+##MD
+---
+## Interview and real-world questions
+
+1. "Explain what a container is to someone who knows VMs."
+2. "A pod restarts with exit code 137. What happened and how do you confirm it?"
+3. "A user says the website is down. Walk me through how you narrow it down from DNS to the app."
+4. "Why should production images be small and run as non-root?"
+5. "Your image works on your MacBook but fails on the OKE nodes with `exec format error`. Why?"
+6. "What is the difference between a security list and an NSG on OCI, and how does that relate to Kubernetes NetworkPolicy?"
+
+<details><summary>Answers</summary>
+
+1. A VM virtualises hardware and runs its own kernel. A container shares the host kernel. It is a process isolated with namespaces (what it sees) and limited with cgroups (what it uses), running from an image filesystem. So containers start in milliseconds and use less memory, but isolation is weaker than a VM.
+2. 137 = 128 + 9 = SIGKILL, usually the kernel OOM killer because the container exceeded its memory limit. Confirm with `kubectl describe pod` (`Last State: Terminated, Reason: OOMKilled`) and `kubectl top pod`, and look at memory metrics before the restart.
+3. DNS: `dig site` → correct IP? Network: `curl -v` → connect OK or timeout/refused? TLS: certificate valid? HTTP: status code — 502/503/504 point to the backend layer. Then the load balancer health, Ingress logs, Service endpoints, pod readiness, app logs. Move from outside to inside, one layer at a time.
+4. Small images pull faster (faster scaling and recovery) and contain fewer packages, so fewer vulnerabilities. Non-root limits damage if the app is compromised and is required by restricted Pod Security.
+5. The Mac builds arm64 images by default. Many node pools are amd64. Build for the target platform with `docker buildx build --platform linux/amd64` (or multi-arch).
+6. A security list applies to all VNICs in a subnet. An NSG applies to specific VNICs (resources) and can reference other NSGs. Both work at the VCN level. A NetworkPolicy works inside the cluster, between pods, using labels. Production uses both layers.
+</details>
+
+##MD
+## Practical assignment
+
+**Scenario:** The Events team gives you a Python web app. They want a production-quality container image before it goes to Kubernetes.
+
+**Tasks**
+1. Create `labs/01/pyapp/app.py`: a web server on port 8000 that returns `events ok` on `/` (use Python's `http.server`, no extra packages).
+2. Write a Dockerfile that:
+   - uses `python:3.12-alpine`,
+   - runs as a non-root user,
+   - sets env `PYTHONUNBUFFERED=1` (logs appear immediately),
+   - starts the app.
+3. Build it as `events-api:0.1.0`. Run it with a **128 MiB memory limit** and **0.5 CPU**, published on host port 8090.
+4. Prove: it responds, runs as non-root, and the cgroup memory limit is 134217728.
+5. Push it to a local registry on port 5001 as `localhost:5001/events/events-api:0.1.0`.
+
+**Success criteria:** `curl localhost:8090` returns `events ok`; `docker exec ... id -u` is not `0`; `memory.max` shows 134217728; the registry catalog lists `events/events-api`.
+
+**Hints:** `adduser -D -u 10001 app` on Alpine; `USER 10001`; `docker run -m 128m --cpus 0.5`.
+
+<details><summary>Solution</summary>
+
+```bash
+mkdir -p labs/01/pyapp && cd labs/01/pyapp
+cat > app.py <<'EOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"events ok\n")
+
+HTTPServer(("0.0.0.0", 8000), H).serve_forever()   # 0.0.0.0, not 127.0.0.1
+EOF
+cat > Dockerfile <<'EOF'
+FROM python:3.12-alpine
+ENV PYTHONUNBUFFERED=1
+RUN adduser -D -u 10001 app
+WORKDIR /app
+COPY app.py .
+USER 10001
+EXPOSE 8000
+CMD ["python", "app.py"]
+EOF
+docker build -t events-api:0.1.0 .
+docker run -d --name events -m 128m --cpus 0.5 -p 8090:8000 events-api:0.1.0
+sleep 1
+curl -s localhost:8090                                  # events ok
+docker exec events id -u                                # 10001
+docker exec events cat /sys/fs/cgroup/memory.max        # 134217728
+docker run -d --rm --name registry -p 5001:5000 registry:2
+docker tag events-api:0.1.0 localhost:5001/events/events-api:0.1.0
+docker push localhost:5001/events/events-api:0.1.0
+curl -s localhost:5001/v2/_catalog                      # {"repositories":["events/events-api"]}
+docker rm -f events registry
+```
+</details>
+
+##MD
+## Break it challenge
+
+This Dockerfile builds, but the container is **unreachable** from the host, the image is **huge**, and every code change **re-downloads all dependencies**. Find all three problems.
+
+```dockerfile
+FROM golang:1.22
+WORKDIR /src
+COPY . .
+RUN go mod download
+RUN go build -o /app .
+CMD ["/app", "--listen", "127.0.0.1:8080"]
+```
+Run with: `docker run -p 8080:8080 badapp` → `curl localhost:8080` fails.
+
+<details><summary>Solution</summary>
+
+1. **Unreachable:** the app listens on `127.0.0.1` inside the container. Port publishing sends traffic to the container's `eth0` IP, not loopback. Listen on `0.0.0.0:8080` (or `:8080`).
+2. **Huge image:** single stage based on the full `golang` image (~800 MB). Use a multi-stage build with a distroless or alpine final stage.
+3. **No dependency cache:** `COPY . .` comes before `go mod download`, so any code change invalidates the download layer. Copy `go.mod`/`go.sum` first, download, then copy the code.
+
+Bonus problem: it runs as **root**. Add a non-root `USER`.
+</details>
+
+##MD
+## Cleanup
+Remove lab containers, networks, and images from this notebook. The `learn` kind cluster is **not** touched. We keep `demoapp:1.0` because later notebooks load it into the cluster.
+
+##CODE
+%%bash
+docker rm -f demo memtest c1 app orders web1 web2 lb registry events >/dev/null 2>&1
+docker network rm dnslab lblab netlab >/dev/null 2>&1
+docker image rm demoapp:single localhost:5001/team/alpine:3.20 >/dev/null 2>&1
+echo "Cleanup done. Kept: demoapp:1.0 (used in later notebooks) and the 'learn' cluster."
+docker image ls demoapp
+
+##MD
+---
+**Next notebook:** [02-Kubernetes-Fundamentals.ipynb](02-Kubernetes-Fundamentals.ipynb) — the architecture of Kubernetes and how one `kubectl apply` travels through the whole system.

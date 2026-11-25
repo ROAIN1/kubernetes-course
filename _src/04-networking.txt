@@ -1,0 +1,1740 @@
+##MD
+# Phase 4 — Kubernetes Networking
+
+Networking is where most real production problems happen. This notebook explains how a packet travels from a user to a container, step by step, and how to debug every step.
+
+**What you will learn**
+- The Kubernetes networking model and Pod-to-Pod traffic
+- Services: ClusterIP, NodePort, LoadBalancer, Headless, ExternalName
+- How Services really work: kube-proxy (iptables / IPVS) and EndpointSlices
+- CoreDNS: names, search domains, `ndots`
+- Ingress and ingress controllers (ingress-nginx), host/path routing, TLS
+- Gateway API (the successor of Ingress)
+- Network Policies (firewall rules for Pods)
+- CNI plugins: Calico, Cilium, Flannel — and OKE's VCN-native networking
+- Service discovery and a step-by-step troubleshooting playbook
+
+**Time:** about 5–6 hours (split over 3 days).
+
+**Prerequisites:** Notebooks 00–03. Basic TCP/IP, DNS, HTTP (notebook 01).
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift+Enter**. Read the text first.
+- `%%writefile` creates YAML in `labs/04/`. `%%bash` runs commands.
+- Compare your output with "Expected output". IPs and names will differ.
+- Quiz answers are hidden behind **Answer**.
+
+##MD
+## 0. Safety check and lab namespace
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx'. This notebook only runs on kind-learn."
+  echo "Fix: kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+mkdir -p labs/04
+kubectl create namespace lab-04 --dry-run=client -o yaml | kubectl apply -f -
+kubectl config set-context --current --namespace=lab-04
+
+##MD
+---
+## 1. The Kubernetes networking model and Pod-to-Pod traffic
+
+### What is it?
+Kubernetes has **three simple rules**. Every network plugin must follow them:
+1. Every Pod gets its **own IP address**.
+2. Every Pod can reach every other Pod **directly by IP**, on any node, **without NAT** (no address translation).
+3. Agents on a node (kubelet, etc.) can reach all Pods on that node.
+
+There are **three different IP ranges** in a cluster. Do not mix them up:
+
+| Range | Example (kind) | Who gives it |
+|---|---|---|
+| Node IPs | 172.18.0.x (Docker network) | The cloud / your VCN subnet |
+| Pod IPs | 10.244.0.0/16 | The CNI plugin |
+| Service IPs | 10.96.0.0/12 | The API server (virtual, never on any interface) |
+
+### Why do we need it?
+Containers move between nodes all the time. Apps should not care *where* the other app runs. One flat network makes this simple: just an IP and a port.
+
+### How it works internally
+The **CNI plugin** (Container Network Interface) does the work. When the kubelet creates a Pod, it calls the CNI plugin. The plugin:
+1. creates a virtual cable (**veth pair**): one end inside the Pod (`eth0`), one end on the node,
+2. gives the Pod an IP from the node's Pod range,
+3. sets routes so other nodes know "10.244.2.0/24 lives on node worker2".
+```
+        Node learn-worker (172.18.0.3)                    Node learn-worker2 (172.18.0.4)
+   ┌───────────────────────────────┐                 ┌───────────────────────────────┐
+   │ Pod A 10.244.1.5              │                 │ Pod B 10.244.2.7              │
+   │   eth0 ──veth── node netns    │                 │   eth0 ──veth── node netns    │
+   │ route: 10.244.2.0/24 via      │ ── 172.18 net ─►│ route: 10.244.1.0/24 via      │
+   │        172.18.0.4             │                 │        172.18.0.3             │
+   └───────────────────────────────┘                 └───────────────────────────────┘
+```
+kind uses **kindnet**: simple routes, no overlay. Other CNIs use an **overlay** (VXLAN: wrap the Pod packet inside a node packet, like Flannel) or **native routing** (Pods get real VPC/VCN IPs, like OKE VCN-native).
+
+### Real production scenario
+On OKE with **VCN-native pod networking**, each Pod gets an IP from a VCN subnet. You can apply **NSGs** and route tables to Pod traffic, and an on-prem system can reach Pods directly. The cost: you must size the Pod subnet. A /24 Pod subnet runs out of IPs quickly, and new Pods stay `ContainerCreating` with "failed to allocate IP". With **flannel** (overlay) on OKE, Pod IPs are internal to the cluster and do not use VCN addresses.
+
+##MD
+### Hands-on lab: see Pod IPs, routes, and talk Pod-to-Pod across nodes
+We create two Pods on **different** nodes (we force it with `nodeName`, only for this demo) and ping between them.
+
+##CODE
+%%bash
+kubectl run pod-a --image=busybox:1.36 --overrides='{"spec":{"nodeName":"learn-worker"}}'  -- sleep 3600
+kubectl run pod-b --image=busybox:1.36 --overrides='{"spec":{"nodeName":"learn-worker2"}}' -- sleep 3600
+kubectl wait --for=condition=Ready pod/pod-a pod/pod-b --timeout=90s
+kubectl get pods -o wide
+B_IP=$(kubectl get pod pod-b -o jsonpath='{.status.podIP}')
+echo "--- pod-a pings pod-b directly at $B_IP (different node, no NAT) ---"
+kubectl exec pod-a -- ping -c 3 "$B_IP"
+echo "--- inside pod-a: one interface, one IP ---"
+kubectl exec pod-a -- ip -4 addr show eth0
+
+##MD
+**Expected output**
+```
+NAME    READY   STATUS    IP           NODE
+pod-a   1/1     Running   10.244.1.4   learn-worker
+pod-b   1/1     Running   10.244.2.3   learn-worker2
+--- pod-a pings pod-b ---
+64 bytes from 10.244.2.3: seq=0 ttl=62 time=0.2 ms
+...
+3 packets transmitted, 3 packets received, 0% packet loss
+--- inside pod-a ---
+eth0@if7: ... inet 10.244.1.4/24 ...
+```
+
+##MD
+Now look at the **node side**: the Pod range of each node and the routes that kindnet created.
+
+##CODE
+%%bash
+echo "--- Pod CIDR per node (given by the controller-manager) ---"
+kubectl get nodes -o custom-columns=NODE:.metadata.name,PODCIDR:.spec.podCIDR,INTERNAL-IP:.status.addresses[0].address
+echo "--- routes on learn-worker: other nodes' Pod ranges go via their node IP ---"
+docker exec learn-worker ip route | grep 10.244
+
+##MD
+**Expected output**
+```
+NODE                  PODCIDR         INTERNAL-IP
+learn-control-plane   10.244.0.0/24   172.18.0.2
+learn-worker          10.244.1.0/24   172.18.0.3
+learn-worker2         10.244.2.0/24   172.18.0.4
+--- routes on learn-worker ---
+10.244.0.0/24 via 172.18.0.2 dev eth0
+10.244.1.4 dev vethxxxx scope host        <- local Pod, through its veth
+10.244.2.0/24 via 172.18.0.4 dev eth0
+```
+This is exactly the diagram: a route per remote node, a veth per local Pod.
+
+##MD
+### Troubleshooting Pod-to-Pod
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pods on same node talk, other node not | Node firewall / security list / NSG blocks Pod traffic between nodes; overlay port (VXLAN UDP 8472) blocked | Open required ports between node subnets |
+| Pod stuck `ContainerCreating`, event "failed to allocate IP" | Pod subnet / IP pool exhausted (common with VCN-native) | Bigger Pod subnet; fewer max Pods per node |
+| Works by IP, not by name | DNS problem, not routing | Go to section 6 (CoreDNS) |
+| Random packet drops for big packets | MTU mismatch with overlay | Set CNI MTU = node MTU − overlay header |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| kindnet, simple routes | Calico / Cilium / cloud CNI (OKE VCN-native or flannel) | Network policy, scale, observability |
+| Pinging Pod IPs | Never hardcode Pod IPs; use Services | Pod IPs change on every restart |
+| Docker bridge network | VCN subnets with NSGs/security lists | Real isolation between tiers |
+
+### Check yourself
+1. What are the three IP ranges in a cluster?
+2. Who gives a Pod its IP?
+3. Should your app config contain Pod IPs? Why?
+
+<details><summary>Answer</summary>
+
+1. Node IPs, Pod IPs, Service IPs.
+2. The CNI plugin (called by the kubelet when the Pod starts).
+3. No. Pod IPs change every time a Pod is recreated. Use a Service name.
+</details>
+
+##MD
+---
+## 2. Services and how they work (kube-proxy, EndpointSlices)
+
+### What is it?
+A **Service** gives a group of Pods **one stable name and one stable virtual IP** (the ClusterIP). Traffic to the Service is spread over the healthy Pods behind it. The Service finds its Pods by **label selector**.
+
+### Why do we need it?
+Pods come and go. Their IPs change. Clients need one address that never changes, plus load balancing, plus "only send to Ready Pods".
+
+### How it works internally
+```
+            Service "web"  ClusterIP 10.96.45.10:80  selector app=web
+                    │
+   EndpointSlice controller watches Pods with app=web AND Ready=true
+                    │  writes
+                    ▼
+   EndpointSlice: 10.244.1.8:5678, 10.244.2.9:5678, 10.244.1.9:5678
+                    │  watched by
+                    ▼
+   kube-proxy on EVERY node programs rules (iptables or IPVS or nftables):
+      "packet to 10.96.45.10:80  ──► DNAT to one of the endpoints (random)"
+```
+Key points:
+- The ClusterIP is **virtual**. No interface has it. You cannot ping it (ICMP is not handled). Only the defined ports work.
+- **kube-proxy does not carry traffic**. It only writes rules into the node kernel. The kernel rewrites the destination (DNAT).
+- **iptables mode** (default): random choice per connection; rule lists get long with thousands of Services.
+- **IPVS mode**: kernel load balancer with hash tables; scales better, more algorithms (round robin, least connection).
+- **nftables mode** (newer): modern replacement for iptables mode.
+- Cilium can replace kube-proxy completely using eBPF.
+- `port` = port of the Service. `targetPort` = port of the container.
+
+### Real production scenario
+After a release, users get 502 errors for 1 minute. Reason: Pods had no readiness probe, so the EndpointSlice included Pods that were still starting. kube-proxy sent traffic to them. Adding a readiness probe fixed it: a Pod is in the EndpointSlice only after it is Ready.
+
+##MD
+### Hands-on lab: a ClusterIP Service in front of 3 Pods
+Each Pod prints its own name. `$(POD_NAME)` in `args` is expanded by Kubernetes from the env var (this works for env vars defined in the container).
+
+##CODE
+%%writefile labs/04/web.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web                 # the Service selects Pods by this label
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name    # Downward API: this Pod's name
+          args: ["-listen=:5678", "-text=hello from $(POD_NAME)"]
+          ports:
+            - name: http                 # named port, the Service can refer to it by name
+              containerPort: 5678
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: ClusterIP           # default type: reachable only inside the cluster
+  selector:
+    app: web                # send traffic to Ready Pods with this label
+  ports:
+    - name: http
+      port: 80              # clients use web:80
+      targetPort: http      # forwarded to the container port named "http" (5678)
+      protocol: TCP
+
+##CODE
+%%bash
+kubectl apply -f labs/04/web.yaml
+kubectl rollout status deploy/web --timeout=120s
+kubectl get svc web
+echo "--- EndpointSlice: the real Pod IPs behind the Service ---"
+kubectl get endpointslices -l kubernetes.io/service-name=web
+kubectl get pods -l app=web -o wide
+
+##MD
+**Expected output**
+```
+NAME   TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)
+web    ClusterIP   10.96.123.45   <none>        80/TCP
+NAME        ADDRESSTYPE   PORTS   ENDPOINTS
+web-8xk2p   IPv4          5678    10.244.1.6,10.244.2.5,10.244.1.7
+```
+The ENDPOINTS are the Pod IPs; the port is the **targetPort** (5678), not 80.
+
+##MD
+### Start a debug client
+We start one long-running "toolbox" Pod with network tools (`curl`, `dig`, `nslookup`, `tcpdump`). `nicolaka/netshoot` is the standard image for this. We reuse it in the whole notebook.
+
+##CODE
+%%bash
+kubectl run client --image=nicolaka/netshoot:v0.13 -- sleep infinity
+kubectl wait --for=condition=Ready pod/client --timeout=120s
+echo "--- 6 requests to the Service: answered by different Pods ---"
+for i in 1 2 3 4 5 6; do kubectl exec client -- curl -s web; done
+echo "--- ping the ClusterIP: does NOT work (virtual IP, only TCP port 80 is handled) ---"
+kubectl exec client -- ping -c 1 -W 2 "$(kubectl get svc web -o jsonpath='{.spec.clusterIP}')" || echo "ping failed, as expected"
+
+##MD
+**Expected output**
+```
+hello from web-6d5f9c7b8-abcde
+hello from web-6d5f9c7b8-xyz12
+hello from web-6d5f9c7b8-abcde
+hello from web-6d5f9c7b8-qwert
+...
+ping failed, as expected
+```
+
+##MD
+### Look at the rules kube-proxy wrote
+We read the NAT table on a node. You see the Service IP and a jump to a chain per endpoint, each with a probability. That is the "random" load balancing.
+
+##CODE
+%%bash
+CIP=$(kubectl get svc web -o jsonpath='{.spec.clusterIP}')
+echo "kube-proxy mode:"; kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep -E '^mode' || true
+echo "--- Service rule ---"
+docker exec learn-worker iptables-save -t nat 2>/dev/null | grep "$CIP" | head -3
+SVC_CHAIN=$(docker exec learn-worker iptables-save -t nat | grep "$CIP" | grep -o 'KUBE-SVC-[A-Z0-9]*' | head -1)
+echo "--- endpoint selection in $SVC_CHAIN ---"
+docker exec learn-worker iptables-save -t nat | grep "^-A $SVC_CHAIN" | grep KUBE-SEP
+echo "(If empty, your kind version may use nftables mode: try 'docker exec learn-worker nft list ruleset | grep $CIP')"
+
+##MD
+**Expected output** (iptables mode)
+```
+kube-proxy mode:
+mode: iptables
+--- Service rule ---
+-A KUBE-SERVICES -d 10.96.123.45/32 -p tcp -m comment --comment "lab-04/web:http cluster IP" -m tcp --dport 80 -j KUBE-SVC-ABC...
+--- endpoint selection ---
+-A KUBE-SVC-ABC... -m statistic --mode random --probability 0.33333 -j KUBE-SEP-111...
+-A KUBE-SVC-ABC... -m statistic --mode random --probability 0.50000 -j KUBE-SEP-222...
+-A KUBE-SVC-ABC... -j KUBE-SEP-333...
+```
+1/3, then 1/2 of the rest, then the last one = equal chance for each Pod.
+
+##MD
+### Prove: readiness controls the endpoints
+We break readiness on one Pod (we change its label so the Service no longer selects it — a quick way to "take a Pod out"). The EndpointSlice updates in about a second.
+
+##CODE
+%%bash
+P=$(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+echo "Removing $P from the Service by changing its label"
+kubectl label pod "$P" app=debug --overwrite
+sleep 3
+kubectl get endpointslices -l kubernetes.io/service-name=web
+echo "--- the ReplicaSet also created a replacement (it counts only app=web Pods) ---"
+kubectl get pods -L app
+kubectl delete pod "$P" --wait=false
+
+##MD
+This is also a real debugging trick: relabel a broken Pod to take it out of traffic, but keep it running so you can investigate it.
+
+##MD
+### Troubleshooting Services
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `curl web` → connection refused / timeout, ENDPOINTS empty | Selector does not match Pod labels, or Pods not Ready | `kubectl get endpointslices -l kubernetes.io/service-name=web`; compare `kubectl get svc web -o yaml` selector with `kubectl get pods --show-labels` |
+| Endpoints OK, still refused | `targetPort` wrong (app listens on other port) | `kubectl exec <pod> -- netstat -tlnp` or check image docs |
+| Works from some nodes only | kube-proxy broken on a node | `kubectl -n kube-system logs ds/kube-proxy`; check pod on that node |
+| App listens on `127.0.0.1` | Not reachable from outside the Pod | App must bind `0.0.0.0` |
+| Ping to ClusterIP fails | Normal | Test with `curl`/`nc` on the Service port |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| iptables kube-proxy | iptables fine up to a few thousand Services; IPVS/nftables or Cilium eBPF for large clusters | Rule update time and CPU |
+| Random balancing | Same; for sticky sessions use `sessionAffinity: ClientIP` or do it at the Ingress | Apps should be stateless ideally |
+| — | `internalTrafficPolicy`/topology-aware routing to keep traffic in the same zone/AD | Lower latency and cross-AD cost |
+
+### Check yourself
+1. Which component writes the iptables rules? Does it forward packets itself?
+2. What is the difference between `port` and `targetPort`?
+3. A Pod is Running but not Ready. Is it in the EndpointSlice?
+4. Why can't you ping a ClusterIP?
+
+<details><summary>Answer</summary>
+
+1. kube-proxy writes rules on every node. The kernel forwards the packets, not kube-proxy.
+2. `port` is what clients call on the Service; `targetPort` is the container's port.
+3. It is listed as not ready (`ready: false`) and gets **no** traffic.
+4. The ClusterIP is virtual. Rules exist only for the Service's TCP/UDP ports, not ICMP.
+</details>
+
+##MD
+---
+## 3. Service types: NodePort and LoadBalancer
+
+### What is it?
+
+| Type | Reachable from | How |
+|---|---|---|
+| `ClusterIP` | Inside the cluster | Virtual IP (section 2) |
+| `NodePort` | Outside, via `<any node IP>:<30000-32767>` | Opens the same port on **every** node, then like ClusterIP |
+| `LoadBalancer` | Internet / VCN via a cloud load balancer | NodePort + the **cloud controller** creates a real LB (on OKE: OCI Load Balancer or Network Load Balancer) |
+
+Each type **builds on the one before**: a LoadBalancer Service also has a NodePort and a ClusterIP.
+
+### How it works internally
+```
+Internet ─► OCI LB (public IP) ─► worker nodes :31234 (NodePort) ─► kube-proxy DNAT ─► Pod :5678
+                 ▲
+ cloud-controller-manager (OCI CCM) watches Services type=LoadBalancer,
+ creates the LB, listeners, backend set (all nodes), health checks,
+ then writes the LB IP into status.loadBalancer.ingress
+```
+`externalTrafficPolicy`:
+- `Cluster` (default): any node accepts and may forward to a Pod on another node. Extra hop, client IP is lost (SNAT).
+- `Local`: node only sends to its own Pods. Keeps the **client source IP**, no extra hop. Nodes without Pods fail the LB health check, so the LB skips them.
+
+### Real production scenario
+Your OKE app needs the real client IP for audit logs, and uses a flexible OCI LB:
+```yaml
+metadata:
+  annotations:
+    service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"     # Mbps
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "100"
+    service.beta.kubernetes.io/oci-load-balancer-internal: "true"         # private LB, no public IP
+    oci.oraclecloud.com/oci-network-security-groups: "<nsg-ocid>"         # attach NSG to the LB
+    # oci.oraclecloud.com/load-balancer-type: "nlb"                       # use Network Load Balancer instead
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+```
+Every LoadBalancer Service = one cloud LB = monthly cost. With 20 apps, use **one** LB in front of an **Ingress controller** instead (section 7).
+
+##MD
+### Hands-on lab: NodePort
+kind nodes are Docker containers. A NodePort is open on each node container. We test it from **inside a node** with `docker exec` (your Mac cannot reach the node IPs directly on macOS).
+
+##CODE
+%%writefile labs/04/svc-nodeport.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+    - port: 80              # ClusterIP port (still created)
+      targetPort: http      # container port
+      nodePort: 30080       # fixed port on every node (30000-32767). Omit to get a random one
+
+##CODE
+%%bash
+kubectl apply -f labs/04/svc-nodeport.yaml
+kubectl get svc web-nodeport
+echo "--- call NodePort 30080 on EVERY node, even the control plane (no web Pod there) ---"
+for n in learn-control-plane learn-worker learn-worker2; do
+  printf "%-22s " "$n:"; docker exec "$n" curl -s localhost:30080
+done
+
+##MD
+**Expected output**
+```
+NAME           TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)
+web-nodeport   NodePort   10.96.200.11   <none>        80:30080/TCP
+learn-control-plane:   hello from web-...
+learn-worker:          hello from web-...
+learn-worker2:         hello from web-...
+```
+The control-plane node has no `web` Pod but still answers: `externalTrafficPolicy: Cluster` forwards to another node.
+
+##MD
+### Hands-on lab: LoadBalancer on kind
+kind has no cloud, so nobody creates a load balancer. The Service stays `<pending>`. This is exactly what you see on any cluster where the cloud controller is broken or missing permissions.
+
+##CODE
+%%bash
+kubectl expose deployment web --name=web-lb --type=LoadBalancer --port=80 --target-port=http
+sleep 5
+kubectl get svc web-lb
+kubectl describe svc web-lb | grep -E 'Type|NodePort|Events'
+
+##MD
+**Expected output**
+```
+NAME     TYPE           CLUSTER-IP    EXTERNAL-IP   PORT(S)
+web-lb   LoadBalancer   10.96.77.88   <pending>     80:3xxxx/TCP
+```
+It still got a NodePort and a ClusterIP. Only the external part is missing.
+
+**Optional:** install [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind) (`brew install cloud-provider-kind`, then run `sudo cloud-provider-kind` in a separate terminal). It acts like a cloud controller for kind and gives `web-lb` an EXTERNAL-IP. Then run the cell again.
+
+##MD
+### Troubleshooting NodePort and LoadBalancer
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| EXTERNAL-IP `<pending>` forever (cloud) | Cloud controller error: wrong annotation, no permission (OCI IAM policy), subnet full, LB limit/quota reached | `kubectl describe svc` → Events; OCI console work requests |
+| LB created, health checks fail | Security list/NSG blocks LB → node NodePort range, or `Local` policy and no Pods on node | Allow 30000-32767 from LB subnet; check Pods |
+| Client IP is a node IP in logs | `externalTrafficPolicy: Cluster` | Use `Local` (or proxy protocol / X-Forwarded-For at Ingress) |
+| NodePort works on one node only | Host firewall (firewalld) on other nodes | Open NodePort range on all nodes |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| NodePort 30080 used directly | Never expose NodePorts to users; put an LB in front | Node IPs change; no TLS; odd ports |
+| One LB per Service | One LB → Ingress controller → many Services | Cost and fewer public IPs |
+| `<pending>` LB | OCI CCM with annotations, NSGs, private LB for internal apps | Security and cost control |
+
+### Check yourself
+1. A LoadBalancer Service also has which two other things?
+2. Which component creates the OCI load balancer?
+3. What do you gain and lose with `externalTrafficPolicy: Local`?
+
+<details><summary>Answer</summary>
+
+1. A NodePort and a ClusterIP.
+2. The cloud-controller-manager (OCI CCM), not kube-proxy.
+3. Gain: real client source IP, no extra hop. Lose: uneven balancing (per node, not per Pod); nodes without Pods are marked unhealthy by the LB.
+</details>
+
+##MD
+---
+## 4. Headless Services
+
+### What is it?
+A Service with `clusterIP: None`. There is **no virtual IP and no load balancing**. DNS returns **all Pod IPs** directly, and (with a StatefulSet) one DNS name per Pod.
+
+### Why do we need it?
+- StatefulSets need per-Pod names (`db-0.db`) — you saw this in notebook 03.
+- Clients that do their own balancing or need to know all members: database drivers (MongoDB, Cassandra), gRPC client-side load balancing, Kafka.
+
+### Hands-on lab: compare DNS of a normal and a headless Service
+
+##CODE
+%%bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-headless
+spec:
+  clusterIP: None          # headless: no VIP, DNS returns Pod IPs
+  selector:
+    app: web
+  ports:
+    - port: 5678
+      targetPort: http
+EOF
+echo "--- normal Service: ONE address (the ClusterIP) ---"
+kubectl exec client -- dig +short web.lab-04.svc.cluster.local
+echo "--- headless Service: ALL ready Pod IPs ---"
+kubectl exec client -- dig +short web-headless.lab-04.svc.cluster.local
+
+##MD
+**Expected output**
+```
+--- normal Service ---
+10.96.123.45
+--- headless Service ---
+10.244.1.6
+10.244.2.5
+10.244.1.7
+```
+
+### Check yourself
+1. Does a headless Service do load balancing?
+2. Name two reasons to use one.
+
+<details><summary>Answer</summary>
+
+1. No. DNS returns all Pod IPs; the client chooses.
+2. StatefulSet per-Pod DNS names; clients that need all members (DB drivers, gRPC client-side LB, peer discovery).
+</details>
+
+##MD
+---
+## 5. ExternalName Services
+
+### What is it?
+A Service that is only a **DNS alias** (CNAME) to a name outside the cluster. No Pods, no proxy, no ports are translated.
+
+### Why do we need it?
+Apps inside the cluster use a stable internal name (`db`) while the real target is outside: a managed database (MySQL HeatWave endpoint), or a service you will migrate later. When you move the DB into the cluster, you change the Service — not the app config.
+
+### Hands-on lab
+
+##CODE
+%%bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-db
+spec:
+  type: ExternalName
+  externalName: example.com      # in real life e.g. the private DNS name of your managed DB
+EOF
+kubectl get svc external-db
+kubectl exec client -- dig external-db.lab-04.svc.cluster.local +noall +answer
+
+##MD
+**Expected output**
+```
+NAME          TYPE           CLUSTER-IP   EXTERNAL-IP   PORT(S)
+external-db   ExternalName   <none>       example.com   <none>
+external-db.lab-04.svc.cluster.local. 5 IN CNAME example.com.
+example.com.                        ... IN A     93.184.x.x
+```
+**Limits:** HTTP `Host` header and TLS certificate name are still the internal name, so HTTPS to an external host often fails with a certificate mismatch. Works best for plain TCP (databases). Do not use IP addresses in `externalName` — use a Service without selector + EndpointSlice for that.
+
+### Check yourself
+1. What DNS record does an ExternalName Service create?
+2. Why can HTTPS through an ExternalName fail?
+
+<details><summary>Answer</summary>
+
+1. A CNAME record.
+2. The client sends the internal name in the TLS SNI / Host header; the external server's certificate does not match it.
+</details>
+
+##MD
+---
+## 6. CoreDNS and service discovery
+
+### What is it?
+**CoreDNS** is the DNS server of the cluster. It runs as a Deployment in `kube-system` behind the Service `kube-dns` (ClusterIP `10.96.0.10` on kind). Every Pod's `/etc/resolv.conf` points to it.
+
+**Service discovery** = how an app finds another app. In Kubernetes it is mainly **DNS**:
+
+| Name | Resolves to |
+|---|---|
+| `web` | Service in the **same** namespace |
+| `web.lab-04` | Service in namespace `lab-04` |
+| `web.lab-04.svc.cluster.local` | Full name (FQDN) |
+| `db-0.db.lab-04.svc.cluster.local` | One StatefulSet Pod (headless) |
+| `_http._tcp.web.lab-04.svc.cluster.local` | SRV record: port number |
+
+(Old way: env vars like `WEB_SERVICE_HOST` injected into Pods. Only for Services that existed before the Pod. Prefer DNS.)
+
+### How it works internally
+```
+Pod /etc/resolv.conf:
+  nameserver 10.96.0.10
+  search lab-04.svc.cluster.local svc.cluster.local cluster.local
+  options ndots:5
+
+App asks "web"  ─► resolver: fewer than 5 dots ─► try search domains in order:
+                   web.lab-04.svc.cluster.local  ✔ found
+App asks "api.github.com" (2 dots < 5) ─► tries
+                   api.github.com.lab-04.svc.cluster.local ✗
+                   api.github.com.svc.cluster.local ✗
+                   api.github.com.cluster.local ✗
+                   api.github.com ✔            (4 queries x A and AAAA = up to 8 queries!)
+CoreDNS: cluster.local zone answered from the Kubernetes API; other names forwarded to the node's upstream DNS
+```
+**ndots:5** means: if a name has fewer than 5 dots, try the search domains first. Good for short internal names; costly for external names.
+
+### Real production scenario
+An app calls an external payment API thousands of times per second. CoreDNS CPU is high and some requests are slow. Reason: `ndots:5` creates 4–8 DNS queries per lookup. Fixes: use a trailing dot (`api.payment.com.` = absolute name), set `dnsConfig: {options: [{name: ndots, value: "2"}]}` for that app, scale CoreDNS, or use **NodeLocal DNSCache**.
+
+##MD
+### Hands-on lab: read resolv.conf and resolve names
+
+##CODE
+%%bash
+echo "--- the Pod's DNS config ---"
+kubectl exec client -- cat /etc/resolv.conf
+echo "--- CoreDNS itself ---"
+kubectl -n kube-system get svc kube-dns
+kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+echo "--- short, namespaced and full names all work ---"
+for n in web web.lab-04 web.lab-04.svc.cluster.local kubernetes.default; do
+  printf "%-32s -> " "$n"; kubectl exec client -- dig +short +search "$n" | tail -1
+done
+echo "--- SRV record: discover the port ---"
+kubectl exec client -- dig +short SRV _http._tcp.web.lab-04.svc.cluster.local
+
+##MD
+**Expected output**
+```
+nameserver 10.96.0.10
+search lab-04.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+NAME       TYPE        CLUSTER-IP   PORT(S)
+kube-dns   ClusterIP   10.96.0.10   53/UDP,53/TCP,9153/TCP
+coredns-xxxx   1/1  Running  ...
+web                              -> 10.96.123.45
+web.lab-04                       -> 10.96.123.45
+web.lab-04.svc.cluster.local     -> 10.96.123.45
+kubernetes.default               -> 10.96.0.1
+0 100 80 web.lab-04.svc.cluster.local.
+```
+Note: `dig` ignores the search list unless you add `+search`. `nslookup` and normal apps use it.
+
+##MD
+### See the ndots cost with your own eyes
+We turn on CoreDNS query logging for a moment, resolve an external name, and count the queries.
+
+##CODE
+%%bash
+echo "--- CoreDNS config (Corefile) ---"
+kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'
+kubectl -n kube-system get cm coredns -o yaml > labs/04/coredns-backup.yaml
+# add the 'log' plugin after 'errors' (temporary)
+kubectl -n kube-system get cm coredns -o json \
+ | python3 -c "import json,sys; c=json.load(sys.stdin); cf=c['data']['Corefile']; c['data']['Corefile']=cf if '    log\n' in cf else cf.replace('    errors\n','    errors\n    log\n',1); print(json.dumps(c))" \
+ | kubectl apply -f -
+echo "waiting for CoreDNS to reload (reload plugin, ~30s)..."; sleep 35
+kubectl exec client -- nslookup example.com >/dev/null 2>&1
+kubectl exec client -- nslookup example.com. >/dev/null 2>&1
+sleep 2
+echo "--- queries CoreDNS received ---"
+kubectl -n kube-system logs -l k8s-app=kube-dns --since=20s | grep -o '"[A-Z]* IN [^ ]*' | sort | uniq -c
+
+##MD
+**Expected output** (roughly)
+```
+1 "A IN example.com.lab-04.svc.cluster.local."
+1 "A IN example.com.svc.cluster.local."
+1 "A IN example.com.cluster.local."
+2 "A IN example.com."
+1 "AAAA IN example.com.lab-04.svc.cluster.local." ...
+```
+`example.com` (no trailing dot) → several useless queries first. `example.com.` (trailing dot) → one query.
+
+Now restore the original CoreDNS config:
+
+##CODE
+%%bash
+kubectl apply -f labs/04/coredns-backup.yaml
+kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep -c '^    log$' || echo "log plugin removed (0 = restored)"
+
+##MD
+### Troubleshooting DNS
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `nslookup web` fails, IP works | Wrong namespace (use `web.<ns>`), or Service missing | `kubectl get svc -A | grep web` |
+| All DNS fails in a Pod | CoreDNS down, or NetworkPolicy blocks UDP/TCP 53 to kube-system | `kubectl -n kube-system get pods -l k8s-app=kube-dns`; check egress policy |
+| External names fail, internal OK | CoreDNS upstream (node `/etc/resolv.conf`) cannot reach DNS | `kubectl -n kube-system logs -l k8s-app=kube-dns` |
+| Slow lookups, 5s delays | ndots search + AAAA, conntrack race on UDP | trailing dot, lower ndots, NodeLocal DNSCache |
+| `dnsPolicy: Default` set by mistake | Pod uses node DNS, no cluster names | Use `ClusterFirst` (the default) |
+
+**Debug recipe:** `kubectl run -it --rm dbg --image=nicolaka/netshoot:v0.13 -- bash` then `cat /etc/resolv.conf`, `dig @10.96.0.10 web.lab-04.svc.cluster.local`.
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| 2 CoreDNS replicas | CoreDNS autoscaling (OKE has a cluster add-on), Pod anti-affinity, PDB | DNS down = whole cluster down |
+| Query log on and off by hand | Monitor CoreDNS metrics (`coredns_dns_requests_total`, latency, SERVFAIL) | Spot DNS problems early |
+| Default ndots | Tune per app; NodeLocal DNSCache for heavy DNS users | Less load and latency |
+
+### Check yourself
+1. What is the full DNS name of Service `api` in namespace `shop`?
+2. What does `ndots:5` do?
+3. How do you make one lookup for an external name instead of many?
+4. Which Service and namespace does CoreDNS run in?
+
+<details><summary>Answer</summary>
+
+1. `api.shop.svc.cluster.local`.
+2. Names with fewer than 5 dots are tried with each search domain first, before the name as typed.
+3. Use a trailing dot (`example.com.`), or lower ndots for that Pod.
+4. Service `kube-dns` in `kube-system` (Pods labelled `k8s-app=kube-dns`).
+</details>
+
+##MD
+---
+## 7. Ingress and ingress controllers
+
+### What is it?
+- An **Ingress** is a set of **HTTP/HTTPS routing rules**: "host `shop.example.com`, path `/api` → Service `api` port 80".
+- An **ingress controller** is the software that **reads** Ingress objects and **does** the routing. It is a reverse proxy running as Pods (ingress-nginx, Traefik, HAProxy, the OCI Native Ingress Controller, ...).
+
+An Ingress object alone does nothing. You must install a controller.
+
+> Note: the community **ingress-nginx** project was retired in March 2026 (no more fixes). We still use it here because it is the simplest way to learn the Ingress API on kind. For new production work, choose a maintained controller or a **Gateway API** implementation (section 8).
+
+### Why do we need it?
+- One load balancer for many apps (cost!).
+- Routing by host name and URL path.
+- TLS termination in one place, redirects, rate limits, auth.
+
+### How it works internally
+```
+Browser ─► https://shop.local/api
+   │
+   ▼  (prod: one OCI LB / on kind: port 80/443 of the control-plane container mapped to your Mac)
+ingress-nginx controller Pod(s)
+   │  watches Ingress, Service, EndpointSlice, Secret objects via the API
+   │  writes nginx.conf and reloads
+   ├── Host shop.local, path /api  ─► Service api ─► Pod IPs (direct to endpoints)
+   └── Host shop.local, path /     ─► Service web ─► Pod IPs
+```
+`ingressClassName` says which controller owns an Ingress (you can run several).
+
+### Real production scenario
+You host 12 Misk-style web apps on one OKE cluster. Instead of 12 OCI load balancers, you run one ingress controller behind one flexible OCI LB. Each team creates an Ingress with its host name. TLS certificates are issued automatically by **cert-manager** and stored as Secrets.
+
+##MD
+### Hands-on lab: install ingress-nginx for kind
+This manifest is prepared by the kind project. It runs the controller on the node labelled `ingress-ready=true` and uses host ports 80/443, which the cluster config from notebook 00 maps to your Mac.
+
+##CODE
+%%bash
+kubectl get nodes -l ingress-ready=true
+kubectl apply -f https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml
+kubectl wait --namespace ingress-nginx --for=condition=Ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=180s
+kubectl get pods,svc -n ingress-nginx
+kubectl get ingressclass
+
+##MD
+**Expected output**
+```
+NAME                  STATUS   ROLES
+learn-control-plane   Ready    control-plane
+...
+pod/ingress-nginx-controller-xxxx   1/1   Running
+NAME    CONTROLLER             ...
+nginx   k8s.io/ingress-nginx
+```
+If no node is listed in the first line, your cluster was created without the ingress config. Recreate it with the config from notebook 00.
+
+##MD
+### Hands-on lab: host and path routing
+We create a second app `api`, then one Ingress with two hosts and two paths.
+
+##CODE
+%%writefile labs/04/ingress.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: api}
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=API v1 response"]
+          ports: [{name: http, containerPort: 5678}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector: {app: api}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /   # controller-specific: strip /api before sending to the api Service
+spec:
+  ingressClassName: nginx            # which controller handles this Ingress
+  rules:
+    - host: shop.local               # match the HTTP Host header
+      http:
+        paths:
+          - path: /api               # requests to shop.local/api...
+            pathType: Prefix         # Prefix = /api, /api/, /api/x ; Exact = only /api
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+    - host: admin.local              # second host on the SAME load balancer / IP
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+
+##CODE
+%%bash
+kubectl apply -f labs/04/ingress.yaml
+kubectl rollout status deploy/api --timeout=90s
+sleep 10
+kubectl get ingress shop
+echo "--- from your Mac, port 80 -> ingress controller. We set the Host header by hand ---"
+echo -n "shop.local/      : "; curl -s -H 'Host: shop.local'  http://localhost/
+echo -n "shop.local/api   : "; curl -s -H 'Host: shop.local'  http://localhost/api
+echo -n "admin.local/     : "; curl -s -H 'Host: admin.local' http://localhost/
+echo -n "unknown host     : "; curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: other.local' http://localhost/
+
+##MD
+**Expected output**
+```
+NAME   CLASS   HOSTS                    ADDRESS     PORTS
+shop   nginx   shop.local,admin.local   localhost   80
+shop.local/      : hello from web-6d5f9c7b8-abcde
+shop.local/api   : API v1 response
+admin.local/     : API v1 response
+unknown host     : 404
+```
+Instead of `-H Host:` you can add `127.0.0.1 shop.local admin.local` to `/etc/hosts` on your Mac and open http://shop.local in a browser.
+
+##MD
+### Hands-on lab: TLS with a self-signed certificate
+TLS certificates live in a Secret of type `kubernetes.io/tls`. The Ingress refers to it in `spec.tls`. The controller does the TLS handshake (TLS **termination**) and sends plain HTTP to the Pods.
+
+##CODE
+%%bash
+cd labs/04
+openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+  -keyout shop.key -out shop.crt -subj "/CN=shop.local" \
+  -addext "subjectAltName=DNS:shop.local" 2>/dev/null
+kubectl create secret tls shop-tls --cert=shop.crt --key=shop.key --dry-run=client -o yaml | kubectl apply -f -
+kubectl patch ingress shop --type=merge -p '{"spec":{"tls":[{"hosts":["shop.local"],"secretName":"shop-tls"}]}}'
+sleep 5
+echo "--- HTTPS (-k accepts our self-signed cert; --resolve maps the name to 127.0.0.1) ---"
+curl -sk --resolve shop.local:443:127.0.0.1 https://shop.local/api; echo
+echo "--- which certificate did we get? ---"
+curl -skv --resolve shop.local:443:127.0.0.1 https://shop.local/ 2>&1 | grep -E 'subject:|issuer:'
+echo "--- HTTP now redirects to HTTPS (ingress-nginx default when TLS is set) ---"
+curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' -H 'Host: shop.local' http://localhost/
+
+##MD
+**Expected output**
+```
+secret/shop-tls created
+ingress.networking.k8s.io/shop patched
+--- HTTPS ---
+API v1 response
+--- which certificate ---
+*  subject: CN=shop.local
+*  issuer: CN=shop.local
+--- HTTP now redirects ---
+308 -> https://shop.local/
+```
+If the subject shows `Kubernetes Ingress Controller Fake Certificate`, the Secret name or host does not match — check `kubectl describe ingress shop`.
+
+##MD
+### Troubleshooting Ingress
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Ingress ADDRESS empty, nothing happens | No controller, or wrong `ingressClassName` | `kubectl get ingressclass`; install controller |
+| 404 from nginx | Host/path does not match any rule | Check Host header, `pathType`, trailing slashes |
+| 503 Service Temporarily Unavailable | Service has no ready endpoints | `kubectl get endpointslices -l kubernetes.io/service-name=<svc>` |
+| 502 Bad Gateway | Pod answers wrongly / wrong targetPort / app crashed mid-request | Controller logs: `kubectl -n ingress-nginx logs deploy/ingress-nginx-controller` |
+| "Fake Certificate" | TLS Secret missing, wrong namespace, or host not in cert | Secret must be in the **same namespace** as the Ingress |
+| 413 Request Entity Too Large | Upload bigger than nginx default (1m) | Annotation `nginx.ingress.kubernetes.io/proxy-body-size: 50m` |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| Host ports on one kind node | Controller Deployment ≥2 replicas behind a cloud LB (`Service type: LoadBalancer`), PDB, anti-affinity | No single point of failure |
+| Self-signed cert by openssl | cert-manager + Let's Encrypt or your CA; automatic renewal; alerts on expiry | Expired certs are a top outage cause |
+| ingress-nginx (retired) | A maintained controller or Gateway API implementation (Envoy Gateway, Cilium, NGINX Gateway Fabric, OCI Native Ingress Controller) | Security fixes |
+| No WAF | WAF in front (OCI WAF, Cloudflare) | OWASP protection |
+
+### Check yourself
+1. What is the difference between an Ingress and an ingress controller?
+2. Many apps, one public IP. How?
+3. You see 503 from the controller. What do you check first?
+4. Where must the TLS Secret live?
+
+<details><summary>Answer</summary>
+
+1. Ingress = routing rules (an API object). Controller = the proxy that implements them.
+2. One LB → ingress controller → host/path rules to many Services.
+3. The backend Service's endpoints (no ready Pods, or selector mismatch).
+4. In the same namespace as the Ingress that uses it.
+</details>
+
+##MD
+---
+## 8. Gateway API
+
+### What is it?
+**Gateway API** is the newer, richer replacement for Ingress (stable `gateway.networking.k8s.io/v1`). It splits the job into roles:
+
+| Object | Owned by | Meaning |
+|---|---|---|
+| `GatewayClass` | Infra provider | "Which implementation" (like IngressClass) |
+| `Gateway` | Platform / ops team | "A load balancer with these listeners (ports, TLS, hostnames)" |
+| `HTTPRoute` (also `GRPCRoute`, `TLSRoute`, ...) | App team | "Send these requests to my Service" |
+
+### Why do we need it?
+Ingress is limited: only HTTP host/path, and everything else (rewrites, header matching, traffic split, timeouts) is hidden in controller-specific **annotations** that do not work across controllers. Gateway API puts these features in the standard API, and lets ops and app teams own different objects safely.
+
+### How it works internally
+```
+GatewayClass "eg" (controllerName: gateway.envoyproxy.io/...)
+      ▲
+Gateway "public" (listener HTTP :80, hostnames *.local, allowedRoutes: from namespaces with label)
+      ▲  parentRefs
+HTTPRoute "shop" (host shop.local; /api -> api:80 weight 90, api-v2:80 weight 10; header match; redirects)
+```
+Canary deployments with `weight` and header-based routing are built in.
+
+### Hands-on lab (manifests + optional install)
+We install only the Gateway API **CRDs** (the new object types). Without an implementation (controller), the Gateway shows `Accepted: Unknown / waiting for controller` — that is expected and teaches you to read the status. The last cell shows how to add a real implementation if you want.
+
+##CODE
+%%bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+kubectl get crd | grep gateway.networking.k8s.io
+
+##CODE
+%%writefile labs/04/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+spec:
+  gatewayClassName: eg            # must match an installed GatewayClass (here: Envoy Gateway, optional install)
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.local"         # only these host names
+      allowedRoutes:
+        namespaces:
+          from: Same              # only routes from this namespace may attach (ops controls this)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+spec:
+  parentRefs:
+    - name: public                # attach to the Gateway above
+  hostnames: ["shop.local"]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /api}
+          headers:
+            - name: x-canary      # requests with header x-canary: true ...
+              value: "true"
+      backendRefs:
+        - {name: api, port: 80}   # ...always go to api (e.g. the new version)
+    - matches:
+        - path: {type: PathPrefix, value: /api}
+      backendRefs:                # canary split without annotations:
+        - {name: api, port: 80, weight: 90}
+        - {name: web, port: 80, weight: 10}
+    - backendRefs:
+        - {name: web, port: 80}   # everything else
+
+##CODE
+%%bash
+kubectl apply -f labs/04/gateway.yaml
+sleep 3
+kubectl get gateway,httproute
+kubectl get gateway public -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
+
+##MD
+**Expected output (no implementation installed)**
+```
+NAME     CLASS   ADDRESS   PROGRAMMED   AGE
+public   eg                Unknown      5s
+NAME    HOSTNAMES        AGE
+shop    ["shop.local"]   5s
+Accepted=Unknown (Pending)
+Programmed=Unknown (Pending)
+```
+"Pending" = no controller owns GatewayClass `eg`. The same thing happens in production when the class name is wrong.
+
+**Optional — make it real with Envoy Gateway** (needs Helm from notebook 00 and cloud-provider-kind for the LB IP):
+```bash
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.2.1 -n envoy-gateway-system --create-namespace
+kubectl apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: eg}
+spec: {controllerName: gateway.envoyproxy.io/gatewayclass-controller}
+EOF
+kubectl get gateway public   # PROGRAMMED=True, ADDRESS filled (with cloud-provider-kind)
+```
+
+### Lab vs Production
+| This lab | Production | Why |
+|---|---|---|
+| CRDs only | A supported implementation (Envoy Gateway, Cilium, Istio, NGINX Gateway Fabric, cloud controllers) | Something must program the data plane |
+| One namespace | Gateway in an infra namespace; `allowedRoutes` by namespace label; ReferenceGrant for cross-namespace | Teams self-serve safely |
+
+### Check yourself
+1. Which object would an app team own, and which the platform team?
+2. How do you do a 90/10 canary in Gateway API?
+3. Your Gateway status is `Pending`. Most likely cause?
+
+<details><summary>Answer</summary>
+
+1. App team: HTTPRoute. Platform team: Gateway (and GatewayClass from the provider).
+2. Two `backendRefs` in one rule with `weight: 90` and `weight: 10`.
+3. No controller for that `gatewayClassName` (not installed or name typo).
+</details>
+
+##MD
+---
+## 9. Network Policies
+
+### What is it?
+A **NetworkPolicy** is a **firewall rule for Pods**. It selects Pods by label and says which traffic is allowed **in** (ingress) and **out** (egress), by Pod labels, namespace labels, or IP blocks (CIDR), plus ports.
+
+Default behaviour: **everything is allowed**. As soon as one policy selects a Pod for a direction, that direction becomes **deny-all except what policies allow**. Policies only add "allow" rules; they add up (union).
+
+### Why do we need it?
+The flat network (section 1) means a hacked frontend Pod can reach your database Pod directly. Network Policies give **micro-segmentation** — like NSGs, but per Pod and per label, inside the cluster.
+
+### How it works internally
+The **CNI plugin** enforces policies (Calico with iptables/eBPF, Cilium with eBPF). The API server only stores them.
+**If your CNI does not support policies, they are silently ignored.** No error.
+
+```
+namespace lab-np
+  [web]  ──allowed──►  [db :5432]     policy on db: ingress from podSelector app=web, port 5432
+  [other] ───✗──────►  [db]
+  [db]   ──egress──►   kube-dns :53   (if you deny egress, you MUST allow DNS!)
+```
+
+### Real production scenario
+Audit finding: "database Pods reachable from all namespaces". You apply a **default-deny** policy in the `payments` namespace, then allow only `app=payments-api` → `app=postgres:5432`, and DNS egress to `kube-system`. Monitoring still needs to scrape metrics, so you also allow ingress from the `monitoring` namespace on the metrics port. You test every rule before and after.
+
+##MD
+### Important: does your kind cluster enforce policies?
+kind's default CNI (kindnet) has historically **not** enforced NetworkPolicy (newer kind releases started adding basic support). Do not guess — **test it**. The lab below works either way:
+- If the "after deny" test is **blocked** → your CNI enforces.
+- If it **still works** → policies are ignored. Then do the optional Calico cluster lab after it.
+
+##CODE
+%%writefile labs/04/netpol.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab-np
+  labels:
+    purpose: netpol-lab
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+  namespace: lab-np
+  labels: {app: db}
+spec:
+  containers:
+    - name: db
+      image: hashicorp/http-echo:1.0
+      args: ["-listen=:5432", "-text=db reached"]   # pretend database on port 5432
+      ports: [{containerPort: 5432}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: db, namespace: lab-np}
+spec:
+  selector: {app: db}
+  ports: [{port: 5432}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: lab-np
+  labels: {app: web}          # this one will be allowed
+spec:
+  containers: [{name: c, image: "nicolaka/netshoot:v0.13", command: ["sleep", "infinity"]}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: other
+  namespace: lab-np
+  labels: {app: other}        # this one will be blocked
+spec:
+  containers: [{name: c, image: "nicolaka/netshoot:v0.13", command: ["sleep", "infinity"]}]
+
+##CODE
+%%writefile labs/04/netpol-rules.yaml
+# 1) default deny: selects ALL Pods in the namespace, allows nothing in or out
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: lab-np
+spec:
+  podSelector: {}             # {} = every Pod in this namespace
+  policyTypes: [Ingress, Egress]
+---
+# 2) allow DNS for every Pod (otherwise even name lookups fail)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: lab-np
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system   # label every namespace has automatically
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns                          # AND (same list item) = CoreDNS Pods only
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# 3) db accepts traffic only from app=web on 5432
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-from-web
+  namespace: lab-np
+spec:
+  podSelector:
+    matchLabels: {app: db}    # policy applies TO the db Pods
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: web}   # FROM web Pods in the same namespace
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# 4) web may send to db on 5432 (egress side must ALSO allow it, because egress is default-deny)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-allow-to-db
+  namespace: lab-np
+spec:
+  podSelector:
+    matchLabels: {app: web}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: db}
+      ports:
+        - {protocol: TCP, port: 5432}
+
+##CODE
+%%bash
+CTX=$(kubectl config current-context)
+kubectl apply -f labs/04/netpol.yaml
+kubectl -n lab-np wait --for=condition=Ready pod --all --timeout=120s
+t() { printf "%-30s" "$1"; kubectl -n lab-np exec "$2" -- curl -s -m 3 db:5432 || echo "BLOCKED (timeout)"; }
+echo "=== BEFORE policies ($CTX) ==="
+t "web   -> db:5432 :" web
+t "other -> db:5432 :" other
+kubectl apply -f labs/04/netpol-rules.yaml
+sleep 5
+echo "=== AFTER policies ==="
+t "web   -> db:5432 :" web
+t "other -> db:5432 :" other
+printf "%-30s" "other -> internet :"; kubectl -n lab-np exec other -- curl -s -m 3 -o /dev/null -w '%{http_code}\n' https://example.com || echo "BLOCKED (timeout)"
+
+##MD
+**Expected output — CNI that enforces policies (Calico/Cilium, or kindnet with policy support)**
+```
+=== BEFORE policies ===
+web   -> db:5432 :           db reached
+other -> db:5432 :           db reached
+=== AFTER policies ===
+web   -> db:5432 :           db reached
+other -> db:5432 :           BLOCKED (timeout)
+other -> internet :          BLOCKED (timeout)
+```
+**If "other" still reaches db after the policies, your CNI ignores NetworkPolicy.** The YAML is correct; the cluster does not enforce it. This is a dangerous situation in production: the policies *look* applied. Continue with the optional Calico lab below.
+
+##MD
+### Optional: a second kind cluster with Calico (enforces policies)
+This creates a small separate cluster `learn-np` **without** the default CNI and installs Calico. Then it re-runs the same test. It takes ~5 minutes and ~2 GB RAM. The guard for this part accepts only `kind-learn-np`.
+
+##CODE
+%%writefile labs/04/kind-calico.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true        # do not install kindnet; we install Calico
+  podSubnet: 192.168.0.0/16      # Calico's default IP pool
+nodes:
+  - role: control-plane
+  - role: worker
+
+##CODE
+%%bash
+kind get clusters | grep -qx learn-np || kind create cluster --name learn-np --config labs/04/kind-calico.yaml
+kubectl config use-context kind-learn-np
+[ "$(kubectl config current-context)" = "kind-learn-np" ] || { echo "STOP: not on kind-learn-np"; exit 1; }
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+kubectl -n kube-system rollout status ds/calico-node --timeout=300s
+kubectl get nodes
+
+##CODE
+%%bash
+[ "$(kubectl config current-context)" = "kind-learn-np" ] || { echo "STOP: not on kind-learn-np"; exit 1; }
+kubectl delete -f labs/04/netpol-rules.yaml --ignore-not-found >/dev/null 2>&1
+kubectl apply -f labs/04/netpol.yaml
+kubectl -n lab-np wait --for=condition=Ready pod --all --timeout=180s
+t() { printf "%-30s" "$1"; kubectl -n lab-np exec "$2" -- curl -s -m 3 db:5432 || echo "BLOCKED (timeout)"; }
+echo "=== BEFORE (Calico) ==="; t "other -> db:5432 :" other
+kubectl apply -f labs/04/netpol-rules.yaml; sleep 5
+echo "=== AFTER (Calico) ==="; t "web   -> db:5432 :" web; t "other -> db:5432 :" other
+echo "--- switching back to the main lab cluster ---"
+kubectl config use-context kind-learn
+kubectl config set-context --current --namespace=lab-04
+
+##MD
+**Expected output**
+```
+=== BEFORE (Calico) ===
+other -> db:5432 :           db reached
+=== AFTER (Calico) ===
+web   -> db:5432 :           db reached
+other -> db:5432 :           BLOCKED (timeout)
+```
+Delete the extra cluster when done: `kind delete cluster --name learn-np` (also in the cleanup cell).
+
+##MD
+### Common NetworkPolicy mistakes (very important)
+
+**1. AND vs OR in `from`/`to`:**
+```yaml
+from:                       # ONE item with two selectors = AND
+  - namespaceSelector: {matchLabels: {team: a}}
+    podSelector: {matchLabels: {app: web}}      # web Pods IN namespaces of team a
+---
+from:                       # TWO items = OR
+  - namespaceSelector: {matchLabels: {team: a}} # ANY Pod in team a namespaces
+  - podSelector: {matchLabels: {app: web}}      # OR web Pods in THIS namespace
+```
+One dash changes the meaning completely.
+
+**2. Forgetting DNS** after egress default-deny → every name lookup fails, looks like "network is down".
+
+**3. Forgetting the other side:** with default-deny on both directions, you need an egress rule on the client **and** an ingress rule on the server.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Policies have no effect | CNI does not enforce | Use Calico/Cilium; on OKE flannel, install Calico for policy, or use VCN-native + NSGs |
+| Everything broke after default-deny | No DNS egress, no monitoring/ingress-controller allow | Add allow rules for DNS, ingress controller namespace, Prometheus |
+| Too much allowed | Two list items (OR) instead of one (AND) | Check indentation/dashes |
+| Can't select by namespace name | Used custom label | Use `kubernetes.io/metadata.name: <ns>` |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| One namespace | Default-deny in every app namespace, managed in Git | Zero trust by default |
+| Test by curl | Test policies in CI (e.g. with a policy test tool) and with Cilium Hubble / Calico flow logs | Prove what is allowed |
+| Pod-level only | Combine with NSGs/security lists at node and LB level | Defense in depth |
+
+### Check yourself
+1. With no NetworkPolicy at all, what traffic is allowed?
+2. You add a default-deny egress policy. What breaks first?
+3. One `from` item with namespaceSelector and podSelector — AND or OR?
+4. Who enforces NetworkPolicy?
+
+<details><summary>Answer</summary>
+
+1. Everything.
+2. DNS (and then all calls by name).
+3. AND. Two separate items would be OR.
+4. The CNI plugin. If it does not support policies, they are ignored silently.
+</details>
+
+##MD
+---
+## 10. CNI plugins: Calico vs Cilium vs Flannel (and OKE)
+
+### What is it?
+A **CNI plugin** sets up Pod networking: IP addresses (IPAM), routes or overlay, and optionally Network Policy and observability. Kubernetes itself does not include one.
+
+| | Flannel | Calico | Cilium |
+|---|---|---|---|
+| Main idea | Simple overlay (VXLAN) | Routing (BGP) or overlay; iptables or eBPF data plane | eBPF everywhere |
+| NetworkPolicy | **No** (alone) | Yes, plus extended policies (global, deny rules, order) | Yes, plus L7 (HTTP/DNS-aware) policies |
+| kube-proxy replacement | No | Yes (eBPF mode) | Yes |
+| Observability | Basic | Flow logs (Enterprise / some OSS) | **Hubble**: live flow visibility |
+| Complexity | Low | Medium | Medium–high |
+| Typical use | Small/simple clusters | Enterprise policy, BGP to data center | Performance, security, service mesh features |
+
+**OKE options:**
+- **Flannel overlay**: Pod IPs from a private cluster range; simple; NetworkPolicy needs Calico added on top.
+- **OCI VCN-native pod networking**: Pods get VCN IPs; NSGs can apply to Pods; direct routing from the VCN/on-prem; needs IP planning (Pod subnet size × max Pods per node).
+- Cilium can also be installed on OKE (your notes on "OCI OKE Cilium and eBPF" relate to this).
+
+### How to check which CNI a cluster uses
+
+##CODE
+%%bash
+echo "--- CNI config on a node (the kubelet reads /etc/cni/net.d) ---"
+docker exec learn-worker ls /etc/cni/net.d
+docker exec learn-worker sh -c 'cat /etc/cni/net.d/*.conflist' | head -20
+echo "--- CNI Pods ---"
+kubectl -n kube-system get ds
+
+##MD
+**Expected output**
+```
+10-kindnet.conflist
+{ "cniVersion": "0.3.1", "name": "kindnet", "plugins": [ { "type": "ptp", ... "ipam": {"type": "host-local", ...
+NAME         DESIRED   ...
+kindnet      3
+kube-proxy   3
+```
+On OKE you would see e.g. `kube-flannel-ds` or the VCN-native CNI DaemonSet, and on Cilium clusters `cilium`.
+
+### Check yourself
+1. Which of the three cannot enforce NetworkPolicy alone?
+2. What is one advantage and one cost of OKE VCN-native pod networking?
+3. Where on a node is the CNI configuration?
+
+<details><summary>Answer</summary>
+
+1. Flannel.
+2. Advantage: Pods have VCN IPs, NSGs and VCN routing apply, direct reachability. Cost: consumes VCN IPs; needs careful subnet sizing.
+3. `/etc/cni/net.d/` (binaries in `/opt/cni/bin/`).
+</details>
+
+##MD
+---
+## 11. Network troubleshooting playbook
+
+When "the app cannot reach the service", go **layer by layer, from the client to the container**. Do not jump. At each step you either find the problem or prove that layer works.
+
+```
+ 1. DNS        name resolves?                       nslookup / dig
+ 2. Service    Service exists, right port/selector? kubectl get svc -o yaml
+ 3. Endpoints  ready Pod IPs behind it?             kubectl get endpointslices
+ 4. Pod IP     reach a Pod IP directly?             curl <podIP>:<targetPort>
+ 5. Container  app listening on that port, 0.0.0.0? ss -tlnp inside Pod / logs
+ 6. Policy     NetworkPolicy / NSG / firewall?      kubectl get netpol -A, cloud rules
+ (outside → in: LB health → NodePort → Ingress controller logs → step 2)
+```
+
+##CODE
+%%bash
+# A reusable checker: ./labs/04/netcheck.sh <service> <namespace>
+cat > labs/04/netcheck.sh <<'EOF'
+#!/usr/bin/env bash
+# Layer-by-layer check of a Service, run from the 'client' debug Pod in lab-04.
+SVC=${1:-web}; NS=${2:-lab-04}; C="kubectl -n lab-04 exec client --"
+echo "1) DNS";        $C dig +short "$SVC.$NS.svc.cluster.local" || echo "   DNS FAILED"
+echo "2) Service";    kubectl -n "$NS" get svc "$SVC" -o jsonpath='   type={.spec.type} clusterIP={.spec.clusterIP} ports={.spec.ports[*].port}->{.spec.ports[*].targetPort} selector={.spec.selector}{"\n"}' || exit 1
+echo "3) Endpoints";  EPS=$(kubectl -n "$NS" get endpointslices -l kubernetes.io/service-name="$SVC" -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.addresses[0]}{" "}{end}')
+                      PORT=$(kubectl -n "$NS" get endpointslices -l kubernetes.io/service-name="$SVC" -o jsonpath='{.items[0].ports[0].port}')
+                      echo "   ready: ${EPS:-NONE}  port: ${PORT:-?}"; [ -z "$EPS" ] && { echo "   -> check selector vs pod labels and readiness"; exit 1; }
+echo "4) Pod IPs";    for ip in $EPS; do printf "   %s:%s -> " "$ip" "$PORT"; $C curl -s -m 2 -o /dev/null -w '%{http_code}\n' "http://$ip:$PORT/" || echo "FAIL"; done
+echo "5) Service IP"; $C curl -s -m 2 -o /dev/null -w '   HTTP %{http_code} via service\n' "http://$SVC.$NS.svc.cluster.local:$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].port}')/" || echo "   FAIL via service"
+echo "6) Policies";   kubectl -n "$NS" get networkpolicy 2>/dev/null | sed 's/^/   /' || true
+EOF
+chmod +x labs/04/netcheck.sh
+./labs/04/netcheck.sh web lab-04
+
+##MD
+**Expected output**
+```
+1) DNS
+10.96.123.45
+2) Service
+   type=ClusterIP clusterIP=10.96.123.45 ports=80->http selector={"app":"web"}
+3) Endpoints
+   ready: 10.244.1.6 10.244.2.5 10.244.1.7   port: 5678
+4) Pod IPs
+   10.244.1.6:5678 -> 200
+   ...
+5) Service IP
+   HTTP 200 via service
+6) Policies
+```
+
+##MD
+### Practice the playbook on a broken Service
+This Service has a mistake. Run the checker and find at which step it fails.
+
+##CODE
+%%bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-broken
+spec:
+  selector:
+    app: webapp            # <- hmm
+  ports:
+    - port: 80
+      targetPort: http
+EOF
+./labs/04/netcheck.sh web-broken lab-04 || true
+
+##MD
+<details><summary>Answer</summary>
+
+Step 3 fails: `ready: NONE`. The selector is `app: webapp`, but the Pods have `app: web`. DNS and the Service exist, so the name resolves — but there is nobody behind it. Fix the selector to `app: web`. This is the #1 Service bug in real life.
+</details>
+
+**Useful extra tools:** `kubectl debug -it <pod> --image=nicolaka/netshoot:v0.13 --target=<container>` (attach a debug container to a running Pod that has no tools), `tcpdump -i any port 80` inside netshoot, `kubectl port-forward svc/web 8080:80` to test a Service from your laptop.
+
+##MD
+---
+## Interview and real-world questions
+
+<details><summary>1. Explain what happens when a Pod calls http://api.shop:80.</summary>
+
+Resolver reads `/etc/resolv.conf`; `api.shop` has < 5 dots so it tries `api.shop.<ns>.svc.cluster.local` first, then `api.shop.svc.cluster.local` → CoreDNS returns the ClusterIP. The Pod sends a TCP SYN to ClusterIP:80. On the node, kube-proxy's iptables/IPVS rules DNAT it to one ready endpoint `podIP:targetPort`. The packet is routed by the CNI (local veth or to the other node / overlay). Reply goes back through conntrack, which reverses the NAT.
+</details>
+
+<details><summary>2. ClusterIP vs NodePort vs LoadBalancer vs Ingress?</summary>
+
+ClusterIP: internal virtual IP. NodePort: a port on every node (builds on ClusterIP). LoadBalancer: cloud LB in front of NodePorts (OCI CCM). Ingress: L7 HTTP routing by host/path through one controller, usually behind one LoadBalancer — cheaper and more features for many web apps.
+</details>
+
+<details><summary>3. Why might a NetworkPolicy have no effect?</summary>
+
+The CNI does not enforce policies (e.g. flannel alone), the podSelector does not match the Pods, or another policy allows the traffic (policies are additive).
+</details>
+
+<details><summary>4. A Service has no endpoints. What do you check?</summary>
+
+Selector vs Pod labels (`--show-labels`), namespace, Pod readiness (probes), and whether the Pods exist at all.
+</details>
+
+<details><summary>5. How do you keep the client IP for an app behind an OCI load balancer?</summary>
+
+`externalTrafficPolicy: Local` on the Service (L4), or at L7 use the ingress controller with `X-Forwarded-For` / proxy protocol enabled on both the LB and the controller.
+</details>
+
+<details><summary>6. Users report intermittent 5-second delays on outbound calls. Ideas?</summary>
+
+DNS: `ndots:5` search expansion and A/AAAA parallel queries hitting a conntrack race on UDP. Fix with trailing dots, lower ndots, `single-request-reopen`, NodeLocal DNSCache, or scaling CoreDNS. Check CoreDNS latency metrics.
+</details>
+
+<details><summary>7. Flannel vs Calico vs Cilium — which for a regulated environment?</summary>
+
+Need NetworkPolicy → Calico or Cilium (flannel alone cannot). Calico for mature policy and BGP integration; Cilium for eBPF performance, L7 policies and Hubble flow visibility (great for audits). On OKE also consider VCN-native networking with NSGs.
+</details>
+
+##MD
+---
+## Practical assignment: "Expose the Events platform safely"
+
+**Scenario.** In namespace `lab-04`:
+1. Deploy `events-frontend` (2 replicas, http-echo text "frontend") and `events-api` (2 replicas, text "api"), each with a ClusterIP Service on port 80.
+2. One Ingress `events` with host `events.local`: `/` → frontend, `/api` → api (with rewrite). Add TLS with your own self-signed cert for `events.local`.
+3. A namespace `events-db` with a pretend DB (http-echo on 5432) and Service `db`.
+4. NetworkPolicies in `events-db`: default deny ingress; allow only Pods labelled `app=events-api` **from namespace `lab-04`** on TCP 5432. (Test on a cluster that enforces policies.)
+5. Use `netcheck.sh` to prove each Service works.
+
+**Success criteria**
+- `curl -sk --resolve events.local:443:127.0.0.1 https://events.local/api` → `api`
+- From an `events-api` Pod: `curl db.events-db:5432` works. From an `events-frontend` Pod: blocked (on a policy-enforcing CNI).
+- `netcheck.sh events-api lab-04` passes all steps.
+
+**Hints:** for a cross-namespace allow you need **one** `from` item with **both** `namespaceSelector` (`kubernetes.io/metadata.name: lab-04`) and `podSelector` (AND). http-echo has no curl; use the `client` Pod with label changes, or run netshoot Pods with the right labels.
+
+<details><summary>Full solution</summary>
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: events-frontend, namespace: lab-04}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: events-frontend}}
+  template:
+    metadata: {labels: {app: events-frontend}}
+    spec:
+      containers: [{name: c, image: "hashicorp/http-echo:1.0", args: ["-listen=:5678", "-text=frontend"], ports: [{name: http, containerPort: 5678}]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: events-frontend, namespace: lab-04}
+spec: {selector: {app: events-frontend}, ports: [{port: 80, targetPort: http}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: events-api, namespace: lab-04}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: events-api}}
+  template:
+    metadata: {labels: {app: events-api}}
+    spec:
+      containers: [{name: c, image: "hashicorp/http-echo:1.0", args: ["-listen=:5678", "-text=api"], ports: [{name: http, containerPort: 5678}]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: events-api, namespace: lab-04}
+spec: {selector: {app: events-api}, ports: [{port: 80, targetPort: http}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: events
+  namespace: lab-04
+  annotations: {nginx.ingress.kubernetes.io/rewrite-target: /}
+spec:
+  ingressClassName: nginx
+  tls: [{hosts: [events.local], secretName: events-tls}]
+  rules:
+    - host: events.local
+      http:
+        paths:
+          - {path: /api, pathType: Prefix, backend: {service: {name: events-api, port: {number: 80}}}}
+          - {path: /, pathType: Prefix, backend: {service: {name: events-frontend, port: {number: 80}}}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: events-db}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: db, namespace: events-db, labels: {app: db}}
+spec:
+  containers: [{name: db, image: "hashicorp/http-echo:1.0", args: ["-listen=:5432", "-text=db"], ports: [{containerPort: 5432}]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: db, namespace: events-db}
+spec: {selector: {app: db}, ports: [{port: 5432}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-ingress, namespace: events-db}
+spec: {podSelector: {}, policyTypes: [Ingress]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-events-api, namespace: events-db}
+spec:
+  podSelector: {matchLabels: {app: db}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: lab-04}}
+          podSelector: {matchLabels: {app: events-api}}     # same item = AND
+      ports: [{protocol: TCP, port: 5432}]
+```
+```bash
+openssl req -x509 -nodes -newkey rsa:2048 -days 30 -keyout e.key -out e.crt -subj "/CN=events.local" -addext "subjectAltName=DNS:events.local"
+kubectl -n lab-04 create secret tls events-tls --cert=e.crt --key=e.key
+kubectl apply -f solution.yaml
+# test as "api" and as "frontend" using netshoot Pods with those labels:
+kubectl -n lab-04 run t-api --image=nicolaka/netshoot:v0.13 --labels=app=events-api -it --rm -- curl -s -m 3 db.events-db:5432
+kubectl -n lab-04 run t-fe  --image=nicolaka/netshoot:v0.13 --labels=app=events-frontend -it --rm -- curl -s -m 3 db.events-db:5432
+```
+Note: the `t-api` Pod also matches the `events-api` Service selector for a moment — fine for a test, but in real life never reuse app labels for debug Pods.
+</details>
+
+##MD
+---
+## "Break it" challenge
+The Ingress below returns **503** for `/api` and **404** for `/`. There are 3 bugs. Find them using the playbook and the troubleshooting tables.
+
+##CODE
+%%writefile labs/04/broken-ingress.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-svc
+spec:
+  selector:
+    app: API
+  ports:
+    - port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: broken
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: broken.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-svc
+                port:
+                  number: 80
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: web
+                port:
+                  number: 8080
+
+##CODE
+%%bash
+kubectl apply -f labs/04/broken-ingress.yaml
+sleep 8
+echo -n "/api      : "; curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: broken.local' http://localhost/api
+echo -n "/         : "; curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: broken.local' http://localhost/
+echo -n "/index    : "; curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: broken.local' http://localhost/index
+./labs/04/netcheck.sh api-svc lab-04 || true
+
+##MD
+<details><summary>Solution</summary>
+
+1. **Selector case**: `app: API` but Pods are `app: api`. Labels are case-sensitive → no endpoints → **503** on `/api`. Fix: `app: api`.
+2. **Wrong Service port** for `/`: Service `web` exposes port **80**, not 8080 → the controller has no valid backend (Ingress events/controller logs show the port does not exist) → errors on `/`. Fix: `number: 80`.
+3. **pathType Exact** for `/`: only exactly `/` matches; `/index` and other paths get **404**. Fix: `pathType: Prefix`.
+
+How to find: `kubectl describe ingress broken` (backends and errors), `netcheck.sh api-svc` (step 3: no endpoints), controller logs `kubectl -n ingress-nginx logs deploy/ingress-nginx-controller | tail`.
+</details>
+
+##MD
+---
+## Cleanup
+Deletes the lab namespaces and the optional Calico cluster. ingress-nginx and the Gateway API CRDs stay installed, because later notebooks use Ingress. Remove them with the commented lines if you want a clean cluster.
+
+##CODE
+%%bash
+kubectl config use-context kind-learn
+kubectl delete namespace lab-04 lab-np events-db --ignore-not-found --wait=false
+kind get clusters | grep -qx learn-np && kind delete cluster --name learn-np
+kubectl config set-context --current --namespace=default
+rm -f labs/04/shop.key labs/04/e.key
+# kubectl delete -f https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml
+# kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+echo "Cleanup started."
+
+##MD
+---
+**Next notebook:** [05-Storage.ipynb](05-Storage.ipynb) — Volumes, PersistentVolumes, StorageClasses, CSI, snapshots and backup.

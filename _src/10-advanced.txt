@@ -1,0 +1,1497 @@
+##MD
+# Phase 10 — Advanced Kubernetes: Extending and Understanding the API
+
+**What you will learn**
+- Custom Resource Definitions (CRDs) with schema and CEL validation
+- Controllers and the reconciliation loop — you will **write and run your own controller**
+- Operators: what they add, real examples
+- Admission webhooks, and ValidatingAdmissionPolicy as a simpler option
+- API extension: the aggregation layer and APIServices
+- Finalizers — and how to fix an object stuck in `Terminating`
+- Owner references and garbage collection (background, foreground, orphan)
+- Scheduler internals: filter and score plugins, profiles — and scheduling a Pod by hand
+- API internals: watch, resourceVersion, optimistic concurrency, server-side apply and field managers
+
+**Time:** about 4–5 hours.
+
+**Prerequisites:** Notebooks 00–09. kind cluster `learn` running. Python 3 (already on your Mac).
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift + Enter**.
+- `%%writefile` cells create files in `labs/10/`. `%%bash` cells run commands.
+- In Topic 2 a controller runs **in the background**. Do not skip its stop cell.
+- Quiz answers are hidden under **Answer**.
+
+##MD
+## The big idea of this notebook
+Kubernetes is not "a container runner". It is a **database of desired state (etcd) + an API + many control loops**.
+Every built-in feature (Deployments, Services, HPA) is a controller that watches the API and makes reality match the spec.
+You can add your own types and your own controllers the same way. This is how Operators, Argo CD, cert-manager and Prometheus Operator work.
+
+```
+         +------------------- API server -------------------+
+ kubectl | REST: /apis/<group>/<version>/namespaces/x/<res> | <---- watch ---- controllers
+ ------->| authN -> authZ -> admission -> validation -> etcd |                 (built-in + yours)
+         +---------------------------------------------------+ ---- update --->
+```
+
+##MD
+## Lab setup
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx'. Run: kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+mkdir -p labs/10
+kubectl create namespace lab-10 --dry-run=client -o yaml | kubectl apply -f -
+
+##MD
+---
+# Topic 1 — Custom Resource Definitions (CRDs)
+
+### What is it?
+A **CRD** adds a new resource type to the Kubernetes API. After you create the CRD, you can `kubectl get/apply/delete` the new type like a Pod.
+- **CRD** = the type definition (like a table schema).
+- **Custom Resource (CR)** = one object of that type (like a row).
+
+### Why do we need it?
+Teams want to describe things in Kubernetes language: a `Certificate`, a `PostgresCluster`, a `ServiceMonitor`, a `Website`.
+With a CRD you get for free: storage in etcd, RBAC, `kubectl`, watch, validation, versioning, audit logs.
+
+### How does it work internally?
+```
+kubectl apply CRD --> API server stores it --> API server creates new REST endpoints:
+       /apis/learn.example.com/v1/namespaces/<ns>/websites
+kubectl apply Website --> validated against openAPIV3Schema (+ CEL rules) --> saved in etcd
+```
+A CRD alone **does nothing**. It just stores data. A **controller** must watch the CRs and act (Topic 2).
+
+##MD
+### Real production scenario
+A platform team wants developers to request a website with 3 lines of YAML, instead of writing a Deployment, Service, ConfigMap and Ingress. They create a `Website` CRD and a controller that builds all those objects. Developers get a simple API; the platform team keeps control of the details (security settings, labels, resources).
+
+##MD
+### Hands-on lab: create a `Website` CRD
+Important parts:
+- `group`, `names`, `scope` define the API path and kubectl names.
+- `openAPIV3Schema` validates fields (types, min/max, required, defaults).
+- `x-kubernetes-validations` adds **CEL** rules (cross-field logic), GA since Kubernetes 1.29.
+- `subresources.status` separates `spec` (user wants) from `status` (controller reports).
+- `additionalPrinterColumns` controls `kubectl get` output.
+
+##CODE
+%%writefile labs/10/crd-website.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: websites.learn.example.com      # must be <plural>.<group>
+spec:
+  group: learn.example.com              # API group -> /apis/learn.example.com/...
+  scope: Namespaced                     # or Cluster
+  names:
+    kind: Website                       # used in YAML 'kind:'
+    singular: website
+    plural: websites                    # used in the URL and 'kubectl get websites'
+    shortNames: ["ws"]                  # 'kubectl get ws'
+  versions:
+    - name: v1
+      served: true                      # API serves this version
+      storage: true                     # this version is stored in etcd (exactly one)
+      subresources:
+        status: {}                      # /status endpoint: users edit spec, controller edits status
+      additionalPrinterColumns:
+        - { name: Replicas, type: integer, jsonPath: .spec.replicas }
+        - { name: Ready,    type: integer, jsonPath: .status.readyReplicas }
+        - { name: Phase,    type: string,  jsonPath: .status.phase }
+        - { name: Age,      type: date,    jsonPath: .metadata.creationTimestamp }
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["message"]           # message must be given
+              properties:
+                message:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                  default: 1                  # API server fills this in if missing
+              x-kubernetes-validations:       # CEL rule on the spec object
+                - rule: "!self.message.contains('<script')"
+                  message: "message must not contain <script> tags"
+            status:
+              type: object
+              properties:
+                readyReplicas: { type: integer }
+                phase: { type: string }
+
+##CODE
+%%bash
+kubectl apply -f labs/10/crd-website.yaml
+kubectl wait --for=condition=Established crd/websites.learn.example.com --timeout=30s
+kubectl api-resources --api-group=learn.example.com
+echo "--- kubectl can explain your type, from the schema ---"
+kubectl explain website.spec
+
+##MD
+**Expected output**
+```
+customresourcedefinition.apiextensions.k8s.io/websites.learn.example.com created
+customresourcedefinition.apiextensions.k8s.io/websites.learn.example.com condition met
+NAME       SHORTNAMES   APIVERSION             NAMESPACED   KIND
+websites   ws           learn.example.com/v1   true         Website
+--- kubectl can explain your type, from the schema ---
+GROUP:      learn.example.com
+KIND:       Website
+...
+FIELDS:
+  message	<string> -required-
+  replicas	<integer>
+```
+
+##MD
+### Create custom resources — and see validation work
+
+##CODE
+%%writefile labs/10/website-shop.yaml
+apiVersion: learn.example.com/v1
+kind: Website
+metadata:
+  name: shop
+  namespace: lab-10
+spec:
+  message: "Welcome to the shop"
+  replicas: 2
+
+##CODE
+%%bash
+kubectl apply -f labs/10/website-shop.yaml
+echo "--- missing replicas -> default 1 is filled in ---"
+kubectl apply -f - <<'EOF'
+apiVersion: learn.example.com/v1
+kind: Website
+metadata: { name: blog, namespace: lab-10 }
+spec: { message: "My blog" }
+EOF
+kubectl get website blog -n lab-10 -o jsonpath='{.spec.replicas}{"\n"}'
+echo "--- replicas: 9 (too many) ---"
+kubectl apply -f - <<'EOF' 2>&1 || true
+apiVersion: learn.example.com/v1
+kind: Website
+metadata: { name: big, namespace: lab-10 }
+spec: { message: "too big", replicas: 9 }
+EOF
+echo "--- CEL rule ---"
+kubectl apply -f - <<'EOF' 2>&1 || true
+apiVersion: learn.example.com/v1
+kind: Website
+metadata: { name: evil, namespace: lab-10 }
+spec: { message: "<script>alert(1)</script>" }
+EOF
+kubectl get ws -n lab-10
+
+##MD
+**Expected output**
+```
+website.learn.example.com/shop created
+--- missing replicas -> default 1 is filled in ---
+website.learn.example.com/blog created
+1
+--- replicas: 9 (too many) ---
+The Website "big" is invalid: spec.replicas: Invalid value: 9: spec.replicas in body should be less than or equal to 5
+--- CEL rule ---
+The Website "evil" is invalid: spec: Invalid value: "object": message must not contain <script> tags
+NAME   REPLICAS   READY   PHASE   AGE
+blog   1                          5s
+shop   2                          6s
+```
+`READY` and `PHASE` are empty: **nobody is acting on these objects yet**. That is the controller's job.
+
+##MD
+### Troubleshooting CRDs
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no matches for kind "Website" in version ...` | CRD not installed or not Established yet; wrong apiVersion | `kubectl get crd`; `kubectl wait --for=condition=Established` |
+| Fields silently disappear | Not in schema → **pruned** by the API server | Add them to the schema (or `x-kubernetes-preserve-unknown-fields: true`, avoid if possible) |
+| Deleting a CRD deleted all my data | Deleting a CRD deletes **all** its CRs | Protect CRDs (RBAC, `helm.sh/resource-policy: keep`), back up CRs |
+| User can change `status` | No status subresource | Add `subresources.status` |
+| Version upgrade breaks clients | Changed schema without a new version | Add `v2`, keep `v1` served, use a conversion webhook when shapes differ |
+
+##MD
+### Check yourself
+1. What is the difference between a CRD and a CR?
+2. Does creating a CRD start any Pods or logic?
+3. What happens to fields not in the schema?
+4. Why use the status subresource?
+
+<details><summary>Answer</summary>
+
+1. CRD = the type definition. CR = an object of that type.
+2. No. It only adds API endpoints and storage. A controller is needed for behavior.
+3. They are pruned (removed) when saved.
+4. Users can update spec without touching status, and the controller updates status without racing user edits. RBAC can also separate them.
+</details>
+
+##MD
+---
+# Topic 2 — Controllers and the reconciliation loop
+
+### What is it?
+A **controller** is a program that runs a loop:
+1. **Observe** — read the desired state (the spec of objects) and the actual state.
+2. **Diff** — find the difference.
+3. **Act** — create, update or delete things to remove the difference.
+4. **Report** — write the result to `status`.
+5. Repeat forever.
+
+This is called **reconciliation**. It is **level-based**: the controller looks at the current state, not at a list of events. If it crashes and restarts, it just reconciles again. Nothing is lost.
+
+### Why do we need it?
+Declarative systems need something that *makes it so*. The Deployment controller makes ReplicaSets. The ReplicaSet controller makes Pods. The kubelet makes containers.
+
+### How does it work internally?
+Real controllers (written in Go with `client-go` / `controller-runtime` / Kubebuilder / Operator SDK) use:
+- **Informers**: one `watch` connection, with a local cache of objects (less load on the API server).
+- **Work queue**: changed object keys are queued; workers call `Reconcile(namespace/name)`.
+- **Owner references**: created objects point back to their owner (Topic 6), so changes to children also trigger the owner's reconcile, and deletion cascades.
+- **Leader election**: only one replica of the controller is active at a time.
+
+```
+           watch (informer)                       Reconcile(ns/name)
+API server ----------------> local cache --> queue ----------------> compare spec vs actual
+    ^                                                                       |
+    |                     create/update/delete children, patch status      |
+    +-----------------------------------------------------------------------+
+```
+
+##MD
+### Real production scenario
+Someone deletes a Deployment created by an operator ("it looked unused"). Within seconds it is back. This is not a bug: the operator's desired state still says it must exist. To really remove it, you change or delete the **custom resource** that owns it.
+
+##MD
+### Hands-on lab: write and run your own controller
+Our controller is a small Python program. It uses `kubectl` instead of a client library, so you can read every step.
+For each `Website` it makes sure that:
+- A **ConfigMap** `<name>-content` has an `index.html` with the message.
+- A **Deployment** `<name>-web` runs nginx with `spec.replicas` replicas and serves that page.
+- Both have an **ownerReference** to the Website (so deleting the Website deletes them).
+- The Website's **status** shows `readyReplicas` and `phase`.
+
+It uses **server-side apply** (Topic 9) with field manager `website-controller`, so applying is idempotent: running it 100 times gives the same result.
+
+##CODE
+%%writefile labs/10/controller.py
+"""A tiny Website controller. Learning only: polls every 5 s instead of using a watch/informer."""
+import hashlib, json, subprocess, time, sys
+
+NAMESPACE = "lab-10"
+MANAGER = "website-controller"
+STOP_AFTER_SECONDS = 15 * 60          # safety: stop by itself after 15 minutes
+
+
+def kubectl(*args, stdin=None):
+    return subprocess.run(["kubectl", *args], input=stdin, capture_output=True, text=True)
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def desired_children(site):
+    """Build the objects that SHOULD exist for this Website (the desired state)."""
+    name = site["metadata"]["name"]
+    owner = [{
+        "apiVersion": "learn.example.com/v1", "kind": "Website",
+        "name": name, "uid": site["metadata"]["uid"],
+        "controller": True,              # this owner is the managing controller
+        "blockOwnerDeletion": True,      # foreground deletion waits for this child
+    }]
+    labels = {"app.kubernetes.io/name": "website", "app.kubernetes.io/instance": name}
+    configmap = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": f"{name}-content", "namespace": NAMESPACE,
+                     "labels": labels, "ownerReferences": owner},
+        "data": {"index.html": f"<h1>{site['spec']['message']}</h1>\n"},
+    }
+    deployment = {
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": f"{name}-web", "namespace": NAMESPACE,
+                     "labels": labels, "ownerReferences": owner},
+        "spec": {
+            "replicas": site["spec"].get("replicas", 1),
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": labels,
+                             # restart Pods when the message changes
+                             "annotations": {"learn.example.com/message-hash":
+                                             hashlib.sha256(site["spec"]["message"].encode()).hexdigest()[:12]}},
+                "spec": {"containers": [{
+                    "name": "web", "image": "nginxinc/nginx-unprivileged:1.27-alpine",
+                    "ports": [{"containerPort": 8080}],
+                    "volumeMounts": [{"name": "content", "mountPath": "/usr/share/nginx/html"}],
+                }],
+                "volumes": [{"name": "content", "configMap": {"name": f"{name}-content"}}]},
+            },
+        },
+    }
+    return [configmap, deployment]
+
+
+def reconcile(site):
+    name = site["metadata"]["name"]
+    if site["metadata"].get("deletionTimestamp"):
+        return                                   # being deleted; garbage collector removes children
+    for obj in desired_children(site):
+        r = kubectl("apply", "--server-side", f"--field-manager={MANAGER}", "--force-conflicts",
+                    "-f", "-", stdin=json.dumps(obj))
+        if r.returncode != 0:
+            log(f"[{name}] ERROR applying {obj['kind']}: {r.stderr.strip()}")
+    # read actual state and report it in status
+    d = kubectl("get", "deployment", f"{name}-web", "-n", NAMESPACE, "-o", "json")
+    ready = json.loads(d.stdout).get("status", {}).get("readyReplicas", 0) if d.returncode == 0 else 0
+    want = site["spec"].get("replicas", 1)
+    phase = "Ready" if ready == want else "Progressing"
+    old = site.get("status", {})
+    if old.get("readyReplicas") != ready or old.get("phase") != phase:
+        kubectl("patch", "website", name, "-n", NAMESPACE, "--subresource=status", "--type=merge",
+                "-p", json.dumps({"status": {"readyReplicas": ready, "phase": phase}}))
+        log(f"[{name}] status -> phase={phase} ready={ready}/{want}")
+
+
+def main():
+    log("controller started")
+    start = time.time()
+    known = set()
+    while time.time() - start < STOP_AFTER_SECONDS:
+        r = kubectl("get", "websites", "-n", NAMESPACE, "-o", "json")
+        if r.returncode != 0:
+            log("cannot list websites: " + r.stderr.strip()); time.sleep(5); continue
+        sites = json.loads(r.stdout)["items"]
+        names = {s["metadata"]["name"] for s in sites}
+        for gone in known - names:
+            log(f"[{gone}] Website deleted; children are removed by the garbage collector")
+        for new in names - known:
+            log(f"[{new}] new Website seen")
+        known = names
+        for site in sites:
+            reconcile(site)
+        time.sleep(5)                     # real controllers use watch + queue instead of polling
+    log("controller stopped (time limit)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+##MD
+Start the controller **in the background**. Its output goes to `labs/10/controller.log`. We save its process ID in `labs/10/controller.pid` so we can stop it later.
+
+##CODE
+%%bash
+pkill -f "labs/10/controller.py" 2>/dev/null || true
+nohup python3 -u labs/10/controller.py > labs/10/controller.log 2>&1 &
+echo $! > labs/10/controller.pid
+echo "controller PID $(cat labs/10/controller.pid)"
+sleep 25
+cat labs/10/controller.log
+kubectl get ws,deploy,cm -n lab-10
+
+##MD
+**Expected output**
+```
+controller PID 12345
+10:00:00 controller started
+10:00:00 [blog] new Website seen
+10:00:00 [shop] new Website seen
+10:00:01 [blog] status -> phase=Progressing ready=0/1
+10:00:01 [shop] status -> phase=Progressing ready=0/2
+10:00:12 [blog] status -> phase=Ready ready=1/1
+10:00:12 [shop] status -> phase=Ready ready=2/2
+NAME                                REPLICAS   READY   PHASE   AGE
+website.learn.example.com/blog      1          1       Ready   2m
+website.learn.example.com/shop      2          2       Ready   2m
+NAME                       READY   UP-TO-DATE   AVAILABLE
+deployment.apps/blog-web   1/1     1            1
+deployment.apps/shop-web   2/2     2            2
+NAME                      DATA
+configmap/blog-content    1
+configmap/shop-content    1
+```
+Your CRD now has **behavior**. The `READY` and `PHASE` columns are filled by your controller.
+
+##MD
+### Self-healing: delete a child and watch it come back
+This proves the loop is level-based: the controller does not need a "deleted" event; it simply sees that reality differs from the desired state.
+
+##CODE
+%%bash
+kubectl delete deployment shop-web -n lab-10
+sleep 12
+kubectl get deploy -n lab-10
+tail -4 labs/10/controller.log
+
+##MD
+**Expected output**
+```
+deployment.apps "shop-web" deleted
+NAME       READY   UP-TO-DATE   AVAILABLE
+blog-web   1/1     1            1
+shop-web   2/2     2            2        <- recreated by the controller
+... [shop] status -> phase=Progressing ready=0/2
+... [shop] status -> phase=Ready ready=2/2
+```
+
+##MD
+### Change the spec: scale and change the message
+
+##CODE
+%%bash
+kubectl patch website shop -n lab-10 --type=merge -p '{"spec":{"replicas":3,"message":"Big sale today"}}'
+sleep 20
+kubectl get ws shop -n lab-10
+kubectl get cm shop-content -n lab-10 -o jsonpath='{.data.index\.html}'
+POD=$(kubectl get pod -n lab-10 -l app.kubernetes.io/instance=shop -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n lab-10 "$POD" -- wget -qO- http://localhost:8080
+
+##MD
+**Expected output**
+```
+NAME   REPLICAS   READY   PHASE   AGE
+shop   3          3       Ready   5m
+<h1>Big sale today</h1>
+<h1>Big sale today</h1>
+```
+
+##MD
+### Garbage collection through owner references
+Delete the Website. Our controller does **nothing** for deletion. The built-in **garbage collector** sees that the children's owner is gone and deletes them.
+
+##CODE
+%%bash
+kubectl get deploy shop-web -n lab-10 -o jsonpath='{.metadata.ownerReferences}' | python3 -m json.tool
+kubectl delete website blog -n lab-10
+sleep 8
+kubectl get deploy,cm -n lab-10
+
+##MD
+**Expected output**
+```
+[
+    {
+        "apiVersion": "learn.example.com/v1",
+        "blockOwnerDeletion": true,
+        "controller": true,
+        "kind": "Website",
+        "name": "shop",
+        "uid": "..."
+    }
+]
+website.learn.example.com "blog" deleted
+NAME                       READY ...
+deployment.apps/shop-web   3/3          <- blog-web is gone
+configmap/shop-content                  <- blog-content is gone
+```
+
+##MD
+### What a real controller does better than ours
+
+| Our learning controller | Production controller (Kubebuilder / controller-runtime / Operator SDK) |
+|---|---|
+| Polls every 5 s with `kubectl get` | Watches with informers + local cache |
+| Reconciles everything every time | Work queue; reconciles only changed objects, with retries and backoff |
+| One process, no HA | Leader election, 2+ replicas |
+| Runs on your laptop as you | Runs in-cluster with its own ServiceAccount and minimal RBAC |
+| No metrics | Prometheus metrics, health probes, structured logs, events |
+| Simple `phase` string in status | Status conditions (`Ready`, `Degraded`) with `observedGeneration` |
+
+##MD
+### Troubleshooting controllers
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| CR has no status | Controller not running, or crashing | Check controller Pod logs; check its RBAC (`kubectl auth can-i --as=system:serviceaccount:...`) |
+| Child keeps being changed back | Controller owns that field (desired state) | Change the CR, not the child |
+| Two controllers fight (values flip back and forth) | Both manage the same field | Check `managedFields`; give each field one owner |
+| Controller stuck in error loop | Bad spec, controller has no validation | Validate in the CRD schema/CEL; report errors in status conditions |
+
+##MD
+### Check yourself
+1. What does "level-based" reconciliation mean, and why is it robust?
+2. Why did the deleted Deployment come back?
+3. Who deleted `blog-web` when you deleted the Website?
+4. Name two things real controllers use that ours did not.
+
+<details><summary>Answer</summary>
+
+1. The controller compares the current state with the desired state each time, instead of reacting to single events. Missed events or restarts do not matter — the next loop fixes everything.
+2. The Website still wanted it; the controller saw the difference and recreated it.
+3. The built-in garbage collector, because the Deployment had an ownerReference to the deleted Website.
+4. Informers/watch with a cache, work queues with retries, leader election, in-cluster RBAC, metrics.
+</details>
+
+##MD
+---
+# Topic 3 — Operators
+
+### What is it?
+An **Operator** = **CRDs + a controller that contains human operational knowledge** for one specific application.
+An operator does what a skilled human operator would do: install, configure, scale, back up, upgrade, fail over, recover.
+
+### Why do we need it?
+Stateless apps are easy: a Deployment is enough. Stateful systems (databases, message queues, monitoring) need **ordered** and **app-aware** operations:
+- Promote a replica to primary when the primary dies.
+- Take a backup to object storage every night and test restore.
+- Upgrade one node at a time and check replication health between steps.
+
+### Examples you meet in real clusters
+
+| Operator | CRDs (examples) | What it automates |
+|---|---|---|
+| **Prometheus Operator** (kube-prometheus-stack) | `Prometheus`, `Alertmanager`, `ServiceMonitor`, `PodMonitor`, `PrometheusRule` | Runs Prometheus; turns ServiceMonitors into scrape config automatically |
+| **CloudNativePG** | `Cluster`, `Backup`, `ScheduledBackup`, `Pooler` | PostgreSQL HA, failover, backups to object storage (works with OCI Object Storage via its S3-compatible API) |
+| **cert-manager** | `Certificate`, `Issuer`, `ClusterIssuer` | Issues and renews TLS certificates |
+| **Strimzi** | `Kafka`, `KafkaTopic`, `KafkaUser` | Kafka clusters |
+| **Argo CD** | `Application`, `AppProject` | GitOps sync |
+
+**Capability levels** (Operator Framework): 1 basic install → 2 seamless upgrades → 3 full lifecycle (backup/restore) → 4 deep insights (metrics, alerts) → 5 auto pilot (auto-scale, auto-tune, auto-heal).
+
+### Real production scenario
+A team runs PostgreSQL in a StatefulSet they wrote themselves (like the Patroni setups many teams run on VMs). Failover and backups are manual scripts. They move to CloudNativePG: a `Cluster` CR with 3 instances and a `ScheduledBackup` to object storage. Primary failover becomes automatic and is tested every month.
+
+##MD
+### Hands-on lab (optional, ~5 min, needs internet): run CloudNativePG
+We install the operator, then ask for a 1-instance PostgreSQL cluster with a short YAML. Watch how much the operator creates for you.
+
+##CODE
+%%bash
+kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.1.yaml >/dev/null
+kubectl wait --for=condition=Available deployment/cnpg-controller-manager -n cnpg-system --timeout=180s
+kubectl get crd | grep cnpg.io
+
+##CODE
+%%writefile labs/10/pg-cluster.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster                    # a CR handled by the CloudNativePG operator
+metadata:
+  name: lab-pg
+  namespace: lab-10
+spec:
+  instances: 1                   # production: 3 (1 primary + 2 replicas, on different nodes/ADs)
+  storage:
+    size: 1Gi                    # PVC per instance (kind's default StorageClass)
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }
+
+##CODE
+%%bash
+kubectl apply -f labs/10/pg-cluster.yaml
+echo "Waiting for PostgreSQL to be ready (can take 2-3 minutes: image pull + init)..."
+kubectl wait --for=condition=Ready cluster/lab-pg -n lab-10 --timeout=300s
+kubectl get cluster -n lab-10
+echo "--- objects the operator created for you ---"
+kubectl get pods,pvc,svc,secrets -n lab-10 -l cnpg.io/cluster=lab-pg
+
+##MD
+**Expected output (shape)**
+```
+NAME     AGE   INSTANCES   READY   STATUS                     PRIMARY
+lab-pg   2m    1           1       Cluster in healthy state   lab-pg-1
+--- objects the operator created for you ---
+pod/lab-pg-1                   1/1   Running
+persistentvolumeclaim/lab-pg-1 Bound   1Gi
+service/lab-pg-r   ClusterIP ...   (read: any instance)
+service/lab-pg-ro  ClusterIP ...   (read-only: replicas)
+service/lab-pg-rw  ClusterIP ...   (read-write: primary)
+secret/lab-pg-app ...              (app user credentials)
+...
+```
+10 lines of YAML → Pod, storage, three Services, credentials, TLS certificates, monitoring endpoints. That is the operator's value.
+
+##MD
+### Lab vs Production (operators)
+
+| Area | Lab | Production |
+|---|---|---|
+| Install | `kubectl apply` of a release file | Helm chart or OLM, version pinned, upgraded deliberately |
+| Instances | 1 | 3, spread across nodes/availability domains, PDBs |
+| Backups | none | Scheduled backups to object storage + restore drills |
+| Trust | — | Review operator RBAC (often cluster-wide), maturity, community, support |
+| Upgrades | — | Read release notes; CRD changes can be breaking; test in staging |
+
+##MD
+### Check yourself
+1. What is the difference between a controller and an operator?
+2. Why are operators most useful for stateful apps?
+3. Name two operators and their main CRDs.
+
+<details><summary>Answer</summary>
+
+1. An operator is a controller (+ CRDs) that encodes application-specific operational knowledge (backup, failover, upgrade) for one app.
+2. Stateful apps need ordered, app-aware steps (failover, replication checks, backups) that generic controllers cannot do.
+3. Prometheus Operator: Prometheus, ServiceMonitor, PrometheusRule. CloudNativePG: Cluster, Backup, ScheduledBackup. cert-manager: Certificate, Issuer.
+</details>
+
+##MD
+---
+# Topic 4 — Admission webhooks (and the simpler alternative)
+
+### What is it?
+An **admission webhook** is an HTTPS service you write. The API server sends it an `AdmissionReview` request for matching objects and waits for an answer.
+- **ValidatingWebhookConfiguration** → answer allow/deny.
+- **MutatingWebhookConfiguration** → answer with a JSON patch that changes the object (e.g. Istio injects a sidecar container).
+
+### How does it work internally?
+```
+kubectl apply --> API server --> (mutating webhooks, in sequence) --> schema check --> (validating webhooks, in parallel)
+                        |                                                                     |
+                        +-- HTTPS POST AdmissionReview{request: object, user, operation} ------+
+                                              |
+                                     your webhook Service (TLS!)
+                                              |
+                        <-- AdmissionReview{response: allowed: true/false, patch: ...}
+```
+Rules:
+- Must use TLS; the API server must trust the cert (`caBundle`, often injected by cert-manager's CA injector).
+- Must be **fast** (timeouts default 10 s, max 30 s) and **highly available**.
+- `failurePolicy: Fail` blocks requests when the webhook is down. `Ignore` lets them through.
+- Must exclude critical namespaces, or a broken webhook can block the cluster from healing itself.
+
+### Example manifest (read only — we do not run a webhook server here)
+
+##CODE
+%%writefile labs/10/webhook-example.yaml
+# EXAMPLE ONLY - not applied. Shows the fields you must get right in production.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: website-policy
+  annotations:
+    cert-manager.io/inject-ca-from: platform/website-webhook-cert   # cert-manager fills caBundle
+webhooks:
+  - name: validate.websites.learn.example.com      # must be a fully qualified name
+    admissionReviewVersions: ["v1"]
+    sideEffects: None                               # the webhook does not change other things
+    timeoutSeconds: 5                               # keep it short
+    failurePolicy: Fail                             # deny on webhook errors (safer for security rules)
+    matchPolicy: Equivalent
+    clientConfig:
+      service:                                      # in-cluster Service that serves HTTPS
+        name: website-webhook
+        namespace: platform
+        path: /validate
+        port: 443
+      # caBundle: <base64 CA>                       # injected by cert-manager
+    rules:
+      - apiGroups: ["learn.example.com"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["websites"]
+        scope: Namespaced
+    namespaceSelector:                              # never block system namespaces
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "platform"]
+
+##MD
+### The simpler alternative: ValidatingAdmissionPolicy (VAP)
+Since 1.30 you can write many rules as CEL **inside the API server**: no server, no TLS, no availability risk. It also works for **custom resources**.
+Rule: in namespaces labelled `tier=small`, a Website may have at most 2 replicas.
+
+##CODE
+%%writefile labs/10/vap-website.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: website-max-replicas
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["learn.example.com"]   # works on our CRD
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["websites"]
+  validations:
+    - expression: "object.spec.replicas <= 2"
+      messageExpression: "'Website ' + object.metadata.name + ' asks for ' + string(object.spec.replicas) + ' replicas; max is 2 in small namespaces'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: website-max-replicas-small
+spec:
+  policyName: website-max-replicas
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        tier: small
+
+##CODE
+%%bash
+kubectl apply -f labs/10/vap-website.yaml
+kubectl label ns lab-10 tier=small --overwrite
+sleep 2
+kubectl apply -f - <<'EOF' 2>&1 || true
+apiVersion: learn.example.com/v1
+kind: Website
+metadata: { name: promo, namespace: lab-10 }
+spec: { message: "Promo", replicas: 4 }
+EOF
+kubectl label ns lab-10 tier-
+
+##MD
+**Expected output**
+```
+The websites "promo" is invalid: : ValidatingAdmissionPolicy 'website-max-replicas' with binding 'website-max-replicas-small'
+denied request: Website promo asks for 4 replicas; max is 2 in small namespaces
+namespace/lab-10 unlabeled
+```
+
+| Use VAP when | Use a webhook when |
+|---|---|
+| Rule fits in an expression on the object (and params) | You need external data (CMDB, image registry, another API) |
+| You want zero extra infrastructure | You need mutation with complex logic (or MutatingAdmissionPolicy is not available) |
+| | You need image signature verification (Kyverno/Gatekeeper/Sigstore policy-controller) |
+
+##MD
+### Check yourself
+1. Mutating webhooks run before or after validating ones?
+2. What happens with `failurePolicy: Fail` if the webhook Pods are down?
+3. Why exclude `kube-system` from webhooks?
+4. Give one reason to prefer VAP over a webhook.
+
+<details><summary>Answer</summary>
+
+1. Before.
+2. Every matching request is rejected.
+3. If the webhook breaks, system components (CoreDNS, CNI) could not be created or updated, and the cluster could not recover.
+4. No server, TLS or HA to run; evaluated inside the API server, so faster and cannot be "down".
+</details>
+
+##MD
+---
+# Topic 5 — API extensions: the aggregation layer
+
+### What is it?
+There are two ways to extend the Kubernetes API:
+
+| Way | How | Example |
+|---|---|---|
+| **CRD** | API server stores your objects in etcd | Website, Certificate, ServiceMonitor |
+| **Aggregated API** | API server **proxies** requests for a group to your own API server | `metrics.k8s.io` (metrics-server), custom metrics adapters |
+
+An **APIService** object registers an aggregated API: "requests for group X version Y go to Service Z".
+
+### Why do aggregated APIs exist?
+For data that should not live in etcd (it changes every second, like CPU metrics) or needs custom storage/logic. `kubectl top` calls `metrics.k8s.io`, which metrics-server serves from memory.
+
+```
+kubectl top pods --> kube-apiserver --(APIService v1beta1.metrics.k8s.io)--> metrics-server Service --> answer
+kubectl get ws   --> kube-apiserver --(CRD, stored locally)-----------------> etcd
+```
+
+##CODE
+%%bash
+echo "--- APIServices: 'Local' = served by kube-apiserver itself; a Service name = aggregated ---"
+kubectl get apiservices | head -1
+kubectl get apiservices | grep -E "learn.example.com|metrics|apps|v1\." | head -8
+echo "--- discovery document for our CRD group ---"
+kubectl get --raw /apis/learn.example.com/v1 | python3 -m json.tool | head -20
+
+##MD
+**Expected output**
+```
+NAME                         SERVICE                      AVAILABLE   AGE
+v1.                          Local                        True        3d
+v1.apps                      Local                        True        3d
+v1.learn.example.com         Local                        True        20m    <- CRDs also appear, served locally
+v1beta1.metrics.k8s.io       kube-system/metrics-server   True        2d     <- only if metrics-server is installed
+--- discovery document for our CRD group ---
+{
+    "kind": "APIResourceList",
+    "groupVersion": "learn.example.com/v1",
+    "resources": [ { "name": "websites", "namespaced": true, "kind": "Website", "verbs": [...], "shortNames": ["ws"] }, ...
+```
+
+### Troubleshooting
+A broken aggregated API (`AVAILABLE False`) can make `kubectl api-resources` and some tools (namespace deletion, Helm, Argo CD discovery) fail with errors like `unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1: the server is currently unable to handle the request`.
+Fix: repair the backing Service (`kubectl get apiservice v1beta1.metrics.k8s.io -o yaml` shows the reason), or delete the stale APIService.
+
+##MD
+### Check yourself
+1. When would you build an aggregated API instead of a CRD?
+2. Which object registers an aggregated API?
+3. What error do you see if an aggregated API's backend is down?
+
+<details><summary>Answer</summary>
+
+1. When data should not be stored in etcd (fast-changing, computed, external) or you need custom storage/behavior — e.g. metrics.
+2. An `APIService`.
+3. `the server is currently unable to handle the request` / `unable to retrieve the complete list of server APIs`.
+</details>
+
+##MD
+---
+# Topic 6 — Owner references and garbage collection
+
+### What is it?
+- An **ownerReference** in `metadata` says "this object belongs to that object". Deployment → owns ReplicaSet → owns Pods.
+- The **garbage collector (GC)** in kube-controller-manager deletes objects whose owner no longer exists.
+
+Three deletion modes (`kubectl delete --cascade=...`):
+
+| Mode | What happens |
+|---|---|
+| `background` (default) | Owner is deleted at once; GC deletes children afterwards |
+| `foreground` | Owner gets `deletionTimestamp` + finalizer `foregroundDeletion`; children (with `blockOwnerDeletion`) are deleted **first**; then the owner |
+| `orphan` | Owner is deleted; children stay and their ownerReference is removed |
+
+```
+Deployment web  --owns-->  ReplicaSet web-7d9  --owns-->  Pod web-7d9-abc, Pod web-7d9-def
+```
+
+### Real production scenario
+You must change a Deployment's selector (immutable). Instead of downtime: `kubectl delete deploy web --cascade=orphan` keeps the Pods serving traffic; then you create the new Deployment. The old orphaned ReplicaSet is cleaned up after the new Pods are ready. (Advanced — test it in staging first.)
+
+##MD
+### Hands-on lab: see the chain, then orphan and foreground
+
+##CODE
+%%bash
+kubectl create deployment gc-demo --image=nginxinc/nginx-unprivileged:1.27-alpine --replicas=2 -n lab-10
+kubectl rollout status deploy/gc-demo -n lab-10 --timeout=90s
+RS=$(kubectl get rs -n lab-10 -l app=gc-demo -o jsonpath='{.items[0].metadata.name}')
+echo "ReplicaSet $RS is owned by:"
+kubectl get rs "$RS" -n lab-10 -o jsonpath='{range .metadata.ownerReferences[*]}{.kind}/{.name}{"\n"}{end}'
+echo "Pods are owned by:"
+kubectl get pods -n lab-10 -l app=gc-demo -o jsonpath='{range .items[*]}{.metadata.name} -> {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}{end}'
+
+##MD
+**Expected output**
+```
+ReplicaSet gc-demo-5f7b8c9d4 is owned by:
+Deployment/gc-demo
+Pods are owned by:
+gc-demo-5f7b8c9d4-abcde -> ReplicaSet/gc-demo-5f7b8c9d4
+gc-demo-5f7b8c9d4-fghij -> ReplicaSet/gc-demo-5f7b8c9d4
+```
+
+##CODE
+%%bash
+echo "=== orphan: delete Deployment, keep ReplicaSet and Pods ==="
+kubectl delete deployment gc-demo -n lab-10 --cascade=orphan
+sleep 3
+kubectl get deploy,rs,pods -n lab-10 -l app=gc-demo
+RS=$(kubectl get rs -n lab-10 -l app=gc-demo -o jsonpath='{.items[0].metadata.name}')
+echo "ownerReferences of RS now: '$(kubectl get rs $RS -n lab-10 -o jsonpath='{.metadata.ownerReferences}')'"
+
+##MD
+**Expected output**
+```
+deployment.apps "gc-demo" deleted
+NAME                                READY  ...
+replicaset.apps/gc-demo-5f7b8c9d4   2      <- still here
+pod/gc-demo-5f7b8c9d4-abcde         1/1    Running   <- still serving
+pod/gc-demo-5f7b8c9d4-fghij         1/1    Running
+ownerReferences of RS now: ''          <- owner link removed
+```
+
+##CODE
+%%bash
+RS=$(kubectl get rs -n lab-10 -l app=gc-demo -o jsonpath='{.items[0].metadata.name}')
+echo "=== foreground: children first, then owner ==="
+kubectl delete rs "$RS" -n lab-10 --cascade=foreground --wait=false
+kubectl get rs "$RS" -n lab-10 -o jsonpath='deletionTimestamp={.metadata.deletionTimestamp} finalizers={.metadata.finalizers}{"\n"}'
+sleep 5
+kubectl get rs,pods -n lab-10 -l app=gc-demo
+
+##MD
+**Expected output**
+```
+=== foreground: children first, then owner ===
+deletionTimestamp=2026-..Z finalizers=["foregroundDeletion"]
+No resources found in lab-10 namespace.    (after the Pods are gone, the RS is removed too)
+```
+
+##MD
+### Check yourself
+1. Which component deletes children when the owner is deleted?
+2. What does `--cascade=orphan` do to the children's ownerReferences?
+3. In foreground deletion, what finalizer appears on the owner?
+
+<details><summary>Answer</summary>
+
+1. The garbage collector in kube-controller-manager.
+2. Removes the reference to the deleted owner; the children keep running.
+3. `foregroundDeletion`.
+</details>
+
+##MD
+---
+# Topic 7 — Finalizers
+
+### What is it?
+A **finalizer** is a string in `metadata.finalizers`. While the list is not empty, the object **cannot be fully deleted**.
+When you delete an object with finalizers, the API server only sets `deletionTimestamp`. The object shows as `Terminating`. A controller must do its cleanup and then **remove its finalizer**. When the list is empty, the object is deleted.
+
+### Why do we need it?
+To clean up **external** things before the Kubernetes object disappears:
+- `kubernetes.io/pvc-protection` — do not delete a PVC while a Pod uses it.
+- `service.kubernetes.io/load-balancer-cleanup` — delete the cloud load balancer (e.g. OCI LB) before the Service object goes.
+- An operator deletes the database backup bucket before its CR goes.
+
+```
+kubectl delete X --> deletionTimestamp set, object "Terminating"
+                         |
+           controller sees deletionTimestamp --> cleanup external resource --> remove its finalizer
+                         |
+           finalizers == [] --> API server deletes the object from etcd
+```
+
+### Real production scenario
+A namespace is stuck in `Terminating` for days. Reason: an operator was uninstalled **before** its custom resources were deleted. The CRs still carry the operator's finalizer, and nobody is left to remove it. Fix: reinstall the operator and delete the CRs properly, or (last resort) remove the finalizer by hand — accepting that the external cleanup will not happen.
+
+##MD
+### Hands-on lab: create a stuck object, then fix it
+
+##CODE
+%%writefile labs/10/finalizer-demo.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: protected
+  namespace: lab-10
+  finalizers:
+    - learn.example.com/cleanup-bucket   # pretend a controller must delete an external bucket first
+data:
+  bucket: "lab-backups"
+
+##CODE
+%%bash
+kubectl apply -f labs/10/finalizer-demo.yaml
+kubectl delete configmap protected -n lab-10 --wait=false
+sleep 2
+echo "--- the object still exists, with a deletionTimestamp ---"
+kubectl get configmap protected -n lab-10 -o jsonpath='deletionTimestamp={.metadata.deletionTimestamp}{"\n"}finalizers={.metadata.finalizers}{"\n"}'
+echo "--- you cannot remove the deletion; you can only finish it ---"
+
+##MD
+**Expected output**
+```
+configmap "protected" deleted
+--- the object still exists, with a deletionTimestamp ---
+deletionTimestamp=2026-...Z
+finalizers=["learn.example.com/cleanup-bucket"]
+```
+`kubectl delete` printed "deleted", but the object is still there. Try `kubectl delete` again — it hangs (that is why we used `--wait=false`).
+
+Now act as the controller: "cleanup done", remove the finalizer.
+
+##CODE
+%%bash
+# In real life: first make sure the external cleanup really happened (or is not needed)!
+kubectl patch configmap protected -n lab-10 --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+sleep 1
+kubectl get configmap protected -n lab-10 2>&1
+
+##MD
+**Expected output**
+```
+configmap/protected patched
+Error from server (NotFound): configmaps "protected" not found
+```
+
+##MD
+### Finding what blocks a Terminating namespace
+This command lists objects that still exist in a namespace (all resource types). Use it when a namespace is stuck.
+```bash
+kubectl api-resources --verbs=list --namespaced -o name \
+  | xargs -n1 kubectl get --show-kind --ignore-not-found -n <namespace>
+kubectl get namespace <namespace> -o jsonpath='{.status.conditions}'    # shows the blocking reason
+```
+
+### Troubleshooting finalizers
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Object stuck `Terminating` | Finalizer present, controller missing/failing | Check controller logs; fix it; last resort: remove finalizer |
+| Namespace stuck `Terminating` | CRs with finalizers, or a broken aggregated API | `kubectl get ns X -o yaml` → `status.conditions`; fix CRs or APIService |
+| PVC stuck `Terminating` | `pvc-protection`: a Pod still uses it | Delete the Pod first |
+| Service type LoadBalancer stuck | Cloud controller cannot delete the cloud LB (permissions, LB already gone) | Fix CCM permissions (OCI IAM policy); check cloud console |
+
+**Warning:** removing finalizers by hand skips cleanup. It can leave orphaned cloud resources (load balancers, block volumes, buckets) that **still cost money**. Always check the cloud side after.
+
+##MD
+### Check yourself
+1. What does the API server do when you delete an object that has finalizers?
+2. Who should normally remove a finalizer?
+3. What is the risk of removing a finalizer manually?
+
+<details><summary>Answer</summary>
+
+1. Sets `deletionTimestamp`; the object stays (Terminating) until the finalizer list is empty.
+2. The controller that added it, after finishing its cleanup.
+3. The external cleanup never happens: orphaned cloud resources, leaked data, cost.
+</details>
+
+##MD
+---
+# Topic 8 — Scheduler internals
+
+### What is it?
+**kube-scheduler** picks a node for each new Pod that has no `spec.nodeName`. It writes the decision as a **Binding** (sets `nodeName`). Then the kubelet on that node starts the Pod.
+
+### How does it work internally?
+The scheduling framework runs **plugins** at extension points:
+```
+Pod in queue
+  -> PreFilter -> Filter (which nodes CAN run it?) -> PostFilter (preemption if none)
+  -> PreScore -> Score (which feasible node is BEST?) -> NormalizeScore
+  -> Reserve -> Permit -> PreBind -> Bind (write nodeName) -> PostBind
+```
+
+| Phase | Example plugins | Question |
+|---|---|---|
+| Filter | `NodeResourcesFit`, `NodeAffinity`, `TaintToleration`, `NodePorts`, `VolumeBinding`, `PodTopologySpread`, `InterPodAffinity` | Is this node possible? |
+| Score | `NodeResourcesBalancedAllocation`, `ImageLocality`, `InterPodAffinity`, `NodeAffinity` (preferred), `PodTopologySpread` | How good is this node? (0–100 each, weighted) |
+| PostFilter | `DefaultPreemption` | No node fits: can I evict lower-priority Pods? |
+
+**Profiles**: one scheduler binary can run several profiles (different plugin sets) under different `schedulerName`s. Configured with `KubeSchedulerConfiguration`.
+
+##CODE
+%%writefile labs/10/scheduler-config-example.yaml
+# EXAMPLE ONLY - passed to kube-scheduler with --config. Not applied in this lab.
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+  - schedulerName: default-scheduler          # normal behavior: spread load
+  - schedulerName: bin-packing-scheduler      # Pods that set this name: pack nodes tightly (save cost)
+    pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: MostAllocated               # prefer the fullest node that still fits
+            resources:
+              - { name: cpu, weight: 1 }
+              - { name: memory, weight: 1 }
+
+##MD
+### Real production scenario
+Pods stay `Pending` after a release. Events say:
+`0/6 nodes are available: 3 Insufficient memory, 3 node(s) had untolerated taint {dedicated: gpu}. preemption: 0/6 nodes are available: 6 No preemption victims found.`
+Reading it plugin by plugin: `NodeResourcesFit` rejected 3 nodes (memory), `TaintToleration` rejected 3 (GPU pool). Fix: lower requests, or add capacity to the general pool (on OKE: scale the node pool or let Cluster Autoscaler do it).
+
+##MD
+### Hands-on lab 1: read the Filter results from events
+
+##CODE
+%%bash
+kubectl run filter-demo -n lab-10 --image=busybox:1.36 --restart=Never \
+  --overrides='{"spec":{"nodeSelector":{"disk":"nvme"},"containers":[{"name":"filter-demo","image":"busybox:1.36","command":["sleep","3600"],"resources":{"requests":{"cpu":"50m"}}}]}}'
+sleep 5
+kubectl get pod filter-demo -n lab-10
+kubectl get events -n lab-10 --field-selector involvedObject.name=filter-demo,reason=FailedScheduling -o jsonpath='{.items[-1:].message}{"\n"}'
+
+##MD
+**Expected output**
+```
+NAME          READY   STATUS    RESTARTS   AGE
+filter-demo   0/1     Pending   0          5s
+0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+2 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+```
+Each phrase comes from a Filter plugin. Fix by labeling a node:
+
+##CODE
+%%bash
+kubectl label node learn-worker disk=nvme --overwrite
+kubectl wait --for=condition=Ready pod/filter-demo -n lab-10 --timeout=60s
+kubectl get pod filter-demo -n lab-10 -o wide
+kubectl label node learn-worker disk-
+
+##MD
+**Expected output**: the Pod becomes `Running` on `learn-worker`. The scheduler retries Pending Pods when the cluster changes (here: a node label changed).
+
+##MD
+### Hands-on lab 2: be the scheduler yourself
+A Pod that asks for a scheduler that does not exist is never scheduled. No events, just `Pending`.
+Then **you** bind it to a node by creating a **Binding** object — exactly what kube-scheduler does at the end of its cycle.
+
+##CODE
+%%writefile labs/10/manual-schedule.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: manual
+  namespace: lab-10
+spec:
+  schedulerName: my-own-scheduler     # no such scheduler runs -> nobody picks this Pod
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+
+##CODE
+%%bash
+kubectl apply -f labs/10/manual-schedule.yaml
+sleep 5
+kubectl get pod manual -n lab-10 -o wide
+echo "--- now we act as the scheduler: create a Binding ---"
+kubectl create -f - <<'EOF'
+apiVersion: v1
+kind: Binding
+metadata:
+  name: manual          # must equal the Pod name
+  namespace: lab-10
+target:
+  apiVersion: v1
+  kind: Node
+  name: learn-worker2   # our scheduling decision
+EOF
+kubectl wait --for=condition=Ready pod/manual -n lab-10 --timeout=60s
+kubectl get pod manual -n lab-10 -o wide
+
+##MD
+**Expected output**
+```
+NAME     READY   STATUS    NODE
+manual   0/1     Pending   <none>
+--- now we act as the scheduler: create a Binding ---
+binding/manual created
+NAME     READY   STATUS    NODE
+manual   1/1     Running   learn-worker2
+```
+You just did the scheduler's last step (Bind) by hand. The kubelet on `learn-worker2` saw a Pod with its `nodeName` and started it.
+
+##MD
+### Check yourself
+1. What is the difference between Filter and Score?
+2. What does the scheduler write when it decides?
+3. What is a scheduler profile?
+4. Read this: `0/4 nodes are available: 4 Insufficient cpu.` Which plugin, and two fixes?
+
+<details><summary>Answer</summary>
+
+1. Filter removes nodes that cannot run the Pod. Score ranks the remaining nodes to pick the best.
+2. A Binding: it sets `spec.nodeName` of the Pod.
+3. A named set of plugin settings in one scheduler, selected by `spec.schedulerName`.
+4. `NodeResourcesFit`. Fixes: lower the CPU requests, add nodes / bigger nodes (autoscaler), or free capacity (preemption with PriorityClass).
+</details>
+
+##MD
+---
+# Topic 9 — Kubernetes API internals: watch, resourceVersion, server-side apply
+
+### What is it?
+- **resourceVersion**: a version string on every object, changed on every write (based on etcd's revision). Used for **optimistic concurrency** and for watches.
+- **Optimistic concurrency**: an update that includes an old `resourceVersion` is rejected with **409 Conflict**. Nobody overwrites someone else's change by accident.
+- **Watch**: a long HTTP connection (`?watch=true`) that streams `ADDED`, `MODIFIED`, `DELETED` events. All controllers use it.
+- **generation / observedGeneration**: `metadata.generation` increases when the **spec** changes; controllers write `status.observedGeneration` to say "I have processed this spec".
+- **Server-side apply (SSA)**: the API server merges your desired fields and records **who owns which field** in `metadata.managedFields`. Field managers can conflict.
+
+##MD
+### Hands-on lab 1: watch the raw event stream
+We start a watch in the background (it ends after 10 s), then create, change and delete a ConfigMap. The watch prints each event as JSON. We show only type, name and resourceVersion.
+
+##CODE
+%%bash
+( kubectl get --raw "/api/v1/namespaces/lab-10/configmaps?watch=true&timeoutSeconds=10&fieldSelector=metadata.name=watched" \
+  | python3 -u -c "
+import sys, json
+for line in sys.stdin:
+    e = json.loads(line)
+    o = e['object']['metadata']
+    print('EVENT', e['type'].ljust(9), o['name'], 'resourceVersion=' + o['resourceVersion'])
+" ) &
+sleep 2
+kubectl create configmap watched -n lab-10 --from-literal=color=blue >/dev/null
+kubectl patch configmap watched -n lab-10 -p '{"data":{"color":"green"}}' >/dev/null
+kubectl delete configmap watched -n lab-10 >/dev/null
+sleep 9
+
+##MD
+**Expected output**
+```
+EVENT ADDED     watched resourceVersion=81234
+EVENT MODIFIED  watched resourceVersion=81236
+EVENT DELETED   watched resourceVersion=81237
+```
+This is exactly what informers receive. The resourceVersion goes up with every change.
+
+##MD
+### Hands-on lab 2: optimistic concurrency (409 Conflict)
+Two people edit the same object. Person A saves a copy, person B updates the live object, then A tries to `replace` with the old copy (which contains the old resourceVersion).
+
+##CODE
+%%bash
+kubectl create configmap shared -n lab-10 --from-literal=owner=team-a >/dev/null
+kubectl get configmap shared -n lab-10 -o yaml > labs/10/shared-old.yaml        # person A's copy
+echo "resourceVersion in A's copy: $(grep resourceVersion labs/10/shared-old.yaml)"
+kubectl patch configmap shared -n lab-10 -p '{"data":{"owner":"team-b"}}' >/dev/null   # person B saves first
+echo "live resourceVersion now:    $(kubectl get cm shared -n lab-10 -o jsonpath='{.metadata.resourceVersion}')"
+sed -i '' 's/owner: team-a/owner: team-a-again/' labs/10/shared-old.yaml
+kubectl replace -f labs/10/shared-old.yaml 2>&1 || true
+
+##MD
+**Expected output**
+```
+resourceVersion in A's copy:   resourceVersion: "81300"
+live resourceVersion now:    81302
+Error from server (Conflict): error when replacing "labs/10/shared-old.yaml": Operation cannot be fulfilled on configmaps "shared":
+the object has been modified; please apply your changes to the latest version and try again
+```
+Controllers see this error often. The correct reaction is: re-read the object and try again.
+
+##MD
+### Hands-on lab 3: server-side apply and field managers
+Team A applies a ConfigMap with `color` and `size`. Team B applies a ConfigMap that sets `color` to another value. SSA detects that team A **owns** `color` and refuses.
+
+##CODE
+%%bash
+kubectl apply --server-side --field-manager=team-a -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ssa-demo, namespace: lab-10 }
+data: { color: blue, size: large }
+EOF
+echo "--- team-b tries to change color ---"
+kubectl apply --server-side --field-manager=team-b -f - <<'EOF' 2>&1 || true
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ssa-demo, namespace: lab-10 }
+data: { color: green }
+EOF
+
+##MD
+**Expected output**
+```
+configmap/ssa-demo serverside-applied
+--- team-b tries to change color ---
+error: Apply failed with 1 conflict: conflict with "team-a": .data.color
+Please review the fields above--they currently have other managers. Here
+are the ways you can resolve this warning:
+* If you intend to manage all of these fields, please re-run the apply command with the `--force-conflicts` flag.
+* If you do not intend to manage all of the fields, please edit your manifest to remove references to the fields that should keep their current managers.
+* You may co-own fields by updating your manifest to match the existing value; ...
+```
+
+##CODE
+%%bash
+kubectl apply --server-side --field-manager=team-b --force-conflicts -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ssa-demo, namespace: lab-10 }
+data: { color: green }
+EOF
+echo "--- who owns which field now? ---"
+kubectl get configmap ssa-demo -n lab-10 --show-managed-fields -o json | python3 -c "
+import json, sys
+for m in json.load(sys.stdin)['metadata']['managedFields']:
+    fields = list(m.get('fieldsV1', {}).get('f:data', {}).keys())
+    print(f\"{m['manager']:12} {m['operation']:6} {fields}\")
+"
+
+##MD
+**Expected output**
+```
+configmap/ssa-demo serverside-applied
+--- who owns which field now? ---
+team-a       Apply  ['f:size']
+team-b       Apply  ['f:color']
+```
+Team B took ownership of `color`. Team A still owns `size`. This is how GitOps tools, Helm (with SSA), HPA and controllers can share one object without overwriting each other. It is also why our controller in Topic 2 used `--field-manager=website-controller`.
+
+##MD
+### Troubleshooting API internals
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `the object has been modified; please apply your changes to the latest version` | Optimistic concurrency conflict | Re-read and retry (client-go `RetryOnConflict`) |
+| `Apply failed with N conflicts: conflict with "X"` | Another field manager owns the field | Decide ownership; remove field from your manifest, or `--force-conflicts` if you should own it |
+| Argo CD/Helm and HPA keep changing replicas | Two managers for `spec.replicas` | Do not set replicas in Git when HPA is on (or ignore the field in Argo CD) |
+| Watch errors `410 Gone: too old resource version` | Watch started from a compacted resourceVersion | Re-list, then watch from the new resourceVersion (informers do this) |
+| Huge `kubectl get -o yaml` output | managedFields | Hidden by default; `--show-managed-fields` to see |
+
+##MD
+### Lab vs Production
+
+| Area | Lab | Production |
+|---|---|---|
+| Controllers | Python + kubectl polling | Go + controller-runtime, watches, leader election, metrics |
+| CRD changes | Edit and apply | Versioned CRDs, conversion webhooks, upgrade tests, CRD backups |
+| Admission | VAP in one namespace | VAP/Kyverno/Gatekeeper with audit mode first; webhooks HA with PDBs |
+| Finalizers | Removed by hand | Only removed by controllers; manual removal needs a change ticket |
+| Scheduling | Manual Binding for learning | Default scheduler + profiles; autoscaler; PriorityClasses |
+| Apply | `kubectl apply` | Server-side apply in GitOps tools; clear field ownership |
+
+##MD
+### Check yourself
+1. What is resourceVersion used for? Give two uses.
+2. What does a 409 Conflict on update mean?
+3. What is stored in `managedFields`?
+4. What is the difference between `generation` and `resourceVersion`?
+
+<details><summary>Answer</summary>
+
+1. Optimistic concurrency (reject stale updates) and watches (start streaming from a known point).
+2. Your copy of the object is old; someone else changed it after you read it. Re-read and retry.
+3. For each field manager: which fields it owns, the operation (Apply/Update) and time.
+4. `resourceVersion` changes on every write (including status and metadata). `generation` increases only when the spec changes.
+</details>
+
+##MD
+---
+# Interview and real-world questions
+
+1. Explain how a Deployment change becomes running containers, naming each controller.
+2. A namespace is stuck in Terminating. How do you investigate?
+3. When would you write an operator instead of a Helm chart?
+4. What is the difference between a CRD and an aggregated API?
+5. Your webhook went down and nobody can deploy. What happened, and how do you prevent it?
+6. Why can two controllers "fight" over an object, and how does server-side apply help?
+7. How would you schedule a Pod on a specific node without nodeSelector or affinity?
+
+<details><summary>Answer</summary>
+
+1. API server stores the new Deployment spec → Deployment controller creates/updates a ReplicaSet → ReplicaSet controller creates Pods → scheduler binds each Pod to a node → kubelet on the node calls the container runtime (CRI) to start containers → kubelet reports status.
+2. `kubectl get ns X -o yaml` (status.conditions); list remaining objects with `kubectl api-resources --namespaced -o name | xargs -n1 kubectl get -n X`; check finalizers on remaining objects; check APIServices `AVAILABLE False`; fix the controller or, as a last resort, remove finalizers.
+3. When the app needs ongoing operational actions (failover, backups, upgrades with checks, scaling decisions) — Helm only installs and upgrades templates; an operator keeps reconciling.
+4. A CRD's objects are stored in etcd by kube-apiserver. An aggregated API is a separate API server that kube-apiserver proxies to (registered with an APIService), with its own storage/logic.
+5. `failurePolicy: Fail` + webhook unavailable rejects all matching requests. Prevent: 2+ replicas with PDB and anti-affinity, short timeout, exclude system namespaces, monitor the webhook, or use VAP for simple rules.
+6. Each writes its own desired value to the same field. SSA records field ownership and returns a conflict, making the overlap visible and forcing an ownership decision.
+7. Set `spec.nodeName` directly, or create a Binding for the Pod (manual scheduling), or use a custom scheduler profile.
+</details>
+
+##MD
+---
+# Practical Assignment — extend the Website operator
+
+**Scenario:** Developers want their Website reachable inside the cluster.
+
+**Requirements**
+1. Add an optional field `spec.servicePort` to the CRD: integer, minimum 1, maximum 65535, default 80.
+2. Extend `controller.py` so it also creates a **Service** `<name>-web` (ClusterIP) with port `spec.servicePort` → targetPort 8080, with the ownerReference.
+3. Add `status.url` with value `http://<name>-web.lab-10.svc:<servicePort>`.
+4. Add a printer column `URL`.
+
+**Success criteria**
+- `kubectl get ws` shows a URL column.
+- A test Pod can `wget -qO- http://shop-web.lab-10.svc:80` and gets the message.
+- Deleting the Website deletes the Service too.
+
+**Hints**
+- Update the CRD schema under `spec.properties` and `status.properties`, and add the printer column. Re-apply the CRD.
+- Add the Service to `desired_children()`.
+- Restart the controller after changing the file (stop cell, then start cell).
+
+<details><summary>Full solution</summary>
+
+CRD changes (inside `versions[0]`):
+```yaml
+additionalPrinterColumns:
+  - { name: URL, type: string, jsonPath: .status.url }
+...
+spec:
+  properties:
+    servicePort: { type: integer, minimum: 1, maximum: 65535, default: 80 }
+...
+status:
+  properties:
+    url: { type: string }
+```
+In `desired_children()` add:
+```python
+service = {
+    "apiVersion": "v1", "kind": "Service",
+    "metadata": {"name": f"{name}-web", "namespace": NAMESPACE,
+                 "labels": labels, "ownerReferences": owner},
+    "spec": {"type": "ClusterIP", "selector": labels,
+             "ports": [{"name": "http", "port": site["spec"].get("servicePort", 80), "targetPort": 8080}]},
+}
+return [configmap, deployment, service]
+```
+In `reconcile()` status patch:
+```python
+url = f"http://{name}-web.{NAMESPACE}.svc:{site['spec'].get('servicePort', 80)}"
+... "status": {"readyReplicas": ready, "phase": phase, "url": url}
+```
+(and include `old.get("url") != url` in the change check).
+Test:
+```bash
+kubectl run t -n lab-10 --rm -it --image=busybox:1.36 --restart=Never -- wget -qO- http://shop-web.lab-10.svc:80
+```
+</details>
+
+##MD
+---
+# "Break it" challenge
+
+Run the cell. It creates a namespace that will not delete. Find out **why**, using only `kubectl get ... -o yaml`, and fix it **without** deleting the namespace's finalizers directly.
+
+##CODE
+%%bash
+kubectl create namespace lab-10-stuck --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f - <<'EOF'
+apiVersion: learn.example.com/v1
+kind: Website
+metadata:
+  name: legacy
+  namespace: lab-10-stuck
+  finalizers: ["learn.example.com/delete-dns-record"]
+spec: { message: "legacy site" }
+EOF
+kubectl delete namespace lab-10-stuck --wait=false
+sleep 5
+kubectl get namespace lab-10-stuck
+
+##MD
+<details><summary>Solution</summary>
+
+1. `kubectl get ns lab-10-stuck -o yaml` → `status.conditions` show `NamespaceContentRemaining` / `NamespaceFinalizersRemaining`:
+   `Some content in the namespace has finalizers remaining: learn.example.com/delete-dns-record in 1 resource instances`.
+2. Find the object: `kubectl get ws -n lab-10-stuck -o yaml` → `deletionTimestamp` is set and the finalizer is there. No controller handles this finalizer.
+3. Fix at the right level — the **Website**, not the namespace (after confirming the "DNS record" cleanup is not needed):
+```bash
+kubectl patch website legacy -n lab-10-stuck --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+```
+4. The namespace finishes deleting by itself within seconds.
+
+Lesson: never remove the **namespace** finalizer (`kubernetes`) with the `/finalize` API as a shortcut — it leaves orphaned objects in etcd. Fix the objects inside.
+</details>
+
+##MD
+---
+## Cleanup
+Stop the controller, delete the lab objects, the CRD and policies. Deleting the CRD also deletes all Website objects.
+
+##CODE
+%%bash
+[ -f labs/10/controller.pid ] && kill "$(cat labs/10/controller.pid)" 2>/dev/null; pkill -f "labs/10/controller.py" 2>/dev/null
+echo "controller stopped"
+# remove objects whose finalizers have no controller, BEFORE deleting namespaces
+kubectl patch website legacy -n lab-10-stuck --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+# delete operator-managed objects while the operator still runs (it removes its own finalizers)
+kubectl delete clusters.postgresql.cnpg.io lab-pg -n lab-10 --ignore-not-found --wait=true --timeout=120s 2>/dev/null || true
+kubectl delete validatingadmissionpolicybinding website-max-replicas-small --ignore-not-found
+kubectl delete validatingadmissionpolicy website-max-replicas --ignore-not-found
+kubectl delete namespace lab-10 lab-10-stuck --ignore-not-found --timeout=180s
+# now it is safe to remove the operator and the CRD
+kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.1.yaml --ignore-not-found >/dev/null 2>&1 || true
+kubectl delete crd websites.learn.example.com --ignore-not-found
+echo "Cleanup done."
+
+##MD
+---
+**Next notebook:** [11-CICD-and-GitOps.ipynb](11-CICD-and-GitOps.ipynb) — CI/CD pipelines, Argo CD, Flux and deployment strategies.

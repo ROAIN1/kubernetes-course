@@ -1,0 +1,1775 @@
+##MD
+# Phase 16: Capstone Projects (13 mandatory projects)
+
+**What you will do**
+- Build 13 projects that cover everything in this course
+- Write every YAML file **yourself** first; reference solutions are hidden
+- Validate each project with commands
+- Upgrade each project toward production
+- Publish all projects on GitHub as a **portfolio** for job applications
+
+**Time:** 25–40 hours in total (about 2–3 hours per project)
+
+**Prerequisites:** Notebooks 00–15. kind cluster `learn`, `kubectl`, `helm`, Docker Desktop with 6+ GB RAM.
+
+**How to use this notebook**
+1. Read the **Goal**, **Architecture** and **Requirements** of a project.
+2. Create the files in `capstone/pNN-.../` with your editor (VS Code). Do not copy the solution yet.
+3. Run the **Validate** cell. If it fails, debug with `kubectl describe`, `kubectl logs`, `kubectl get events`.
+4. Only after you tried (at least 30 minutes), open **Reference solution** and compare.
+5. Do the **Production upgrade** tasks if you have time. These make your portfolio stand out.
+6. Run **Cleanup** before the next project (except where a project builds on the previous one — it says so).
+
+> **Rule:** "Lab" configurations in this notebook are **not** production-ready unless a section says "production upgrade". Always say this honestly in your GitHub README too.
+
+##MD
+## Progress tracker
+
+Copy this table into your GitHub README and tick each line when done.
+
+| # | Project | Builds on | Done | Production upgrade done |
+|---|---|---|---|---|
+| 1 | Simple app with Pods and Deployments | — | ☐ | ☐ |
+| 2 | Multi-tier app (frontend, backend, database) | 1 | ☐ | ☐ |
+| 3 | Expose with Services and Ingress | 2 | ☐ | ☐ |
+| 4 | Persistent storage for the database | 2 | ☐ | ☐ |
+| 5 | ConfigMaps and Secrets | 2 | ☐ | ☐ |
+| 6 | RBAC and security policies | 2 | ☐ | ☐ |
+| 7 | Autoscaling | 2 | ☐ | ☐ |
+| 8 | Deploy with Helm | 2–7 | ☐ | ☐ |
+| 9 | GitOps pipeline with Argo CD | 8 | ☐ | ☐ |
+| 10 | Prometheus and Grafana monitoring | 8 | ☐ | ☐ |
+| 11 | Game day: simulate failures and troubleshoot | 2 | ☐ | ☐ |
+| 12 | HA production-style architecture | 8 | ☐ | ☐ |
+| 13 | Complete app on managed cloud Kubernetes (OKE) | 8 | ☐ | ☐ |
+
+**The app used in all projects ("shop")**
+- **frontend:** `nginx` serving a page and proxying `/api/` to the backend
+- **backend:** `podinfo` (a small Go web app made for Kubernetes demos; has `/healthz`, `/readyz`, `/metrics`, `/env`)
+- **database:** `postgres:16`
+
+##MD
+## Safety check and folder setup
+
+All local projects run on `kind-learn`. This cell stops if you are connected to anything else.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+echo "Current context: $ctx"
+[ "$ctx" = "kind-learn" ] || { echo "STOP: run 'kubectl config use-context kind-learn' (create it in notebook 00 if missing)"; exit 1; }
+mkdir -p capstone/{p01-simple-app,p02-multi-tier,p03-ingress,p04-storage,p05-config,p06-security,p07-autoscaling,p08-helm,p09-gitops,p10-monitoring,p11-gameday,p12-ha,p13-cloud}
+ls capstone
+kubectl get nodes
+
+##MD
+---
+# Project 1: Simple app with Pods and Deployments
+
+### Goal
+Run the backend as a **bare Pod**, see why that is fragile, then run it as a **Deployment** and prove self-healing, scaling, rolling update and rollback.
+
+### Architecture
+```
+ namespace: p01
+ +------------------------------------------+
+ | Pod: podinfo-bare   (dies = gone forever)|
+ |                                          |
+ | Deployment podinfo (replicas: 3)         |
+ |   -> ReplicaSet podinfo-xxxx             |
+ |        -> Pod  Pod  Pod                  |
+ +------------------------------------------+
+```
+
+### Directory structure
+```
+capstone/p01-simple-app/
+  namespace.yaml
+  pod.yaml
+  deployment.yaml
+  NOTES.md        <- write what you observed (good for your portfolio)
+```
+
+### Requirements checklist
+- [ ] Namespace `p01`
+- [ ] Pod `podinfo-bare`, image `ghcr.io/stefanprodan/podinfo:6.7.0`, port 9898
+- [ ] Deployment `podinfo`, 3 replicas, labels `app: podinfo`, same image
+- [ ] Resource requests (cpu 50m, memory 64Mi) and limits (memory 128Mi)
+- [ ] Readiness probe `/readyz`, liveness probe `/healthz`
+- [ ] Rolling update strategy `maxUnavailable: 0`, `maxSurge: 1`
+
+### Guided tasks
+1. Apply the Pod. Delete it. Does it come back? Write the answer in NOTES.md.
+2. Apply the Deployment. Delete one Pod. What happens and which controller did it?
+3. Scale to 5, then back to 3.
+4. Update the image to `6.7.1`. Watch `kubectl rollout status`.
+5. Roll back with `kubectl rollout undo`. Check `kubectl rollout history`.
+
+<details><summary>Reference solution</summary>
+
+`namespace.yaml`
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: p01
+```
+`pod.yaml`
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podinfo-bare
+  namespace: p01
+  labels: {app: podinfo-bare}
+spec:
+  containers:
+    - name: podinfo
+      image: ghcr.io/stefanprodan/podinfo:6.7.0
+      ports: [{containerPort: 9898}]
+```
+`deployment.yaml`
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podinfo
+  namespace: p01
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: podinfo}
+  template:
+    metadata:
+      labels: {app: podinfo}
+    spec:
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.7.0
+          ports: [{containerPort: 9898, name: http}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+```
+Answers: the bare Pod does **not** come back (nothing owns it). A deleted Deployment Pod is recreated by the **ReplicaSet controller** (inside kube-controller-manager).
+</details>
+
+##CODE
+%%bash
+# Validate Project 1
+cd capstone/p01-simple-app
+kubectl apply -f namespace.yaml -f pod.yaml -f deployment.yaml
+kubectl -n p01 rollout status deploy/podinfo --timeout=120s
+echo "== self-healing test =="
+P=$(kubectl -n p01 get pod -l app=podinfo -o jsonpath='{.items[0].metadata.name}')
+kubectl -n p01 delete pod "$P" --wait=false
+sleep 10
+kubectl -n p01 get pods -l app=podinfo
+READY=$(kubectl -n p01 get deploy podinfo -o jsonpath='{.status.readyReplicas}')
+[ "$READY" = "3" ] && echo "PASS: 3 ready replicas" || echo "FAIL: ready=$READY"
+kubectl -n p01 get deploy podinfo -o jsonpath='{.spec.template.spec.containers[0].readinessProbe.httpGet.path}' | grep -q readyz && echo "PASS: readiness probe" || echo "FAIL: no readiness probe"
+
+##MD
+### Production upgrade
+- Pin images by **digest** (`image: ...@sha256:...`), not only tag.
+- Add `securityContext` (runAsNonRoot, readOnlyRootFilesystem, drop ALL capabilities).
+- Add a PDB and topology spread (see Notebook 14).
+
+##CODE
+%%bash
+# Cleanup Project 1
+kubectl delete namespace p01 --ignore-not-found
+
+##MD
+---
+# Project 2: Multi-tier app (frontend, backend, database)
+
+### Goal
+Deploy the full **shop** app: nginx frontend → podinfo backend → postgres database. Each tier talks to the next through a **Service name** (DNS).
+
+### Architecture
+```
+ namespace: shop
+                    +-------------------+
+ (port-forward) --> | Service frontend  | ClusterIP :80
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    | Deployment        |  nginx, 2 replicas
+                    | frontend          |  /api/ -> http://backend:9898/
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    | Service backend   | ClusterIP :9898
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    | Deployment backend|  podinfo, 2 replicas
+                    |  initContainer:   |  waits for DB (pg_isready)
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    | Service postgres  | ClusterIP :5432
+                    +---------+---------+
+                    | Deployment postgres (1 replica, emptyDir for now)
+                    +-------------------+
+```
+
+### Directory structure
+```
+capstone/p02-multi-tier/
+  00-namespace.yaml
+  10-postgres.yaml        # Deployment + Service (+ Secret later in P5)
+  20-backend.yaml         # Deployment + Service
+  30-frontend.yaml        # ConfigMap (nginx.conf) + Deployment + Service
+```
+
+### Requirements checklist
+- [ ] Namespace `shop`
+- [ ] postgres: image `postgres:16`, env `POSTGRES_PASSWORD` (plain value is OK **only** in this project), `POSTGRES_DB=shop`, Service `postgres:5432`
+- [ ] backend: podinfo 2 replicas, initContainer `postgres:16` running `until pg_isready -h postgres -p 5432; do sleep 2; done`, Service `backend:9898`
+- [ ] frontend: nginx 2 replicas, nginx config from a ConfigMap with `location /api/ { proxy_pass http://backend:9898/; }`, Service `frontend:80`
+- [ ] Every container has requests and limits; every web container has a readiness probe
+
+### Guided tasks
+1. Write and apply in order: namespace, postgres, backend, frontend.
+2. Watch backend Pods stay in `Init:0/1` until postgres is ready. Why?
+3. Port-forward the frontend and call `/` and `/api/`.
+4. Scale postgres to 0. What happens to new backend Pods? Scale back to 1.
+
+<details><summary>Reference solution</summary>
+
+`00-namespace.yaml`
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata: {name: shop}
+```
+`10-postgres.yaml`
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres, namespace: shop}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_DB, value: shop}
+            - {name: POSTGRES_USER, value: shop}
+            - {name: POSTGRES_PASSWORD, value: lab-only-password}   # moved to a Secret in Project 5
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "shop", "-d", "shop"]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes: [{name: data, emptyDir: {}}]        # replaced by a PVC in Project 4
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: shop}
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+```
+`20-backend.yaml`
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: backend, namespace: shop}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: backend}}
+  template:
+    metadata:
+      labels: {app: backend}
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432; do echo waiting for db; sleep 2; done"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.7.0
+          env:
+            - {name: PODINFO_UI_MESSAGE, value: "shop backend"}
+          ports: [{containerPort: 9898, name: http}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: backend, namespace: shop}
+spec:
+  selector: {app: backend}
+  ports: [{port: 9898, targetPort: http}]
+```
+`30-frontend.yaml`
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: frontend-nginx, namespace: shop}
+data:
+  default.conf: |
+    server {
+      listen 80;
+      location / { return 200 "shop frontend OK\n"; add_header Content-Type text/plain; }
+      location /api/ { proxy_pass http://backend:9898/; }
+      location /healthz { return 200 "ok\n"; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: frontend, namespace: shop}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: frontend}}
+  template:
+    metadata: {labels: {app: frontend}}
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports: [{containerPort: 80, name: http}]
+          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+      volumes:
+        - name: conf
+          configMap: {name: frontend-nginx}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: frontend, namespace: shop}
+spec:
+  selector: {app: frontend}
+  ports: [{port: 80, targetPort: http}]
+```
+Answer 2: the init container must exit 0 before app containers start; it loops until the postgres Service has a ready endpoint.
+</details>
+
+##CODE
+%%bash
+# Validate Project 2
+cd capstone/p02-multi-tier
+kubectl apply -f .
+for d in postgres backend frontend; do kubectl -n shop rollout status deploy/$d --timeout=180s; done
+kubectl -n shop port-forward svc/frontend 8082:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
+echo "== / =="; curl -s localhost:8082/
+echo "== /api/ =="; curl -s localhost:8082/api/ | head -c 300; echo
+curl -s localhost:8082/api/ | grep -q '"hostname"' && echo "PASS: frontend -> backend works" || echo "FAIL: /api/ not reaching backend"
+kill $PF
+
+##MD
+### Production upgrade
+- Postgres in a Deployment with emptyDir is **not** production: data is lost on restart. Projects 4 and 12 fix this (StatefulSet + PVC), but in production prefer a **managed database** (MySQL HeatWave, OCI PostgreSQL, Autonomous DB) or an operator (CloudNativePG).
+- Readiness of the backend should check DB connectivity in a real app.
+
+> **Keep `shop` running.** Projects 3–7 and 11 build on it.
+
+##MD
+---
+# Project 3: Expose with Services and Ingress
+
+### Goal
+Expose the shop through an **Ingress controller** with host-based routing and TLS, and compare Service types.
+
+### Architecture
+```
+ curl -H "Host: shop.local"  --> port-forward :8443/:8080
+                                     |
+                         [ ingress-nginx controller ] (namespace ingress-nginx)
+                          host shop.local
+                          /      -> svc frontend:80
+                          /api   -> svc frontend:80 (nginx proxies to backend)
+                          TLS: secret shop-tls (self-signed via cert-manager)
+```
+
+### Directory structure
+```
+capstone/p03-ingress/
+  ingress.yaml
+  issuer.yaml        # cert-manager self-signed ClusterIssuer
+  nodeport-demo.yaml # backend NodePort for comparison
+```
+
+### Requirements checklist
+- [ ] Install ingress-nginx with Helm (namespace `ingress-nginx`)
+- [ ] Install cert-manager with Helm (namespace `cert-manager`, CRDs enabled)
+- [ ] ClusterIssuer `selfsigned`
+- [ ] Ingress `shop`, class `nginx`, host `shop.local`, TLS secret `shop-tls` issued by cert-manager
+- [ ] A NodePort Service for the backend (only to compare; delete after)
+
+### Guided tasks
+1. Install both controllers (cell below).
+2. Write `issuer.yaml` and `ingress.yaml`. Apply.
+3. Check `kubectl -n shop get certificate` becomes `READY=True`.
+4. Port-forward the controller and test with `curl -k --resolve`.
+5. Explain in NOTES.md: ClusterIP vs NodePort vs LoadBalancer vs Ingress.
+
+##CODE
+%%bash
+# Install ingress-nginx and cert-manager (lab settings)
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
+helm repo add jetstack https://charts.jetstack.io >/dev/null
+helm repo update >/dev/null
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace \
+  --set controller.service.type=ClusterIP --wait --timeout 5m
+helm upgrade --install cert-manager jetstack/cert-manager -n cert-manager --create-namespace \
+  --set crds.enabled=true --wait --timeout 5m
+kubectl -n ingress-nginx get pods; kubectl -n cert-manager get pods
+
+##MD
+<details><summary>Reference solution</summary>
+
+`issuer.yaml`
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: selfsigned}
+spec:
+  selfSigned: {}
+```
+`ingress.yaml`
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations:
+    cert-manager.io/cluster-issuer: selfsigned        # cert-manager creates secret shop-tls
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [shop.local]
+      secretName: shop-tls
+  rules:
+    - host: shop.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: frontend, port: {number: 80}}
+```
+`nodeport-demo.yaml`
+```yaml
+apiVersion: v1
+kind: Service
+metadata: {name: backend-nodeport, namespace: shop}
+spec:
+  type: NodePort
+  selector: {app: backend}
+  ports: [{port: 9898, targetPort: 9898, nodePort: 30998}]
+```
+</details>
+
+##CODE
+%%bash
+# Validate Project 3
+cd capstone/p03-ingress
+kubectl apply -f issuer.yaml -f ingress.yaml
+sleep 15
+kubectl -n shop get ingress,certificate
+kubectl -n ingress-nginx port-forward svc/ingress-nginx-controller 8443:443 >/dev/null 2>&1 &
+PF=$!; sleep 3
+curl -sk --resolve shop.local:8443:127.0.0.1 https://shop.local:8443/ | tee /tmp/p03.txt
+grep -q "shop frontend OK" /tmp/p03.txt && echo "PASS: HTTPS ingress works" || echo "FAIL"
+curl -sk --resolve shop.local:8443:127.0.0.1 https://shop.local:8443/api/ | grep -q hostname && echo "PASS: /api via ingress" || echo "FAIL: /api"
+kill $PF
+
+##MD
+### Production upgrade
+- Real certificates: cert-manager with Let's Encrypt (HTTP-01 or DNS-01 with Cloudflare) or your company CA.
+- Controller: 3 replicas, PDB, spread across FDs, behind an NLB with `externalTrafficPolicy: Local`.
+- Add rate limiting and request size annotations; WAF in front.
+- Consider **Gateway API** (`Gateway` + `HTTPRoute`) for new platforms.
+
+##CODE
+%%bash
+# Cleanup Project 3 objects (keep controllers; Projects 8+ reuse them)
+kubectl -n shop delete ingress shop --ignore-not-found
+kubectl -n shop delete svc backend-nodeport --ignore-not-found
+
+##MD
+---
+# Project 4: Persistent storage for the database
+
+### Goal
+Move postgres from Deployment + emptyDir to a **StatefulSet** with a **PersistentVolumeClaim**. Prove data survives Pod deletion.
+
+### Architecture
+```
+ StatefulSet postgres (replicas 1)       volumeClaimTemplates
+   Pod postgres-0  ----mount----> PVC data-postgres-0 --bound--> PV (kind: local-path / OKE: oci-bv)
+   Headless Service postgres-hl (stable DNS: postgres-0.postgres-hl.shop.svc)
+   Service postgres (ClusterIP, used by backend)
+```
+
+### Directory structure
+```
+capstone/p04-storage/
+  postgres-statefulset.yaml   # replaces p02 10-postgres.yaml Deployment
+  seed-job.yaml               # inserts test data
+```
+
+### Requirements checklist
+- [ ] Delete the old postgres Deployment (keep the `postgres` Service name)
+- [ ] StatefulSet `postgres`, serviceName `postgres-hl`, `volumeClaimTemplates` 1Gi, StorageClass `standard` (kind default)
+- [ ] `PGDATA=/var/lib/postgresql/data/pgdata` (postgres needs an empty subfolder on some volumes)
+- [ ] Job `seed` creates table `orders` and inserts 3 rows
+- [ ] Delete `postgres-0`; after restart the 3 rows are still there
+
+<details><summary>Reference solution</summary>
+
+`postgres-statefulset.yaml`
+```yaml
+apiVersion: v1
+kind: Service
+metadata: {name: postgres-hl, namespace: shop}
+spec:
+  clusterIP: None                 # headless: DNS per pod
+  selector: {app: postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres, namespace: shop}
+spec:
+  serviceName: postgres-hl
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_DB, value: shop}
+            - {name: POSTGRES_USER, value: shop}
+            - {name: POSTGRES_PASSWORD, value: lab-only-password}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "shop", "-d", "shop"]}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard       # OKE: oci-bv (min 50Gi)
+        resources: {requests: {storage: 1Gi}}
+```
+`seed-job.yaml`
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata: {name: seed, namespace: shop}
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: psql
+          image: postgres:16
+          env: [{name: PGPASSWORD, value: lab-only-password}]
+          command: ["sh", "-c"]
+          args:
+            - >
+              psql -h postgres -U shop -d shop -c
+              "CREATE TABLE IF NOT EXISTS orders(id serial primary key, item text);
+               INSERT INTO orders(item) VALUES ('dates'),('coffee'),('oud');"
+```
+</details>
+
+##CODE
+%%bash
+# Validate Project 4
+cd capstone/p04-storage
+kubectl -n shop delete deployment postgres --ignore-not-found
+kubectl apply -f postgres-statefulset.yaml
+kubectl -n shop rollout status statefulset/postgres --timeout=180s
+kubectl apply -f seed-job.yaml
+kubectl -n shop wait --for=condition=complete job/seed --timeout=120s
+kubectl -n shop get pvc
+echo "== delete the pod (simulate crash) =="
+kubectl -n shop delete pod postgres-0
+kubectl -n shop rollout status statefulset/postgres --timeout=180s
+sleep 5
+N=$(kubectl -n shop exec postgres-0 -- psql -U shop -d shop -tAc "select count(*) from orders")
+echo "rows=$N"
+[ "$N" -ge 3 ] && echo "PASS: data survived pod deletion" || echo "FAIL"
+
+##MD
+### Production upgrade
+- On OKE: `storageClassName: oci-bv`, size ≥ 50Gi, set `vpusPerGB` for performance, enable volume expansion.
+- Backups: VolumeSnapshots (CSI) + logical backups (`pg_dump` CronJob to Object Storage) + Velero/Commvault. Test restores.
+- HA database: CloudNativePG operator (primary + replicas + failover) or a managed DB service.
+- `reclaimPolicy: Retain` on the production StorageClass so a deleted PVC does not delete data.
+
+##MD
+---
+# Project 5: ConfigMaps and Secrets
+
+### Goal
+Remove all hard-coded config and passwords. Use a **ConfigMap** for settings and a **Secret** for the DB password. Do a config change with a rolling restart.
+
+### Directory structure
+```
+capstone/p05-config/
+  configmap.yaml       # app settings
+  secret.yaml.example  # NEVER commit the real secret.yaml; add it to .gitignore
+  patches.md           # what you changed in p02/p04 manifests
+```
+
+### Requirements checklist
+- [ ] Secret `db-credentials` (keys `username`, `password`) created with `kubectl create secret` (not committed)
+- [ ] ConfigMap `backend-config` with `PODINFO_UI_MESSAGE` and `PODINFO_UI_COLOR`
+- [ ] postgres StatefulSet reads `POSTGRES_USER`/`POSTGRES_PASSWORD` from the Secret (`secretKeyRef`)
+- [ ] backend uses `envFrom: configMapRef`
+- [ ] Change the color in the ConfigMap, `kubectl rollout restart`, verify new value in `/api/env`
+
+> Changing the password Secret does **not** change the password inside an existing postgres data directory. Postgres only reads it on first init. Keep the same value for this lab.
+
+<details><summary>Reference solution</summary>
+
+```bash
+kubectl -n shop create secret generic db-credentials \
+  --from-literal=username=shop --from-literal=password=lab-only-password
+```
+`configmap.yaml`
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: backend-config, namespace: shop}
+data:
+  PODINFO_UI_MESSAGE: "shop backend (from ConfigMap)"
+  PODINFO_UI_COLOR: "#34577c"
+```
+postgres container env (in p04 StatefulSet):
+```yaml
+env:
+  - {name: POSTGRES_DB, value: shop}
+  - name: POSTGRES_USER
+    valueFrom: {secretKeyRef: {name: db-credentials, key: username}}
+  - name: POSTGRES_PASSWORD
+    valueFrom: {secretKeyRef: {name: db-credentials, key: password}}
+  - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+```
+backend container (in p02 backend Deployment):
+```yaml
+envFrom:
+  - configMapRef: {name: backend-config}
+```
+`.gitignore`
+```
+**/secret.yaml
+```
+</details>
+
+##CODE
+%%bash
+# Validate Project 5 (after you edited and re-applied p02/p04 manifests)
+kubectl -n shop get secret db-credentials >/dev/null && echo "PASS: secret exists" || echo "FAIL: secret missing"
+kubectl -n shop get sts postgres -o jsonpath='{.spec.template.spec.containers[0].env}' | grep -q secretKeyRef && echo "PASS: postgres uses secretKeyRef" || echo "FAIL: password still hard-coded"
+kubectl -n shop get deploy backend -o jsonpath='{.spec.template.spec.containers[0].envFrom}' | grep -q backend-config && echo "PASS: backend uses ConfigMap" || echo "FAIL"
+kubectl -n shop rollout status deploy/backend --timeout=120s
+kubectl -n shop exec deploy/frontend -- curl -s http://backend:9898/env | grep PODINFO_UI || echo "check env output"
+grep -rl "lab-only-password" capstone/ 2>/dev/null | grep -v example && echo "WARN: password found in files above. Remove before pushing to GitHub" || echo "PASS: no password in capstone files"
+
+##MD
+### Production upgrade
+- Use **External Secrets Operator** with **OCI Vault** (or Sealed Secrets / SOPS for GitOps). Secrets never in Git.
+- Enable encryption at rest for Secrets (OKE: Vault master key on the cluster).
+- Use **Reloader** or a checksum annotation (Helm) so config changes roll Pods automatically.
+
+##MD
+---
+# Project 6: RBAC and security policies
+
+### Goal
+Lock down the `shop` namespace: least-privilege users, a ServiceAccount for a CI deployer, Pod Security Admission, hardened containers and NetworkPolicies.
+
+### Architecture
+```
+ Users/Groups                     namespace shop  (PSA: restricted)
+  shop-devs   --RoleBinding-->  Role shop-dev   (get/list/watch pods, logs; no secrets)
+  SA ci-deployer --RoleBinding--> Role shop-deployer (manage deployments, services, configmaps)
+
+ NetworkPolicies:
+  default-deny (ingress)
+  frontend <- ingress-nginx namespace
+  backend  <- frontend only
+  postgres <- backend + seed job only
+```
+
+### Requirements checklist
+- [ ] Role `shop-dev`: read pods, pods/log, services, deployments. **No** secrets.
+- [ ] Role `shop-deployer` for ServiceAccount `ci-deployer`
+- [ ] Namespace label `pod-security.kubernetes.io/enforce=restricted` — first test with `warn`, fix Pods, then `enforce`
+- [ ] Every container: `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault`
+- [ ] 4 NetworkPolicies as in the diagram
+- [ ] Prove with `kubectl auth can-i`
+
+> **NetworkPolicy enforcement:** kind's default CNI does not enforce policies. To really test them, create a kind cluster with Calico (see notebook 08) or verify the policy logic with `kubectl describe networkpolicy`. Write in NOTES.md which you did.
+
+> **Images:** stock `nginx` and `postgres` run as root. Use `nginxinc/nginx-unprivileged:1.27` (port 8080) for the frontend. Postgres can run as user 999 with `fsGroup: 999`. podinfo already runs as non-root.
+
+<details><summary>Reference solution</summary>
+
+`rbac.yaml`
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: shop-dev, namespace: shop}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, replicasets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: shop-dev, namespace: shop}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: shop-dev}
+subjects:
+  - {kind: Group, name: shop-devs, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: ci-deployer, namespace: shop}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: shop-deployer, namespace: shop}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [services, configmaps]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: shop-deployer, namespace: shop}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: shop-deployer}
+subjects:
+  - {kind: ServiceAccount, name: ci-deployer, namespace: shop}
+```
+Container security context (add to each container):
+```yaml
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true      # nginx-unprivileged needs emptyDir at /tmp; postgres needs writable data + /var/run/postgresql emptyDir
+  capabilities: {drop: [ALL]}
+  seccompProfile: {type: RuntimeDefault}
+```
+Postgres pod-level: `securityContext: {runAsUser: 999, runAsGroup: 999, fsGroup: 999}`.
+
+`netpol.yaml`
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: shop}
+spec: {podSelector: {}, policyTypes: [Ingress]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: frontend-from-ingress, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: frontend}}
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: backend-from-frontend, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: backend}}
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: frontend}}}]
+      ports: [{port: 9898}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: postgres-from-backend, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: backend}}
+        - podSelector: {matchLabels: {job-name: seed}}
+      ports: [{port: 5432}]
+```
+</details>
+
+##CODE
+%%bash
+# Validate Project 6
+check() { r=$(kubectl auth can-i "$@" 2>/dev/null); echo "can-i $* -> $r"; }
+check get pods -n shop --as=ana --as-group=shop-devs
+check get secrets -n shop --as=ana --as-group=shop-devs
+check delete deployments -n shop --as=ana --as-group=shop-devs
+check patch deployments -n shop --as=system:serviceaccount:shop:ci-deployer
+check get secrets -n shop --as=system:serviceaccount:shop:ci-deployer
+echo "== PSA label =="
+kubectl get ns shop -o jsonpath='{.metadata.labels}'; echo
+echo "== Try a privileged pod (must be rejected with enforce=restricted) =="
+kubectl -n shop run bad --image=nginx --privileged 2>&1 | tail -1
+kubectl -n shop get networkpolicy
+
+##MD
+**Expected:** yes, no, no, yes, no. Privileged Pod **forbidden**. 4 NetworkPolicies listed.
+
+### Production upgrade
+- Map RBAC groups to **OCI IAM group OCIDs** on OKE.
+- Add a policy engine (Kyverno) with rules: no `:latest`, required labels, trusted registries only, signed images (cosign).
+- Scan images in CI (Trivy) and fail on critical CVEs.
+- Audit with `kube-bench` (CIS benchmark) and `kubescape`.
+
+##MD
+---
+# Project 7: Autoscaling
+
+### Goal
+Install **metrics-server**, add an **HPA** for the backend, generate load and watch it scale out and back in.
+
+### Architecture
+```
+ load generator (busybox loop) --> svc backend
+                                     |
+ metrics-server <-- kubelet stats    |
+        |                            |
+     HPA backend (cpu 60%, min 2, max 8) --scales--> Deployment backend
+```
+
+### Requirements checklist
+- [ ] metrics-server installed (`--kubelet-insecure-tls` is needed on kind only)
+- [ ] backend has CPU **requests** (HPA computes % of request)
+- [ ] HPA `autoscaling/v2`: target CPU 60%, min 2, max 8, scale-down stabilization 60 s (lab)
+- [ ] Load test shows replicas > 2, then back to 2 after load stops
+
+##CODE
+%%bash
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ >/dev/null
+helm repo update >/dev/null
+helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system \
+  --set args={--kubelet-insecure-tls} --wait --timeout 3m
+sleep 30; kubectl top nodes
+
+##MD
+<details><summary>Reference solution</summary>
+
+`hpa.yaml`
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: backend, namespace: shop}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: backend}
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60     # lab value; production often 300
+```
+Load generator:
+```bash
+kubectl -n shop run load --image=busybox:1.36 --restart=Never -- \
+  sh -c 'while true; do wget -q -O- http://backend:9898/ >/dev/null; done'
+```
+Note: if the NetworkPolicy from Project 6 is enforced, label the load Pod `app=frontend` or allow it.
+</details>
+
+##CODE
+%%bash
+# Validate Project 7 (takes ~4 minutes)
+kubectl apply -f capstone/p07-autoscaling/hpa.yaml
+kubectl -n shop run load --labels=app=frontend --image=busybox:1.36 --restart=Never -- \
+  sh -c 'for i in 1 2 3 4 5 6 7 8; do (while true; do wget -q -O- http://backend:9898/ >/dev/null; done) & done; wait'
+for i in $(seq 1 12); do sleep 15; kubectl -n shop get hpa backend --no-headers; done
+MAX=$(kubectl -n shop get hpa backend -o jsonpath='{.status.currentReplicas}')
+[ "$MAX" -gt 2 ] && echo "PASS: scaled out to $MAX" || echo "NOT YET: replicas=$MAX (try more load or lower target)"
+kubectl -n shop delete pod load --now
+
+##MD
+### Production upgrade
+- Scale on **custom metrics** (requests per second from Prometheus via prometheus-adapter or KEDA).
+- Pair HPA with Cluster Autoscaler (OKE add-on) and over-provisioning (Notebook 14).
+- Load test with k6 at 2× expected peak and record the time to scale.
+
+##MD
+---
+# Project 8: Deploy with Helm
+
+### Goal
+Package the whole shop (Projects 2–7) as **one Helm chart** with values per environment. Install, upgrade and roll back.
+
+### Directory structure
+```
+capstone/p08-helm/shop/
+  Chart.yaml
+  values.yaml              # defaults (lab)
+  values-prod.yaml         # production-like overrides
+  templates/
+    _helpers.tpl
+    frontend.yaml
+    backend.yaml
+    postgres.yaml
+    hpa.yaml
+    ingress.yaml
+    NOTES.txt
+```
+
+### Requirements checklist
+- [ ] `helm create` is allowed as a start, but delete what you do not use
+- [ ] Values: `image.tag` per component, `replicas`, `resources`, `ingress.enabled/host`, `hpa.enabled`, `postgres.storageClass/size`, `existingSecret`
+- [ ] Labels use `app.kubernetes.io/name`, `app.kubernetes.io/instance`
+- [ ] `checksum/config` annotation so ConfigMap changes roll Pods
+- [ ] `helm lint` and `helm template` pass
+- [ ] Install release `shop` in namespace `shop-helm`, upgrade to new backend tag, `helm rollback` to revision 1
+
+<details><summary>Reference solution (key files)</summary>
+
+`Chart.yaml`
+```yaml
+apiVersion: v2
+name: shop
+description: Three-tier demo shop (nginx, podinfo, postgres)
+type: application
+version: 0.1.0
+appVersion: "6.7.0"
+```
+`values.yaml`
+```yaml
+frontend:
+  replicas: 2
+  image: {repository: nginx, tag: "1.27"}
+  resources: {requests: {cpu: 20m, memory: 32Mi}, limits: {memory: 64Mi}}
+backend:
+  replicas: 2
+  image: {repository: ghcr.io/stefanprodan/podinfo, tag: "6.7.0"}
+  message: "shop backend (helm)"
+  resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 128Mi}}
+postgres:
+  image: {repository: postgres, tag: "16"}
+  storageClass: standard
+  size: 1Gi
+  existingSecret: db-credentials     # created outside the chart
+hpa:
+  enabled: true
+  min: 2
+  max: 8
+  cpu: 60
+ingress:
+  enabled: false
+  className: nginx
+  host: shop.local
+```
+`templates/_helpers.tpl`
+```
+{{- define "shop.labels" -}}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end }}
+```
+`templates/backend.yaml`
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-backend
+  labels: {{- include "shop.labels" . | nindent 4 }}
+data:
+  PODINFO_UI_MESSAGE: {{ .Values.backend.message | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-backend
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.hpa.enabled }}
+  replicas: {{ .Values.backend.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: backend, app.kubernetes.io/instance: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: backend, app.kubernetes.io/instance: {{ .Release.Name }}}
+      annotations:
+        checksum/config: {{ .Values.backend | toYaml | sha256sum }}
+    spec:
+      containers:
+        - name: podinfo
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          envFrom: [{configMapRef: {name: {{ .Release.Name }}-backend}}]
+          ports: [{containerPort: 9898, name: http}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}}
+          resources: {{- toYaml .Values.backend.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-backend
+spec:
+  selector: {app.kubernetes.io/name: backend, app.kubernetes.io/instance: {{ .Release.Name }}}
+  ports: [{port: 9898, targetPort: http}]
+```
+Frontend and postgres templates follow the same pattern as Projects 2 and 4 (nginx `proxy_pass http://{{ .Release.Name }}-backend:9898/;`, StatefulSet using `.Values.postgres.*` and `secretKeyRef: {name: {{ .Values.postgres.existingSecret }}}`). `hpa.yaml` is wrapped in `{{- if .Values.hpa.enabled }}`.
+</details>
+
+##CODE
+%%bash
+# Validate Project 8
+cd capstone/p08-helm
+helm lint shop
+kubectl create namespace shop-helm --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n shop-helm create secret generic db-credentials --from-literal=username=shop --from-literal=password=lab-only-password --dry-run=client -o yaml | kubectl apply -f -
+helm upgrade --install shop ./shop -n shop-helm --wait --timeout 5m
+helm upgrade shop ./shop -n shop-helm --set backend.image.tag=6.7.1 --wait --timeout 5m
+helm history shop -n shop-helm
+helm rollback shop 1 -n shop-helm --wait
+TAG=$(kubectl -n shop-helm get deploy shop-backend -o jsonpath='{.spec.template.spec.containers[0].image}')
+echo "backend image after rollback: $TAG"
+echo "$TAG" | grep -q 6.7.0 && echo "PASS: rollback worked" || echo "FAIL"
+
+##MD
+### Production upgrade
+- Publish the chart to an OCI registry (`helm push` to OCIR / GHCR).
+- Add `values.schema.json` to validate values.
+- Add chart tests (`helm test`) and CI (lint + template + kubeconform).
+- Do not template Secrets with real values — use External Secrets.
+
+##MD
+---
+# Project 9: GitOps pipeline with Argo CD
+
+### Goal
+Make **Git the source of truth**. Argo CD watches your GitHub repo and syncs the Helm chart to the cluster. A change in Git = a deployment.
+
+### Architecture
+```
+ You --git push--> GitHub repo: k8s-capstone
+                     capstone/p08-helm/shop  (chart)
+                     capstone/p09-gitops/apps/shop-dev.yaml (Argo CD Application)
+                          ^
+                          | polls / webhook
+ kind cluster:  Argo CD (namespace argocd) --sync--> namespace shop-gitops
+                 auto-sync, self-heal, prune
+```
+
+### Requirements checklist
+- [ ] Your capstone folder pushed to a **public or private GitHub repo** (see Portfolio section for safe push)
+- [ ] Argo CD installed with Helm
+- [ ] `Application` `shop-dev`: source = your repo path `capstone/p08-helm/shop`, valueFiles `values.yaml`, destination namespace `shop-gitops`, `syncPolicy.automated {prune: true, selfHeal: true}`, `CreateNamespace=true`
+- [ ] Change `backend.replicas` / `message` in Git → Argo CD syncs it
+- [ ] Manually `kubectl scale` → Argo CD reverts it (self-heal)
+- [ ] Rollback by `git revert`
+
+##CODE
+%%bash
+helm repo add argo https://argoproj.github.io/argo-helm >/dev/null
+helm repo update >/dev/null
+helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace --wait --timeout 6m
+kubectl -n argocd get pods
+echo "Admin password:"; kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+echo "UI: kubectl -n argocd port-forward svc/argocd-server 8090:443  then open https://localhost:8090 (user admin)"
+
+##MD
+<details><summary>Reference solution</summary>
+
+`capstone/p09-gitops/apps/shop-dev.yaml`
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<your-user>/k8s-capstone.git
+    targetRevision: main
+    path: capstone/p08-helm/shop
+    helm:
+      valueFiles: [values.yaml]
+      parameters:
+        - {name: postgres.existingSecret, value: db-credentials}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop-gitops
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]
+```
+The DB secret is created once by hand (or by External Secrets in production):
+```bash
+kubectl create ns shop-gitops
+kubectl -n shop-gitops create secret generic db-credentials --from-literal=username=shop --from-literal=password=lab-only-password
+```
+Private repo: add it in Argo CD with a read-only deploy key or token (`argocd repo add` or a labeled Secret).
+</details>
+
+##CODE
+%%bash
+# Validate Project 9 (after you pushed your repo and edited repoURL)
+kubectl get ns shop-gitops >/dev/null 2>&1 || kubectl create ns shop-gitops
+kubectl -n shop-gitops create secret generic db-credentials --from-literal=username=shop --from-literal=password=lab-only-password --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f capstone/p09-gitops/apps/shop-dev.yaml
+sleep 60
+kubectl -n argocd get application shop-dev -o jsonpath='{.status.sync.status} {.status.health.status}'; echo
+echo "== self-heal test: scale frontend manually =="
+kubectl -n shop-gitops scale deploy shop-frontend --replicas=5 2>/dev/null || echo "(adjust deployment name to your chart)"
+sleep 30
+kubectl -n shop-gitops get deploy
+
+##MD
+**Expected:** `Synced Healthy`. After 30–180 s the frontend returns to the replica count in Git.
+
+### Production upgrade
+- **App of apps** or **ApplicationSet** for dev/staging/prod and multiple clusters (Jeddah + Riyadh DR).
+- Promotion by pull request: dev values → staging → prod, with branch protection and reviews.
+- CI (Azure DevOps / GitHub Actions) builds and scans images, then updates the image tag in Git (Argo CD Image Updater or a PR bot).
+- Argo CD SSO (Entra ID / OIDC) and RBAC; no shared admin password.
+
+##MD
+---
+# Project 10: Prometheus and Grafana monitoring
+
+### Goal
+Install **kube-prometheus-stack**, scrape the backend's `/metrics` with a **ServiceMonitor**, build a dashboard and an alert.
+
+### Architecture
+```
+ podinfo /metrics <--scrape-- Prometheus (operator managed)
+ kube-state-metrics, node-exporter <--scrape--|
+                                              |-- rules --> Alertmanager --> (receiver)
+ Grafana <--query-- Prometheus
+```
+
+### Requirements checklist
+- [ ] kube-prometheus-stack installed in `monitoring` (lab: no persistence)
+- [ ] ServiceMonitor selects the shop backend Service (port name `http`, path `/metrics`) — Service port must have a **name**
+- [ ] Target is `UP` in Prometheus
+- [ ] Grafana dashboard: request rate, p95 latency, error rate, Pod restarts, CPU/memory vs requests
+- [ ] PrometheusRule: alert `BackendDown` if no backend target is up for 2 min; alert `HighErrorRate` if 5xx > 5% for 5 min
+
+##CODE
+%%bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
+helm repo update >/dev/null
+helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues=false \
+  --set grafana.adminPassword=lab-admin --wait --timeout 8m
+kubectl -n monitoring get pods
+
+##MD
+`serviceMonitorSelectorNilUsesHelmValues=false` makes Prometheus pick up ServiceMonitors from **all** namespaces, not only ones with the Helm release label.
+
+<details><summary>Reference solution</summary>
+
+Make sure the backend Service port is named: `ports: [{name: http, port: 9898, targetPort: http}]`.
+
+`servicemonitor.yaml`
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: shop-backend
+  namespace: shop-helm
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: backend}   # add this label to the Service metadata too
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+```
+`rules.yaml`
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: {name: shop-rules, namespace: shop-helm}
+spec:
+  groups:
+    - name: shop
+      rules:
+        - alert: BackendDown
+          expr: absent(up{namespace="shop-helm", service=~".*backend"} == 1)
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: "No shop backend target is up"
+            runbook: "Check pods: kubectl -n shop-helm get pods; describe; logs"
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_request_duration_seconds_count{namespace="shop-helm", status=~"5.."}[5m]))
+            / sum(rate(http_request_duration_seconds_count{namespace="shop-helm"}[5m])) > 0.05
+          for: 5m
+          labels: {severity: warning}
+          annotations: {summary: "Backend 5xx rate above 5%"}
+```
+Useful PromQL for the dashboard:
+- Request rate: `sum(rate(http_request_duration_seconds_count{namespace="shop-helm"}[5m]))`
+- p95 latency: `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="shop-helm"}[5m])))`
+- Restarts: `sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace="shop-helm"}[1h]))`
+- CPU vs request: `sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="shop-helm",container!=""}[5m])) / sum by (pod) (kube_pod_container_resource_requests{namespace="shop-helm",resource="cpu"})`
+</details>
+
+##CODE
+%%bash
+# Validate Project 10
+kubectl apply -f capstone/p10-monitoring/
+sleep 60
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9090:9090 >/dev/null 2>&1 &
+PF=$!; sleep 3
+curl -s 'localhost:9090/api/v1/query?query=up%7Bnamespace%3D%22shop-helm%22%7D' | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(len(r),"targets"); [print(x["metric"].get("pod"), x["value"][1]) for x in r]'
+curl -s localhost:9090/api/v1/rules | grep -q BackendDown && echo "PASS: alert rule loaded" || echo "FAIL: rule not loaded"
+kill $PF
+echo "Grafana: kubectl -n monitoring port-forward svc/kps-grafana 3000:80  (admin / lab-admin)"
+
+##MD
+### Production upgrade
+- Persistent storage + retention for Prometheus; long-term storage with **Thanos** (you already run it) or Mimir.
+- Alertmanager routes to on-call (Teams/Slack/email/PagerDuty) with runbook links.
+- SLO-based alerts (burn rate) instead of raw thresholds.
+- Logs (Loki) and traces (OpenTelemetry + Tempo) linked from Grafana.
+
+##MD
+---
+# Project 11: Game day — simulate production failures and troubleshoot
+
+### Goal
+Practice real incident handling. A script breaks the shop in 6 different ways **one at a time**. You find the cause using only kubectl, write a short incident note, and fix it. Do **not** read the script first.
+
+### Rules
+1. Run one scenario. Start a timer.
+2. Find: **symptom → evidence → root cause → fix → prevention**.
+3. Write each in `capstone/p11-gameday/incidents.md`.
+4. Only then open the hint/answer.
+
+### Your toolbox
+```bash
+kubectl -n shop get pods -o wide
+kubectl -n shop describe pod <pod>
+kubectl -n shop logs <pod> [-c container] [--previous]
+kubectl -n shop get events --sort-by=.lastTimestamp
+kubectl -n shop get endpoints
+kubectl -n shop exec deploy/frontend -- curl -sv http://backend:9898/
+kubectl top pods -n shop
+```
+
+##CODE
+%%writefile capstone/p11-gameday/break.sh
+#!/usr/bin/env bash
+# Game day breaker. Usage: bash break.sh <1-6>
+set -e
+NS=shop
+case "$1" in
+  1) kubectl -n $NS set image deploy/backend podinfo=ghcr.io/stefanprodan/podinfo:9.9.9-doesnotexist ;;
+  2) kubectl -n $NS patch deploy backend --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"8Mi"}]' ;;
+  3) kubectl -n $NS patch svc backend -p '{"spec":{"selector":{"app":"backendd"}}}' ;;
+  4) kubectl -n $NS patch deploy backend --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/not-here"}]' ;;
+  5) kubectl -n $NS patch deploy frontend --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"64"}]' ;;
+  6) kubectl -n $NS scale sts postgres --replicas=0 && kubectl -n $NS rollout restart deploy/backend ;;
+  *) echo "usage: break.sh 1..6"; exit 1 ;;
+esac
+echo "Scenario $1 injected. Users report: 'the shop is broken'. Start your investigation."
+
+##CODE
+%%bash
+# Save a known-good copy of the shop before game day, so you can always restore
+mkdir -p capstone/p11-gameday/backup
+for k in deploy/backend deploy/frontend svc/backend sts/postgres; do
+  kubectl -n shop get $k -o yaml > "capstone/p11-gameday/backup/$(echo $k | tr / -).yaml"
+done
+ls capstone/p11-gameday/backup
+
+##CODE
+%%bash
+# Inject a scenario: change the number (1..6)
+bash capstone/p11-gameday/break.sh 1
+
+##MD
+<details><summary>Scenario 1 — hint and answer</summary>
+
+Hint: look at Pod STATUS of new backend Pods.
+Answer: `ImagePullBackOff` / `ErrImagePull` — tag does not exist (`describe pod` → Events: "manifest unknown"). Old Pods keep serving because `maxUnavailable` kept them (if you set it to 0). Fix: `kubectl -n shop rollout undo deploy/backend`. Prevention: CI checks the image exists; pin digests; GitOps review.
+</details>
+
+<details><summary>Scenario 2 — hint and answer</summary>
+
+Hint: RESTARTS column and `describe` → Last State.
+Answer: `OOMKilled` (exit code 137) — memory limit 8Mi is below what the app needs. Fix: rollout undo or set limit back to 128Mi. Prevention: set limits from measured usage; alert on `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}`.
+</details>
+
+<details><summary>Scenario 3 — hint and answer</summary>
+
+Hint: Pods are all Running and Ready. Check `kubectl get endpoints backend`.
+Answer: Service selector typo (`backendd`) → **no endpoints** → frontend gets 502. Fix: patch selector back to `app: backend`. Prevention: Helm templates generate selectors from one label helper; alert on Services with zero endpoints.
+</details>
+
+<details><summary>Scenario 4 — hint and answer</summary>
+
+Hint: new Pods are Running but READY 0/1.
+Answer: readiness probe path wrong → new Pods never Ready → rollout stuck (with maxUnavailable 0, old Pods still serve; with 25% some capacity lost). `describe` shows "Readiness probe failed: HTTP probe failed with statuscode: 404". Fix: rollout undo. Prevention: probe paths in chart values tested in CI; `progressDeadlineSeconds` alert.
+</details>
+
+<details><summary>Scenario 5 — hint and answer</summary>
+
+Hint: new frontend Pods are `Pending`.
+Answer: CPU request 64 cores — no node can fit it. Events: "0/1 nodes are available: 1 Insufficient cpu". Fix: undo. Prevention: LimitRange max per container; review requests in PRs.
+</details>
+
+<details><summary>Scenario 6 — hint and answer</summary>
+
+Hint: backend Pods stuck in `Init:0/1`. Check init container logs.
+Answer: database scaled to 0 → `wait-for-db` init container loops "waiting for db". Fix: `kubectl -n shop scale sts postgres --replicas=1`. Prevention: alert on StatefulSet ready replicas < desired; protect critical workloads with RBAC (only CI may scale).
+</details>
+
+##CODE
+%%bash
+# Restore known-good state after each scenario (if your own fix did not work)
+kubectl -n shop apply -f capstone/p11-gameday/backup/ 2>&1 | tail -4
+kubectl -n shop scale sts postgres --replicas=1
+kubectl -n shop rollout status deploy/backend --timeout=180s
+
+##MD
+### Incident note template (copy into incidents.md)
+```
+## Scenario N — <title>
+- Detected at / by:
+- Symptom (what users saw):
+- Evidence (commands + output lines):
+- Root cause:
+- Fix applied:
+- Time to detect / time to fix:
+- Prevention (alert, test, policy):
+```
+
+### Production upgrade
+- Run game days on a **staging** cluster with real traffic (k6) and a chaos tool (Chaos Mesh / Litmus): kill nodes, add network latency, fill disks.
+- Measure MTTD (mean time to detect) and MTTR (mean time to recover). Improve alerts and runbooks after each game day.
+
+##MD
+---
+# Project 12: HA production-style architecture (local)
+
+### Goal
+Deploy the Helm chart on a **multi-node kind cluster** with production-style settings: 3 control planes, 3 workers in 3 fake zones, topology spread, PDBs, anti-affinity, priority classes, a system pool, and prove the app survives a worker failure and a node drain.
+
+> **RAM:** this needs ~6 GB for Docker. Stop the `learn` cluster if needed: `docker stop $(docker ps -q --filter name=learn-)` and start it again later with `docker start`.
+
+### Architecture
+```
+ kind cluster "capstone-ha"
+  control-plane x3 (stacked etcd) behind haproxy LB
+  worker zone-a  worker zone-b  worker zone-c   (+ system role label on one)
+     frontend x3  backend x3  spread 1 per zone (hard), PDB minAvailable 2
+     postgres-0 StatefulSet with PVC (single instance: documented risk)
+     ingress-nginx x2 with PDB
+```
+
+### Requirements checklist
+- [ ] Cluster config `capstone/p12-ha/kind-ha.yaml` (3 CP + 3 workers with zone labels)
+- [ ] `values-ha.yaml` for the chart: replicas 3, `topologySpreadConstraints` (zone hard, hostname soft), PDB per tier, `priorityClassName`, resource requests/limits
+- [ ] Your chart supports these values (add templates: `pdb.yaml`, spread in deployments)
+- [ ] Test 1: `docker stop` one worker → shop still answers
+- [ ] Test 2: drain another worker → PDB respected, no downtime (use the load loop from Notebook 14)
+- [ ] Document the remaining single points of failure (postgres!) in `ARCHITECTURE.md`
+
+<details><summary>Reference solution (key parts)</summary>
+
+`kind-ha.yaml`
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: capstone-ha
+nodes:
+  - role: control-plane
+  - role: control-plane
+  - role: control-plane
+  - {role: worker, labels: {topology.kubernetes.io/zone: zone-a}}
+  - {role: worker, labels: {topology.kubernetes.io/zone: zone-b}}
+  - {role: worker, labels: {topology.kubernetes.io/zone: zone-c}}
+```
+`values-ha.yaml`
+```yaml
+frontend: {replicas: 3}
+backend: {replicas: 3}
+hpa: {enabled: true, min: 3, max: 9, cpu: 60}
+ha:
+  pdbMinAvailable: 2
+  priorityClassName: shop-critical
+  spread: true
+```
+Template snippet (inside each Deployment pod spec):
+```yaml
+{{- if .Values.ha.spread }}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector: {matchLabels: {app.kubernetes.io/name: backend, app.kubernetes.io/instance: {{ .Release.Name }}}}
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector: {matchLabels: {app.kubernetes.io/name: backend, app.kubernetes.io/instance: {{ .Release.Name }}}}
+{{- end }}
+{{- with .Values.ha.priorityClassName }}
+priorityClassName: {{ . }}
+{{- end }}
+```
+`templates/pdb.yaml`
+```yaml
+{{- range $tier := list "frontend" "backend" }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: {{ $.Release.Name }}-{{ $tier }}}
+spec:
+  minAvailable: {{ $.Values.ha.pdbMinAvailable }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ $tier }}, app.kubernetes.io/instance: {{ $.Release.Name }}}
+{{- end }}
+```
+PriorityClass (create once): `kubectl create priorityclass shop-critical --value=100000 --description="shop tiers"`.
+Remaining SPOF: single postgres instance and its single PVC → production answer: managed DB or CloudNativePG with 3 instances across zones + backups.
+</details>
+
+##CODE
+%%bash
+# Validate Project 12 (creates a separate cluster; ~5 minutes)
+cd capstone/p12-ha
+kind get clusters | grep -q capstone-ha || kind create cluster --config kind-ha.yaml
+kubectl config use-context kind-capstone-ha
+kubectl create priorityclass shop-critical --value=100000 --dry-run=client -o yaml | kubectl apply -f -
+kubectl create ns shop-ha --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n shop-ha create secret generic db-credentials --from-literal=username=shop --from-literal=password=lab-only-password --dry-run=client -o yaml | kubectl apply -f -
+helm upgrade --install shop ../p08-helm/shop -n shop-ha -f values-ha.yaml --wait --timeout 8m
+kubectl -n shop-ha get pods -o wide
+kubectl -n shop-ha get pdb
+echo "== Test 1: stop a worker =="
+docker stop capstone-ha-worker
+sleep 20
+kubectl -n shop-ha exec deploy/shop-frontend -- curl -s -o /dev/null -w "%{http_code}\n" http://shop-backend:9898/ || true
+docker start capstone-ha-worker
+
+##MD
+**Expected:** HTTP `200` while one worker is down. Run Test 2 (drain with load loop) yourself and record the result.
+
+### Production upgrade
+- Real version: Notebook 14 design on OKE across 3 fault domains, managed DB, DR region, private endpoint, WAF.
+- Write a one-page **Architecture Decision Record (ADR)** for each big choice (why NLB, why namespace-per-team, why warm standby).
+
+##CODE
+%%bash
+# Cleanup Project 12
+kind delete cluster --name capstone-ha
+kubectl config use-context kind-learn
+docker start $(docker ps -aq --filter name=learn-) >/dev/null 2>&1 || true
+kubectl get nodes
+
+##MD
+---
+# Project 13: Complete app on managed cloud Kubernetes (OKE default)
+
+### Goal
+Deploy the same Helm chart to a **real managed cluster**. Default: **OKE** (your platform). Alternatives: EKS/AKS/GKE using Notebook 15.
+
+> **This costs money.** All cloud cells are guarded. Use a **lab compartment** and a **lab cluster**, never a production one. Tear down the same day.
+
+### Architecture
+```
+ Internet --> OCI NLB (public) --> ingress-nginx (2 replicas) --> shop frontend --> backend --> postgres (oci-bv 50Gi)
+              created from Service annotations
+ OKE enhanced cluster (Terraform from Notebook 15), private API, 2-3 worker nodes across FDs
+ Optional: Argo CD syncing from your GitHub repo; workload identity for an upload bucket
+```
+
+### Requirements checklist
+- [ ] Cluster created with Terraform (Notebook 15 `labs/15/oke`)
+- [ ] `values-oke.yaml`: `postgres.storageClass: oci-bv`, `postgres.size: 50Gi`, ingress enabled with your test hostname or nip.io
+- [ ] ingress-nginx installed with NLB annotation
+- [ ] App reachable from the internet (screenshot for portfolio)
+- [ ] Pods spread across fault domains (`kubectl get pods -o wide` + node FD labels)
+- [ ] Teardown: delete LB Services and PVCs, then `terraform destroy`; screenshot the empty compartment
+
+<details><summary>Reference solution</summary>
+
+`values-oke.yaml`
+```yaml
+postgres:
+  storageClass: oci-bv
+  size: 50Gi
+frontend: {replicas: 3}
+backend: {replicas: 3}
+ha: {spread: true, pdbMinAvailable: 2, priorityClassName: ""}
+ingress:
+  enabled: true
+  className: nginx
+  host: shop.<NLB-IP>.nip.io
+```
+Spread key on OKE: use `topology.kubernetes.io/zone` in multi-AD regions, or `oci.oraclecloud.com/fault-domain` in single-AD regions (Jeddah/Riyadh) — make the key a chart value.
+
+ingress-nginx on OKE with NLB:
+```bash
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.service.externalTrafficPolicy=Local \
+  --set-string controller.service.annotations."oci\.oraclecloud\.com/load-balancer-type"=nlb
+```
+</details>
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: deploys to a real OKE cluster and creates a billable NLB + 50Gi block volume
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped. Insert 'export CONFIRM_CLOUD=yes' directly under the REVIEW line after reading."; exit 0; }
+ctx=$(kubectl config current-context)
+echo "Context: $ctx"
+case "$ctx" in *lab*) ;; *) echo "STOP: context name must contain 'lab' (use your OKE LAB cluster only)"; exit 1;; esac
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null; helm repo update >/dev/null
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace \
+  --set controller.replicaCount=2 --set controller.service.externalTrafficPolicy=Local \
+  --set-string controller.service.annotations."oci\.oraclecloud\.com/load-balancer-type"=nlb --wait --timeout 10m
+kubectl -n ingress-nginx get svc ingress-nginx-controller
+kubectl create ns shop --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n shop create secret generic db-credentials --from-literal=username=shop --from-literal=password="$(openssl rand -base64 18)" --dry-run=client -o yaml | kubectl apply -f -
+helm upgrade --install shop capstone/p08-helm/shop -n shop -f capstone/p13-cloud/values-oke.yaml --wait --timeout 10m
+kubectl -n shop get pods -o wide
+kubectl get nodes -L oci.oraclecloud.com/fault-domain
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: removes cloud resources created by Project 13 (LB, block volume)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+helm -n shop uninstall shop || true
+kubectl -n shop delete pvc --all
+helm -n ingress-nginx uninstall ingress-nginx || true
+echo "Now destroy the cluster: cd labs/15/oke && terraform destroy"
+echo "Then check the OCI console: Load Balancers, Network Load Balancers, Block Volumes = empty in the lab compartment."
+
+##MD
+### Production upgrade
+- Private API + OCI Bastion; Argo CD in-cluster syncing from Git; External Secrets with OCI Vault; workload identity for buckets.
+- Real DNS + cert-manager Let's Encrypt; Cloudflare/WAF in front.
+- Velero/Commvault backups to another region; a DR cluster in Riyadh (Notebook 14 assignment).
+
+##MD
+---
+# Interview / Architect Questions (about your projects)
+
+**1. Walk me through your capstone architecture in 2 minutes.**
+<details><summary>Answer outline</summary>
+Three-tier app packaged as a Helm chart; GitOps via Argo CD; ingress-nginx + cert-manager; StatefulSet postgres with PVC; HPA on CPU; RBAC + PSA restricted + NetworkPolicies; Prometheus/Grafana with alert rules; HA test on a 3-CP/3-zone cluster; deployed to OKE behind an NLB. Then say clearly what is lab-only (single postgres, self-signed TLS) and what you would change for production.
+</details>
+
+**2. What was the hardest bug you met and how did you find it?**
+<details><summary>Answer outline</summary>
+Pick a real one from incidents.md. Use STAR: Situation, Task, Action (exact commands and evidence), Result, and what you changed to prevent it.
+</details>
+
+**3. Why GitOps instead of `helm upgrade` from a pipeline?**
+<details><summary>Answer</summary>
+Git is the audit log and the source of truth; drift is detected and fixed automatically (self-heal); rollback = git revert; cluster credentials stay inside the cluster (pull model), CI does not need cluster-admin.
+</details>
+
+**4. How would you make the postgres tier production-grade?**
+<details><summary>Answer</summary>
+Managed DB (HA, backups, PITR) or CloudNativePG with 3 instances spread across zones/FDs, synchronous or async replicas per RPO, PDB, PITR backups to object storage in another region, monitoring of replication lag, tested restore.
+</details>
+
+##MD
+---
+# Practical Assignment: Final demo
+
+**Scenario:** You apply for a Platform/DevOps Engineer role. The hiring manager asks for a 15-minute live demo.
+
+**Tasks**
+1. From an empty kind cluster, run one script `bootstrap.sh` that installs ingress-nginx, cert-manager, metrics-server, kube-prometheus-stack and Argo CD, then creates the Argo CD Application.
+2. Show the app over HTTPS, the Grafana dashboard, and Argo CD "Synced/Healthy".
+3. Live: change the backend message in Git → show auto-sync.
+4. Live: inject Game day scenario 3 → diagnose on screen → fix.
+5. Show the README with architecture diagram, lab vs production table, and your incident notes.
+
+**Success criteria:** bootstrap runs end to end in < 15 minutes with no manual steps except the secret; demo works twice in a row.
+
+**Hints:** make bootstrap idempotent (`helm upgrade --install`, `--dry-run=client -o yaml | kubectl apply -f -`); use `--wait`.
+
+<details><summary>Model solution: bootstrap.sh</summary>
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$(kubectl config current-context)" = "kind-learn" ] || { echo "wrong context"; exit 1; }
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add jetstack https://charts.jetstack.io
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace --set controller.service.type=ClusterIP --wait
+helm upgrade --install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set crds.enabled=true --wait
+helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system --set args={--kubelet-insecure-tls} --wait
+helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues=false --wait --timeout 10m
+helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace --wait
+kubectl apply -f capstone/p03-ingress/issuer.yaml
+kubectl create ns shop-gitops --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n shop-gitops create secret generic db-credentials \
+  --from-literal=username=shop --from-literal=password="${DB_PASSWORD:?set DB_PASSWORD}" --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f capstone/p09-gitops/apps/shop-dev.yaml
+kubectl -n argocd wait --for=jsonpath='{.status.health.status}'=Healthy application/shop-dev --timeout=10m
+echo "Ready."
+```
+</details>
+
+##MD
+---
+# Portfolio: publish your projects on GitHub
+
+Recruiters and hiring managers check GitHub. A clean repo with real evidence is worth more than a list of tools on a CV. Only show what you really built.
+
+### 1. Repository layout
+```
+k8s-capstone/
+  README.md                 <- overview, diagram, progress table, how to run, lab vs production
+  bootstrap.sh
+  capstone/
+    p01-simple-app/ ... p13-cloud/
+      README.md or NOTES.md <- what, why, what I learned, screenshots
+  docs/
+    architecture.md
+    incidents.md            <- game day notes (STAR format)
+    adr/                    <- architecture decision records
+  .gitignore
+```
+
+### 2. Never commit secrets
+Add a `.gitignore` and scan before every push.
+
+##CODE
+%%writefile capstone/.gitignore
+# secrets and local files
+**/secret.yaml
+**/*secret*.yaml
+!**/*.example
+*.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+kubeconfig*
+*.pem
+*.key
+p11-gameday/backup/
+
+##CODE
+%%bash
+# Search for things that look like secrets before you push
+cd capstone
+grep -rniE "password|secret|BEGIN (RSA|OPENSSH|PRIVATE)|aws_secret|ocid1\.tenancy" --include="*.yaml" --include="*.sh" --include="*.md" . \
+  | grep -viE "secretKeyRef|existingSecret|kind: Secret|db-credentials|lab-only-password|secretName|\.example" \
+  || echo "No obvious secrets found (still review manually)."
+echo
+echo "Files still containing the lab password (OK only if clearly marked lab-only):"
+grep -rl "lab-only-password" . || true
+
+##MD
+### 3. Create the repo and push
+```bash
+cd ~/Documents/Learning-Certifications/Kubernetes-Course
+mkdir -p ~/Projects/k8s-capstone && cp -R capstone ~/Projects/k8s-capstone/
+cd ~/Projects/k8s-capstone
+git init -b main
+git add .
+git status            # read the list: no secrets, no tfstate
+git commit -m "Kubernetes capstone: 13 projects"
+# create an empty repo named k8s-capstone on github.com, then:
+git remote add origin https://github.com/<your-user>/k8s-capstone.git
+git push -u origin main
+```
+
+### 4. README checklist (what reviewers look for)
+- [ ] One-paragraph summary: what you built and which tools
+- [ ] Architecture diagram (ASCII or draw.io PNG)
+- [ ] Progress table (from the top of this notebook)
+- [ ] "How to run" in < 10 commands
+- [ ] **Lab vs production** table — shows maturity
+- [ ] Screenshots: Argo CD synced, Grafana dashboard, HPA scaling, app on OKE via NLB
+- [ ] Incident notes from game day
+- [ ] What you would do next
+
+### 5. Use it in applications
+- Add the repo link to your CV header (next to LinkedIn) and LinkedIn "Featured".
+- In your CV, describe only what you actually did, for example: "Built a GitOps-deployed three-tier app on Kubernetes (Helm, Argo CD, Prometheus/Grafana, HPA, RBAC, NetworkPolicies) and deployed it to OKE — github.com/<user>/k8s-capstone".
+- Be ready to demo it live (Practical Assignment above).
+
+##MD
+---
+# Cleanup (local)
+
+Removes all capstone namespaces and add-ons from `kind-learn`. Your files in `capstone/` stay.
+
+##CODE
+%%bash
+[ "$(kubectl config current-context)" = "kind-learn" ] || { echo "STOP: not kind-learn"; exit 1; }
+for ns in shop shop-helm shop-gitops p01; do kubectl delete ns $ns --ignore-not-found --wait=false; done
+helm uninstall argocd -n argocd 2>/dev/null || true
+helm uninstall kps -n monitoring 2>/dev/null || true
+helm uninstall cert-manager -n cert-manager 2>/dev/null || true
+helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
+helm uninstall metrics-server -n kube-system 2>/dev/null || true
+kubectl get ns
+
+##MD
+---
+**Next:** this is the last notebook. Go back to [00 Start Here](00-Start-Here-Lab-Setup.ipynb) and review any phase where your Practical Assignment was weak. Then publish your portfolio.

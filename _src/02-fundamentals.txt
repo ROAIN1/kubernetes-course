@@ -1,0 +1,1429 @@
+##MD
+# 02 — Kubernetes Fundamentals: Architecture, API, and kubectl
+
+**Phase 2: Kubernetes fundamentals**
+
+**What you will learn**
+- What Kubernetes is, and which problems it solves.
+- The architecture: control plane and worker nodes.
+- Every core component: API server, etcd, scheduler, controller manager, kubelet, kube-proxy, container runtime (CRI).
+- How one `kubectl apply` travels through the whole system.
+- The Kubernetes API: `kubectl get --raw`, `api-resources`, `explain`.
+- Declarative vs imperative management.
+- kubectl essentials and kubeconfig.
+- Namespaces, labels, selectors, annotations.
+
+**Time:** 4–5 hours.
+
+**Prerequisites:** Notebook 00 (cluster `learn` running) and notebook 01 (Linux, networking, containers).
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift + Enter**.
+- Every lab starts with a **guard cell**. It stops if your kubectl context is not `kind-learn`. Never run these labs against OKE or any real cluster.
+- Labs write YAML to `labs/02/`.
+
+##CODE
+%%bash
+mkdir -p labs/02
+# GUARD: stop if we are not on the local lab cluster.
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then echo "STOP: context is '$ctx', not 'kind-learn'. Run: kubectl config use-context kind-learn"; exit 1; fi
+echo "OK: using kind-learn"
+kubectl get nodes
+
+##MD
+---
+## 1. What Kubernetes is and why it exists
+
+### What is it?
+**Kubernetes** (short: **K8s**) is a system that runs containers across many machines and keeps them in the state you asked for. You describe *what* you want (for example "3 copies of my web app, version 1.4, reachable on port 80"). Kubernetes works out *how* and keeps it that way.
+
+### Why do we need it? What problem does it solve?
+With plain Docker on servers, **you** do everything by hand:
+
+| Problem | Plain Docker on VMs | Kubernetes |
+|---|---|---|
+| A container crashes | Someone notices and restarts it | Restarted automatically |
+| A server dies | Containers on it are gone until you rebuild | Pods are recreated on healthy nodes |
+| Deploy a new version | SSH to each server, stop, pull, start | Rolling update with one command, rollback with one command |
+| Find where an app runs | Spreadsheet of IPs | Service name + DNS |
+| Scale for traffic | Add servers and containers by hand | `replicas: 10` or autoscaling |
+| Pack apps onto servers efficiently | Guesswork | Scheduler places pods by CPU/memory requests |
+
+### The core idea: desired state + reconciliation
+```
+   You:  "I want 3 replicas"      (desired state, stored in etcd)
+   K8s:  "I see 2 running"        (actual state, reported by nodes)
+   K8s:  start 1 more             (action)
+   ...repeat forever...            ← this loop is called RECONCILIATION
+```
+Every part of Kubernetes is a loop that compares **desired** and **actual** state and fixes the difference. If you remember one idea from this notebook, remember this one.
+
+### Real production scenario
+Your company runs the Events app on 4 VMs with Docker Compose. At 02:00 one VM's disk fills and Docker stops. The app is half-down until someone wakes up. After moving to OKE, the same failure means: the node goes `NotReady`, pods are rescheduled to other nodes in about 5 minutes (or faster with tuned settings), and the on-call engineer fixes the node in the morning.
+
+### Check yourself
+1. In one sentence, what does Kubernetes do?
+2. What is reconciliation?
+3. Name three things Kubernetes automates that you do by hand with plain Docker.
+
+<details><summary>Answer</summary>
+
+1. It runs containers across many machines and continuously keeps them in the desired state you declared.
+2. A control loop that compares desired state with actual state and acts to remove the difference, forever.
+3. Restarting failed containers, rescheduling after node failure, rolling updates/rollbacks, service discovery, scaling, bin-packing.
+</details>
+
+##MD
+## 2. Architecture: control plane and worker nodes
+
+### What is it?
+A cluster has two kinds of machines:
+- **Control plane** — the "brain". It stores state, makes decisions, and exposes the API.
+- **Worker nodes** — the "muscle". They run your application pods.
+
+### How it works
+```
+                         CONTROL PLANE
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   kubectl ──HTTPS──►  kube-apiserver  ◄────►  etcd          │
+  │                        ▲     ▲   ▲          (key-value DB,  │
+  │                        │     │   │           the ONLY place │
+  │          watches/updates     │   │           state is kept) │
+  │      ┌─────────────────┘     │   └──────────────┐           │
+  │  kube-scheduler     kube-controller-manager   cloud-controller│
+  │  (picks a node)     (Deployment, ReplicaSet,  -manager        │
+  │                      Node, Job ... loops)     (cloud LBs,    │
+  │                                                volumes)       │
+  └────────────────────────────┬────────────────────────────────┘
+                               │ HTTPS (only the API server talks to etcd)
+          ┌────────────────────┴───────────────────┐
+          ▼                                        ▼
+   WORKER NODE 1                            WORKER NODE 2
+  ┌────────────────────────┐              ┌────────────────────────┐
+  │ kubelet  (node agent)  │              │ kubelet                │
+  │   │ CRI (gRPC)         │              │ containerd             │
+  │   ▼                    │              │ kube-proxy             │
+  │ containerd → pods      │              │ CNI plugin             │
+  │ kube-proxy (Services)  │              │  [pod] [pod] [pod]     │
+  │ CNI plugin (pod network)│             └────────────────────────┘
+  └────────────────────────┘
+```
+
+**Key rules**
+1. **Everything talks to the API server.** No component talks to another directly (except API server ↔ etcd).
+2. **Only the API server reads and writes etcd.**
+3. Components **watch** the API server for changes, then act. Nobody "pushes" commands to nodes.
+
+### On OKE
+OKE runs the control plane **for you** (Oracle manages API server, etcd, scheduler, controller manager). You only see and manage worker nodes (node pools). On kind, you can see everything, which is why we learn here.
+
+### Hands-on lab: see the components
+On kind (built with kubeadm), control plane components run as **static pods** in `kube-system`.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+echo "== Nodes and their roles =="
+kubectl get nodes -o wide
+echo; echo "== Control plane + node components (kube-system) =="
+kubectl get pods -n kube-system -o wide
+
+##MD
+**Expected output (shortened):**
+```
+NAME                                          READY  STATUS   NODE
+coredns-xxxx (2 pods)                         1/1    Running  learn-control-plane
+etcd-learn-control-plane                      1/1    Running  learn-control-plane
+kindnet-xxxxx (3 pods, one per node)          1/1    Running  learn-...
+kube-apiserver-learn-control-plane            1/1    Running  learn-control-plane
+kube-controller-manager-learn-control-plane   1/1    Running  learn-control-plane
+kube-proxy-xxxxx (3 pods, one per node)       1/1    Running  learn-...
+kube-scheduler-learn-control-plane            1/1    Running  learn-control-plane
+```
+Notice: `kube-proxy` and `kindnet` (CNI) run on **every** node. The others run only on the control plane. The kubelet and containerd are **not** pods — they are systemd services on each node (you saw this in notebook 01).
+
+### Static pods: how the control plane starts itself
+The API server cannot schedule itself — it is not running yet. So the **kubelet** on the control plane node reads YAML files from `/etc/kubernetes/manifests` and starts those pods directly. These are **static pods**.
+
+##CODE
+%%bash
+echo "== Static pod manifests on the control plane node =="
+docker exec learn-control-plane ls -l /etc/kubernetes/manifests
+echo; echo "== Part of the API server manifest: important flags =="
+docker exec learn-control-plane grep -E -- '--(etcd-servers|service-cluster-ip-range|authorization-mode|secure-port|admission)' /etc/kubernetes/manifests/kube-apiserver.yaml
+
+##MD
+**Expected output:**
+```
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+
+    - --authorization-mode=Node,RBAC
+    - --enable-admission-plugins=NodeRestriction
+    - --etcd-servers=https://127.0.0.1:2379
+    - --secure-port=6443
+    - --service-cluster-ip-range=10.96.0.0/16
+```
+`--service-cluster-ip-range=10.96.0.0/16` is the **Service network** from notebook 01. The API server listens on port **6443**.
+
+### Lab vs Production
+
+| Lab (kind) | Production |
+|---|---|
+| 1 control plane node (single point of failure) | 3 or 5 control plane nodes behind a load balancer, or managed (OKE, EKS, AKS, GKE) |
+| etcd on the same node, no backups | etcd on 3+ members (odd number for quorum), regular snapshots |
+| Everything in containers on a laptop | Nodes spread across availability/fault domains |
+
+### Check yourself
+1. Which component is the only one that talks to etcd?
+2. Why are control plane components static pods on kubeadm clusters?
+3. Which components run on every worker node?
+4. On OKE, which parts do you manage yourself?
+
+<details><summary>Answer</summary>
+
+1. kube-apiserver.
+2. The API server is not running yet, so nothing can schedule them. The kubelet starts them directly from files in `/etc/kubernetes/manifests`.
+3. kubelet, container runtime (containerd), kube-proxy, CNI plugin agent.
+4. Worker nodes / node pools (and their OS, upgrades of the pools, add-ons you install). Oracle manages the control plane.
+</details>
+
+##MD
+## 3. kube-apiserver and etcd
+
+### What is it?
+- **kube-apiserver** — the front door. A REST API over HTTPS. Every request goes through: **authentication** (who are you?) → **authorization** (RBAC: are you allowed?) → **admission** (mutate/validate the object) → **store in etcd**.
+- **etcd** — a distributed, consistent **key-value store**. It holds every object: pods, deployments, secrets, config. If etcd is lost without backup, the cluster's state is lost.
+
+### Why do we need them?
+One central, consistent source of truth. All components agree on the state because they all read it from one place, through one API with security checks.
+
+### How it works internally
+```
+ kubectl apply ──► API server
+                    1. Authentication   (client certificate, token, OIDC)
+                    2. Authorization    (RBAC rules)
+                    3. Mutating admission  (add defaults, inject sidecars)
+                    4. Schema validation
+                    5. Validating admission (policies: e.g. "no :latest tags")
+                    6. Write to etcd  ──►  /registry/deployments/default/web
+                    7. Notify all WATCHERS (scheduler, controllers, kubelets)
+```
+**etcd uses the Raft consensus algorithm.** A write succeeds only when a **majority (quorum)** of members agree. With 3 members, 1 can fail. With 5 members, 2 can fail. That is why etcd clusters have an **odd** number of members.
+
+### Real production scenario
+A self-managed cluster's etcd disk is slow (shared storage). API requests take seconds. `kubectl` times out. Leader elections fail, controllers restart. The etcd logs show `apply request took too long`. Fix: move etcd to fast local SSD. Lesson: etcd needs low disk latency. On OKE this is Oracle's problem — one big reason to use managed Kubernetes.
+
+### Hands-on lab: talk to the API server and read etcd directly
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+echo "== API server health endpoints =="
+kubectl get --raw='/readyz?verbose' | tail -5
+echo; echo "== Create a namespace, then find it inside etcd =="
+kubectl create namespace etcd-demo --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n kube-system exec etcd-learn-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/namespaces/ --prefix --keys-only
+
+##MD
+**Expected output:**
+```
+[+]poststarthook/... ok
+readyz check passed
+
+namespace/etcd-demo created
+/registry/namespaces/default
+/registry/namespaces/etcd-demo
+/registry/namespaces/kube-node-lease
+/registry/namespaces/kube-public
+/registry/namespaces/kube-system
+/registry/namespaces/local-path-storage
+```
+Every object lives under a key like `/registry/<resource>/<namespace>/<name>`. Values are stored in a binary format (protobuf), so we only list keys.
+
+Check etcd member health and size:
+
+##CODE
+%%bash
+kubectl -n kube-system exec etcd-learn-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status --write-out=table
+kubectl delete namespace etcd-demo
+
+##MD
+**Expected output:** a table with `ENDPOINT`, `VERSION` (3.5.x), `DB SIZE` (a few MB), `IS LEADER` = `true` (only one member in kind), `RAFT TERM`.
+
+### Troubleshooting
+
+| Symptom | Cause | Check |
+|---|---|---|
+| `The connection to the server ... was refused` | API server down, or wrong kubeconfig/context | `kubectl config current-context`; on node: `crictl ps \| grep apiserver` |
+| `Unauthorized` (401) | Bad/expired credentials (on OKE: expired token, OCI CLI config) | Refresh kubeconfig / token |
+| `Forbidden` (403) | Authenticated but RBAC denies | `kubectl auth can-i <verb> <resource>` |
+| `admission webhook ... denied the request` | A policy (validating webhook) blocked it | Read the message; fix the manifest |
+| Slow API, timeouts | etcd slow disk, etcd too large, too many watchers | etcd metrics `etcd_disk_wal_fsync_duration_seconds` |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Single etcd member, no backup | 3/5 members; `etcdctl snapshot save` on schedule; encrypted, off-cluster backup storage; tested restore |
+| Secrets stored in etcd base64 only | Encryption at rest for Secrets (KMS provider, e.g. OCI Vault on OKE) |
+| Admin certificate for everything | Per-user identity (OIDC / OCI IAM), RBAC, audit logging enabled |
+
+### Check yourself
+1. List the API server request steps in order.
+2. Why does etcd use an odd number of members?
+3. Where is a Deployment called `web` in namespace `shop` stored in etcd?
+4. 401 vs 403 from the API server?
+
+<details><summary>Answer</summary>
+
+1. Authentication → authorization → mutating admission → validation → validating admission → persist to etcd → notify watchers.
+2. Raft needs a majority (quorum). An odd number gives the best fault tolerance per member: 3 tolerates 1 failure, 5 tolerates 2. A 4th member adds no extra tolerance over 3.
+3. `/registry/deployments/shop/web`.
+4. 401 = not authenticated (who are you?). 403 = authenticated but not authorized.
+</details>
+
+##MD
+## 4. kube-scheduler and kube-controller-manager
+
+### What is it?
+- **kube-scheduler** — watches for pods with **no node assigned** (`spec.nodeName` empty). For each, it picks the best node and writes the node name into the pod. That is all. It does **not** start containers.
+- **kube-controller-manager** — runs many **controllers** in one process. Each controller is a reconciliation loop for one kind of object: ReplicaSet controller, Deployment controller, Node controller (marks nodes `NotReady`, evicts pods), Job controller, EndpointSlice controller, and more.
+
+### How the scheduler decides
+```
+ Pending pod (needs 500m CPU, 256Mi memory)
+   1. FILTER  — remove nodes that cannot run it:
+        not enough free requests? taint not tolerated? nodeSelector mismatch?
+   2. SCORE   — rank remaining nodes:
+        spread replicas, least allocated, affinity preferences, image already present
+   3. BIND    — write spec.nodeName = best node   (to the API server)
+```
+If **no** node passes the filter, the pod stays `Pending` with a `FailedScheduling` event. That event always tells you **why**.
+
+### How a controller works
+```
+ ReplicaSet controller loop:
+   desired = rs.spec.replicas (3)
+   actual  = count of pods matching rs.spec.selector (2)
+   if actual < desired → create pods
+   if actual > desired → delete pods
+```
+
+### Real production scenario
+After a release, new pods stay `Pending`. `kubectl describe pod` shows `0/6 nodes are available: 6 Insufficient memory`. The new version requests 4Gi memory instead of 512Mi (a typo: `4Gi` vs `400Mi`). The scheduler cannot fit it anywhere. You fix the request, pods schedule immediately. No node was "broken"; the scheduler did exactly its job.
+
+### Hands-on lab 1: watch a controller heal
+We create a Deployment with 3 replicas, delete a pod, and watch the ReplicaSet controller create a new one.
+
+##CODE
+%%writefile labs/02/web.yaml
+apiVersion: apps/v1            # API group "apps", version "v1".
+kind: Deployment               # The object type.
+metadata:
+  name: web                    # Object name (unique per namespace and kind).
+  namespace: default
+  labels:
+    app: web                   # Labels on the Deployment itself.
+spec:
+  replicas: 3                  # DESIRED STATE: 3 pods.
+  selector:
+    matchLabels:
+      app: web                 # Which pods this Deployment owns. Must match template labels.
+  template:                    # The pod template: blueprint for every pod.
+    metadata:
+      labels:
+        app: web               # Pods get this label → selector finds them.
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27    # Pinned version, not "latest".
+          ports:
+            - containerPort: 80
+          resources:
+            requests:          # What the scheduler reserves on a node.
+              cpu: 50m         # 50 millicores = 5% of one CPU.
+              memory: 64Mi
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+kubectl apply -f labs/02/web.yaml
+kubectl rollout status deployment/web --timeout=120s
+kubectl get pods -l app=web -o wide
+victim=$(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+echo; echo "== Deleting $victim ... controller will replace it =="
+kubectl delete pod "$victim" --wait=false
+sleep 3
+kubectl get pods -l app=web -o wide
+
+##MD
+**Expected output:** 3 pods spread over `learn-worker` and `learn-worker2`. After the delete, you see a **new** pod name with a young `AGE` (a few seconds). Still 3 pods. Nobody restarted anything by hand: the ReplicaSet controller saw 2 ≠ 3 and created one.
+
+### Hands-on lab 2: make the scheduler say no
+A pod that asks for a node label no node has. It will stay `Pending`. Read the reason.
+
+##CODE
+%%writefile labs/02/unschedulable.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: needs-gpu
+spec:
+  nodeSelector:
+    hardware: gpu              # FILTER: only nodes with label hardware=gpu. None exist.
+  containers:
+    - name: app
+      image: nginx:1.27
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+
+##CODE
+%%bash
+kubectl apply -f labs/02/unschedulable.yaml
+sleep 5
+kubectl get pod needs-gpu -o wide
+echo; echo "== The scheduler explains why =="
+kubectl describe pod needs-gpu | sed -n '/Events:/,$p'
+
+##MD
+**Expected output:**
+```
+NAME        READY   STATUS    NODE
+needs-gpu   0/1     Pending   <none>
+
+Events:
+  Type     Reason            From               Message
+  Warning  FailedScheduling  default-scheduler  0/3 nodes are available: 1 node(s) had untolerated taint
+           {node-role.kubernetes.io/control-plane: }, 2 node(s) didn't match Pod's node affinity/selector. ...
+```
+Now fix it by adding the label to one worker. The scheduler retries and binds the pod.
+
+##CODE
+%%bash
+kubectl label node learn-worker2 hardware=gpu
+kubectl wait --for=condition=Ready pod/needs-gpu --timeout=60s
+kubectl get pod needs-gpu -o wide
+kubectl delete pod needs-gpu
+kubectl label node learn-worker2 hardware-          # trailing "-" removes the label
+
+##MD
+**Expected output:** the pod becomes `Running` on `learn-worker2`.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pod `Pending`, `Insufficient cpu/memory` | Requests too large, or cluster full | Lower requests, add nodes, enable cluster autoscaler |
+| Pod `Pending`, `didn't match node selector/affinity` | Label missing | Label nodes or fix selector |
+| Pod `Pending`, `untolerated taint` | Node tainted | Add toleration or use other nodes |
+| Pod `Pending`, `unbound PersistentVolumeClaims` | Storage not ready | Check PVC / StorageClass (notebook 05) |
+| Deleted pods come back | Owned by a ReplicaSet/Deployment | Scale or delete the Deployment, not the pod |
+| Pods not recreated after node death for ~5 min | Node controller waits before eviction (tolerationSeconds 300) | Expected; tune per workload if needed |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Default scheduler settings | Requests on every pod, topology spread, PodDisruptionBudgets, priority classes (notebook 07) |
+| One scheduler instance | HA control plane: schedulers and controller managers use **leader election** (only one active) |
+
+### Check yourself
+1. Does the scheduler start containers?
+2. What are the three scheduler phases?
+3. Where do you find why a pod is `Pending`?
+4. You delete a pod and it comes back. Why?
+
+<details><summary>Answer</summary>
+
+1. No. It only writes `spec.nodeName`. The kubelet starts containers.
+2. Filter, score, bind.
+3. `kubectl describe pod` → Events (`FailedScheduling` message).
+4. A controller (ReplicaSet, via a Deployment) owns it and reconciles back to the desired replica count.
+</details>
+
+##MD
+## 5. kubelet, container runtime (CRI), and kube-proxy
+
+### What is it?
+- **kubelet** — the agent on every node. It watches the API server for pods bound to **its** node, tells the container runtime to start them, runs **probes** (liveness/readiness), mounts volumes, and reports pod and node status back.
+- **CRI (Container Runtime Interface)** — a gRPC API between the kubelet and the runtime. Any runtime that speaks CRI works: **containerd** (kind, OKE, most clouds), **CRI-O** (OpenShift). Docker Engine itself is no longer used directly (dockershim was removed in v1.24) — but Docker-built images still work, because images follow the OCI image standard.
+- **crictl** — a CLI to talk to the runtime on a node (like `docker`, but for CRI).
+- **kube-proxy** — on every node. It watches Services and EndpointSlices and programs **iptables** (or IPVS / nftables) rules so traffic to a Service IP is sent to a pod IP.
+
+### How it works
+```
+ API server: "pod web-abc is bound to learn-worker"
+        │ (watch)
+        ▼
+ kubelet on learn-worker
+   ├─ CRI gRPC → containerd: create pod sandbox (the "pause" container holds the network namespace)
+   ├─ CNI plugin: give the sandbox an IP from the pod network, connect veth
+   ├─ CRI gRPC → containerd: pull image, start containers in the sandbox
+   ├─ run probes, report status: Running, podIP=10.244.1.5
+   ▼
+ kube-proxy on EVERY node: Service 10.96.x.x:80 → DNAT → 10.244.1.5:80 (iptables)
+```
+The **pause container** is the "parent" that owns the pod's network namespace. Your app containers join it — the same trick as `--network container:` in notebook 01.
+
+### Real production scenario
+Pods on one OKE node are stuck in `ContainerCreating`. `kubectl describe pod` says `failed to create pod sandbox`. On the node, `crictl ps` hangs and `journalctl -u containerd` shows the disk is full (`/var/lib/containerd`). You clean unused images with `crictl rmi --prune`, and the kubelet recovers. Long-term: set kubelet image garbage collection thresholds and monitor node disk.
+
+### Hands-on lab: be the node
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+node=$(kubectl get pods -l app=web -o jsonpath='{.items[0].spec.nodeName}')
+echo "== Containers on $node, seen through CRI (crictl) =="
+docker exec "$node" crictl ps --name nginx
+echo; echo "== Pod sandboxes (each has a 'pause' container holding the network namespace) =="
+docker exec "$node" crictl pods --label app=web
+echo; echo "== Runtime info =="
+docker exec "$node" crictl version | head -4
+
+##MD
+**Expected output:** one or two `nginx` containers with state `Running`; pod sandboxes named `web-xxxx` in namespace `default`; `RuntimeName: containerd`.
+
+Now look at what kube-proxy did. We create a Service for `web`, then find its rules in iptables on a node.
+
+##CODE
+%%bash
+kubectl expose deployment web --port=80 --target-port=80 --name=web
+svcip=$(kubectl get svc web -o jsonpath='{.spec.clusterIP}')
+echo "Service web has ClusterIP $svcip"
+echo; echo "== kube-proxy mode =="
+kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}' | grep -E '^mode:'
+echo; echo "== iptables NAT rules for this Service IP on learn-worker =="
+docker exec learn-worker iptables -t nat -S KUBE-SERVICES | grep "$svcip"
+echo; echo "== Pod IPs (the endpoints the rules point to) =="
+kubectl get endpointslices -l kubernetes.io/service-name=web -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}'
+
+##MD
+**Expected output:**
+```
+Service web has ClusterIP 10.96.123.45
+mode: iptables
+-A KUBE-SERVICES -d 10.96.123.45/32 -p tcp -m comment --comment "default/web cluster IP" -m tcp --dport 80 -j KUBE-SVC-XXXX
+10.244.1.3
+10.244.2.4
+10.244.2.5
+```
+(`mode:` may be empty, which means the default: iptables.) The Service IP exists **only as iptables rules**. No interface has it. `ping` to it often fails; `curl` to the port works. Test from inside the cluster:
+
+##CODE
+%%bash
+kubectl run tmp --rm -i --restart=Never --image=nicolaka/netshoot -- \
+  sh -c 'curl -s -o /dev/null -w "Service DNS web -> HTTP %{http_code}\n" http://web.default.svc.cluster.local/'
+
+##MD
+**Expected output:** `Service DNS web -> HTTP 200` then `pod "tmp" deleted`. Notebook 04 covers Services in depth.
+
+### Troubleshooting
+
+| Symptom | Cause | Check / fix |
+|---|---|---|
+| Pod stuck `ContainerCreating` | CNI problem, volume mount failure, sandbox error | `kubectl describe pod` events; node: `journalctl -u kubelet` |
+| Node `NotReady` | kubelet down, runtime down, network to API server blocked | `systemctl status kubelet containerd`; port 6443 reachable? |
+| Service IP does not work, pod IP does | kube-proxy not running/broken rules, or no endpoints | `kubectl -n kube-system get pods -l k8s-app=kube-proxy`; `kubectl get endpointslices` |
+| Node disk full, `ImageGCFailed` | Too many images/logs | `crictl rmi --prune`; tune image GC; bigger boot volume |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| `docker exec` into nodes | SSH/OCI Bastion with audit, or `kubectl debug node/<name>` |
+| iptables mode, few Services | Thousands of Services: IPVS/nftables mode, or eBPF CNI (Cilium) that replaces kube-proxy |
+| Default kubelet settings | Tuned eviction thresholds, image GC, system/kube reserved resources |
+
+### Check yourself
+1. What does the kubelet do when a pod is bound to its node?
+2. What is the CRI, and which runtime do kind and OKE use?
+3. What is the pause container for?
+4. Does a Service ClusterIP exist on a network interface?
+
+<details><summary>Answer</summary>
+
+1. Asks the runtime (via CRI) to create the pod sandbox, calls CNI for networking, pulls images, starts containers, mounts volumes, runs probes, reports status to the API server.
+2. A gRPC API between the kubelet and the container runtime. containerd.
+3. It holds the pod's network (and IPC) namespace so app containers can join and share it, and survive restarts of individual containers.
+4. No. It is virtual: kube-proxy implements it with iptables/IPVS/nftables rules (or eBPF with Cilium).
+</details>
+
+##MD
+## 6. Walkthrough: follow one `kubectl apply` through the whole system
+
+You now know every component. Let's follow one request end to end. This is a very common interview question, and a powerful debugging map: when something is stuck, you can ask "which step did it stop at?"
+
+```
+ (1) kubectl apply -f web.yaml
+       │  reads kubeconfig → HTTPS PATCH/POST to API server
+       ▼
+ (2) kube-apiserver: authn → authz (RBAC) → admission → validate → write Deployment to etcd
+       │  notify watchers
+       ▼
+ (3) Deployment controller (controller-manager): "Deployment web has no ReplicaSet"
+       │  → creates ReplicaSet web-<hash> (replicas: 3)     → API server → etcd
+       ▼
+ (4) ReplicaSet controller: "RS wants 3 pods, sees 0"
+       │  → creates 3 Pod objects with spec.nodeName empty  → API server → etcd
+       ▼
+ (5) kube-scheduler: "3 unscheduled pods" → filter → score → BIND
+       │  → sets spec.nodeName = learn-worker / learn-worker2
+       ▼
+ (6) kubelet on each chosen node: "a pod is bound to me"
+       │  → CRI: sandbox (pause) → CNI: pod IP → pull image → start container
+       │  → reports status Running + podIP → API server → etcd
+       ▼
+ (7) EndpointSlice controller: pods are Ready → adds pod IPs to Service endpoints
+       ▼
+ (8) kube-proxy on every node: updates iptables → Service IP now reaches the new pods
+```
+Where it gets stuck tells you where to look:
+
+| Stuck at | Symptom | Look at |
+|---|---|---|
+| (2) | apply returns an error | The error message (RBAC, validation, webhook) |
+| (3)/(4) | Deployment exists, no ReplicaSet / no pods | `kubectl describe deploy`, quota (`ResourceQuota`), controller-manager logs |
+| (5) | Pods `Pending` | `FailedScheduling` event |
+| (6) | `ContainerCreating`, `ImagePullBackOff`, `CrashLoopBackOff` | Pod events, `kubectl logs`, node kubelet logs |
+| (7)/(8) | Pods Running, Service gives 503 / refused | Readiness, `kubectl get endpointslices`, kube-proxy |
+
+### Hands-on lab: watch it happen
+`-v=6` makes kubectl print every HTTP call. Then we read the **events**, which show each component's action with its name in the `SOURCE` column.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+kubectl delete deployment web --ignore-not-found --wait=true >/dev/null
+echo "== (1)+(2): the HTTP calls kubectl makes =="
+kubectl apply -f labs/02/web.yaml -v=6 2>&1 | grep -E 'GET|POST|PATCH' | sed -E 's/ in [0-9]+ milliseconds//'
+kubectl rollout status deployment/web --timeout=120s >/dev/null
+echo; echo "== (3)-(6): events from each component, oldest first =="
+kubectl get events --sort-by=.metadata.creationTimestamp \
+  -o custom-columns=SOURCE:.source.component,REASON:.reason,OBJECT:.involvedObject.name,MESSAGE:.message \
+  | grep -E 'web' | tail -20
+
+##MD
+**Expected output (shortened):**
+```
+== (1)+(2): the HTTP calls kubectl makes ==
+GET  https://127.0.0.1:5xxxx/apis/apps/v1/namespaces/default/deployments/web 404 Not Found
+POST https://127.0.0.1:5xxxx/apis/apps/v1/namespaces/default/deployments?fieldManager=kubectl-client-side-apply 201 Created
+
+== (3)-(6): events ==
+SOURCE                  REASON             OBJECT          MESSAGE
+deployment-controller   ScalingReplicaSet  web             Scaled up replica set web-5d9c... to 3
+replicaset-controller   SuccessfulCreate   web-5d9c...     Created pod: web-5d9c...-abcde
+default-scheduler       Scheduled          web-5d9c...-ab  Successfully assigned default/web-... to learn-worker
+kubelet                 Pulled             web-5d9c...-ab  Container image "nginx:1.27" already present on machine
+kubelet                 Created            web-5d9c...-ab  Created container nginx
+kubelet                 Started            web-5d9c...-ab  Started container nginx
+```
+You can see steps 3 → 4 → 5 → 6 with the component name for each one.
+
+### Check yourself
+1. Which component creates the ReplicaSet? Which creates the Pods?
+2. A pod has `spec.nodeName` set but is not running. Which component should you investigate?
+3. Pods are Running but the Service returns 503. Which steps are involved?
+
+<details><summary>Answer</summary>
+
+1. The Deployment controller creates the ReplicaSet. The ReplicaSet controller creates the Pods.
+2. The kubelet (and runtime/CNI) on that node. The scheduler already did its job.
+3. Steps 7 and 8: readiness → EndpointSlice → kube-proxy rules. Usually pods are not Ready, or the Service selector does not match pod labels.
+</details>
+
+##MD
+## 7. The Kubernetes API: resources, groups, versions, `explain`, and `--raw`
+
+### What is it?
+Everything in Kubernetes is an **API resource** with a URL. Resources are organised by **group** and **version**:
+- Core group (no name): `/api/v1` → pods, services, configmaps, secrets, namespaces, nodes.
+- Named groups: `/apis/<group>/<version>` → `apps/v1` (deployments), `batch/v1` (jobs), `networking.k8s.io/v1` (ingress, networkpolicy), `autoscaling/v2` (HPA), `policy/v1` (PDB).
+- Versions mature: `v1alpha1` → `v1beta1` → `v1`. Old versions get **removed** in upgrades — a common upgrade breakage.
+
+Every manifest's `apiVersion` + `kind` points to one of these.
+
+### Why do we need it?
+- You can find the correct `apiVersion` for any kind, and the fields it supports, without searching the internet.
+- Automation (Ansible, Terraform, CI pipelines, operators) uses the same API.
+- Before a cluster upgrade, you must check for deprecated APIs.
+
+### How it works
+```
+ kubectl get deploy web -n shop
+   = GET https://<api-server>:6443/apis/apps/v1/namespaces/shop/deployments/web
+                                  └group┘└ver┘           └ns┘ └resource┘ └name┘
+```
+
+### Real production scenario
+Before upgrading OKE from 1.24 to 1.25, a Helm chart in the cluster still uses `policy/v1beta1` PodDisruptionBudget and `PodSecurityPolicy`. Both were removed in 1.25. After the upgrade, chart upgrades fail. With `kubectl api-resources` and a deprecation scan beforehand (e.g. `kubent`, or `pluto`), this is found and fixed before the upgrade.
+
+### Hands-on lab
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+echo "== Server version =="; kubectl version | tail -1
+echo; echo "== API groups and versions (first 15) =="; kubectl api-versions | head -15
+echo; echo "== Resources: name, short name, group/version, namespaced?, kind =="
+kubectl api-resources -o wide | head -1
+kubectl api-resources | grep -E '^(pods|services|deployments|ingresses|networkpolicies|horizontalpodautoscalers|poddisruptionbudgets|cronjobs|namespaces|nodes) '
+
+##MD
+**Expected output:** a list such as `apps/v1`, `autoscaling/v2`, `batch/v1`, `networking.k8s.io/v1`, `policy/v1`, `v1`; then rows like:
+```
+deployments    deploy   apps/v1                  true    Deployment
+namespaces     ns       v1                       false   Namespace
+nodes          no       v1                       false   Node
+pods           po       v1                       true    Pod
+```
+`NAMESPACED false` means the object belongs to the whole cluster (nodes, namespaces, ClusterRoles, StorageClasses).
+
+`kubectl explain` is built-in documentation for every field.
+
+##CODE
+%%bash
+kubectl explain deployment.spec.strategy
+echo "-----"
+kubectl explain pod.spec.containers.resources --recursive | head -20
+
+##MD
+**Expected output:** the description of `strategy` (fields `type`, `rollingUpdate`), then the tree of `resources` (`claims`, `limits`, `requests`).
+
+Now call the API directly. `kubectl get --raw` sends an authenticated GET to any path. We format the JSON with Python.
+
+##CODE
+%%bash
+echo "== Raw JSON for pods in 'default' (names and IPs only) =="
+kubectl get --raw /api/v1/namespaces/default/pods | python3 -c '
+import json, sys
+for p in json.load(sys.stdin)["items"]:
+    print(p["metadata"]["name"], p["status"].get("podIP"), p["spec"].get("nodeName"))'
+echo; echo "== Same with plain HTTP via kubectl proxy (handles auth for you) =="
+kubectl proxy --port=8001 >/dev/null 2>&1 & PID=$!
+sleep 2
+curl -s http://127.0.0.1:8001/apis/apps/v1/namespaces/default/deployments/web | python3 -c 'import json,sys; d=json.load(sys.stdin); print("deployment", d["metadata"]["name"], "replicas", d["spec"]["replicas"], "ready", d["status"].get("readyReplicas"))'
+kill $PID
+
+##MD
+**Expected output:** three lines `web-xxxx 10.244.x.x learn-worker...`, then `deployment web replicas 3 ready 3`.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no matches for kind "Ingress" in version "extensions/v1beta1"` | API version removed | Use current version (`networking.k8s.io/v1`); `kubectl explain ingress` shows it |
+| `error: the server doesn't have a resource type "xyz"` | CRD not installed, or typo | `kubectl api-resources \| grep -i xyz` |
+| Upgrade breaks Helm releases | Releases stored with removed APIs | Scan with `pluto`/`kubent` before upgrade; `helm mapkubeapis` |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Explore freely with admin rights | API access through RBAC; audit logs record every request |
+| `kubectl proxy` on localhost | Never expose `kubectl proxy` on a network; OKE public endpoint restricted by NSG / private endpoint |
+
+### Check yourself
+1. What is the URL path for Deployments in namespace `shop`?
+2. How do you find the right `apiVersion` for a CronJob?
+3. Why must you check API versions before an upgrade?
+4. Is a StorageClass namespaced?
+
+<details><summary>Answer</summary>
+
+1. `/apis/apps/v1/namespaces/shop/deployments`.
+2. `kubectl api-resources | grep -i cronjob` or `kubectl explain cronjob` → `batch/v1`.
+3. Deprecated beta APIs are removed in newer versions; manifests and Helm releases using them break.
+4. No, it is cluster-scoped (`kubectl api-resources` shows NAMESPACED false).
+</details>
+
+##MD
+## 8. Declarative vs imperative management
+
+### What is it?
+- **Imperative** — you tell Kubernetes *what to do*, step by step: `kubectl create deployment`, `kubectl scale`, `kubectl set image`, `kubectl edit`.
+- **Declarative** — you write the *desired state* in YAML files and run `kubectl apply -f`. Kubernetes computes the difference and makes it so. Files go into Git.
+
+### Why do we need declarative?
+| | Imperative | Declarative |
+|---|---|---|
+| Speed for a quick test | Fast | Slower |
+| Repeatable | No — depends on who typed what | Yes — same files = same result |
+| Review / audit | No history | Git history, pull requests |
+| Disaster recovery | Hard to rebuild | Re-apply the repo |
+| GitOps (Argo CD, notebook 11) | Impossible | The foundation |
+
+**Rule:** imperative to **explore and generate YAML**; declarative for **anything real**.
+
+### How `kubectl apply` works
+`apply` does a **three-way merge** between: (1) your file, (2) the live object, and (3) what was applied last time (stored in the annotation `kubectl.kubernetes.io/last-applied-configuration`, or by field owners with **server-side apply**). Fields you remove from the file are removed from the object. Fields others set (e.g. an HPA setting replicas) are left alone if you don't manage them.
+
+### Real production scenario
+During an incident, an engineer runs `kubectl scale deployment api --replicas=10` and `kubectl set env deployment/api DEBUG=true`. The incident ends. Nobody updates Git. Next week a normal release runs `kubectl apply` from Git: replicas drop back to 3 during peak hours and DEBUG disappears silently. This is **configuration drift**. GitOps tools detect and stop it.
+
+### Hands-on lab
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+echo "== Imperative: generate YAML without creating anything (--dry-run=client -o yaml) =="
+kubectl create deployment api --image=nginx:1.27 --replicas=2 --dry-run=client -o yaml > labs/02/api.yaml
+cat labs/02/api.yaml
+
+##MD
+This is the best trick to write YAML fast: generate a skeleton with `--dry-run=client -o yaml`, then edit it. Now apply it declaratively, change the file, and preview the change with `kubectl diff` before applying.
+
+##CODE
+%%bash
+kubectl apply -f labs/02/api.yaml
+sed -i.bak 's/replicas: 2/replicas: 4/' labs/02/api.yaml && rm -f labs/02/api.yaml.bak
+echo "== kubectl diff: what WOULD change (exit code 1 means 'there are differences') =="
+kubectl diff -f labs/02/api.yaml || true
+kubectl apply -f labs/02/api.yaml
+kubectl get deployment api
+
+##MD
+**Expected output:** a diff showing `-  replicas: 2` / `+  replicas: 4` (plus a `generation` change), then `deployment.apps/api configured`, then `READY 4/4`.
+
+Now create **drift** imperatively and see `diff` catch it:
+
+##CODE
+%%bash
+kubectl scale deployment api --replicas=1
+echo "== Live state (1) differs from Git/file (4): =="
+kubectl diff -f labs/02/api.yaml | grep -E '^[-+] +replicas' || true
+kubectl apply -f labs/02/api.yaml >/dev/null && echo "re-applied file: back to $(kubectl get deploy api -o jsonpath='{.spec.replicas}') replicas"
+kubectl delete -f labs/02/api.yaml
+
+##MD
+**Expected output:** `-  replicas: 1` / `+  replicas: 4`, then `re-applied file: back to 4 replicas`.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `kubectl create` fails: `AlreadyExists` | `create` is imperative, only for new objects | Use `apply` |
+| Changes made with `kubectl edit` vanish | Next `apply` from Git overwrote them | Change the file in Git, not the live object |
+| `apply` conflicts with another manager | Server-side apply field ownership | Let one tool own each field (e.g. don't set `replicas` when HPA manages it) |
+| `kubectl replace` deletes fields | `replace` sends the full object | Prefer `apply` |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| `kubectl apply` from a laptop | CI/CD or GitOps (Argo CD/Flux) applies from Git; humans have read-only access to prod |
+| Imperative scaling to test | Changes through pull requests; emergency changes back-ported to Git right after |
+
+### Check yourself
+1. Name two imperative and one declarative command.
+2. How do you generate a Deployment YAML without creating it?
+3. What does `kubectl diff` do?
+4. What is configuration drift?
+
+<details><summary>Answer</summary>
+
+1. Imperative: `kubectl create`, `kubectl scale`, `kubectl set image`, `kubectl edit`. Declarative: `kubectl apply -f`.
+2. `kubectl create deployment <name> --image=<img> --dry-run=client -o yaml`.
+3. Shows what `apply` would change compared with the live object, without changing anything.
+4. When the live cluster no longer matches the declared configuration (Git), usually due to manual changes.
+</details>
+
+##MD
+## 9. kubectl essentials
+
+### What is it?
+`kubectl` is the CLI for the Kubernetes API. Ten commands cover 90% of daily work.
+
+| Command | What it does |
+|---|---|
+| `kubectl get <res> [-o wide\|yaml\|json\|name]` | List objects |
+| `kubectl describe <res> <name>` | Details + **events** (the first place to look) |
+| `kubectl logs <pod> [-c container] [-f] [--previous]` | Container logs (`--previous` = before the last crash) |
+| `kubectl exec -it <pod> -- sh` | Run a command in a container |
+| `kubectl port-forward <pod\|svc/name> 8080:80` | Tunnel a local port to a pod/Service |
+| `kubectl apply -f` / `delete -f` | Declarative create/update/delete |
+| `kubectl get events --sort-by=.lastTimestamp` | Recent cluster events |
+| `kubectl top nodes\|pods` | CPU/memory usage (needs metrics-server) |
+| `kubectl rollout status\|history\|undo deploy/<n>` | Manage rollouts |
+| `kubectl get <res> -o jsonpath='{...}'` / `-o custom-columns` | Extract fields for scripts |
+
+Useful flags: `-n <ns>`, `-A` (all namespaces), `-l app=web` (label selector), `-w` (watch), `--field-selector status.phase=Running`.
+
+### Real production scenario
+At 3 a.m. an alert says the checkout API has errors. Your muscle memory: `kubectl get pods -n shop -l app=checkout` → one pod restarting → `kubectl describe pod` → `OOMKilled` → `kubectl logs --previous` → a stack trace showing a huge report query. You know the cause in 2 minutes because the commands are automatic. Practise them until they are.
+
+### Hands-on lab
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+pod=$(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+echo "== get with wide output =="; kubectl get pods -l app=web -o wide
+echo; echo "== describe (only the interesting parts) =="; kubectl describe pod "$pod" | grep -E '^(Name|Node|Status|IP):|Image:|Ready:|Restart Count'
+echo; echo "== exec: run a command in the container =="; kubectl exec "$pod" -- nginx -v
+echo; echo "== logs: last 3 lines =="; kubectl logs "$pod" --tail=3
+echo; echo "== jsonpath: name and node of every web pod =="
+kubectl get pods -l app=web -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+echo; echo "== custom-columns =="
+kubectl get pods -A -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,NODE:.spec.nodeName | head -6
+
+##MD
+Port-forward lets you test a pod or Service from your Mac without exposing it. It runs until you stop it, so we run it in the background for a few seconds.
+
+##CODE
+%%bash
+kubectl port-forward svc/web 8085:80 >/dev/null 2>&1 & PF=$!
+sleep 2
+curl -s http://localhost:8085/ | grep -o '<title>.*</title>'
+kill $PF
+
+##MD
+**Expected output:** `<title>Welcome to nginx!</title>`.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error: You must be logged in to the server` | Credentials expired | Refresh kubeconfig/token |
+| `kubectl logs` empty or "container not found" | Pod has multiple containers | Add `-c <container>` |
+| Logs don't show the crash | Container restarted | `kubectl logs --previous` |
+| `kubectl top` errors | metrics-server not installed | Install metrics-server (notebook 07) |
+| `exec` fails: no `sh` | Distroless image | `kubectl debug -it <pod> --image=busybox --target=<container>` |
+
+### Check yourself
+1. What is the first command when a pod misbehaves, and why?
+2. How do you see logs of the container *before* it crashed?
+3. How do you reach a ClusterIP Service from your laptop for testing?
+
+<details><summary>Answer</summary>
+
+1. `kubectl describe pod <name>` — it shows state, last termination reason, and events.
+2. `kubectl logs <pod> --previous`.
+3. `kubectl port-forward svc/<name> <localport>:<port>`.
+</details>
+
+##MD
+## 10. kubeconfig
+
+### What is it?
+The **kubeconfig** file (default `~/.kube/config`, or the `KUBECONFIG` env var) tells kubectl how to connect. It has three lists:
+- **clusters** — API server URL + CA certificate to trust it.
+- **users** — credentials: client certificate, token, or an **exec plugin** that fetches a token (OKE uses `oci ce cluster generate-token`).
+- **contexts** — a pair of (cluster, user) + default namespace.
+
+Plus `current-context`.
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+  - name: kind-learn
+    cluster: { server: https://127.0.0.1:5xxxx, certificate-authority-data: <base64 CA> }
+users:
+  - name: kind-learn
+    user: { client-certificate-data: <base64>, client-key-data: <base64> }
+contexts:
+  - name: kind-learn
+    context: { cluster: kind-learn, user: kind-learn, namespace: default }
+current-context: kind-learn
+```
+
+### Why does it matter?
+- It holds **credentials**. A leaked kubeconfig with an admin certificate = full cluster access until the cert expires. Treat it like a password.
+- Wrong `current-context` = commands hit the wrong cluster (see notebook 00).
+
+### Real production scenario
+An OKE kubeconfig uses the OCI CLI exec plugin. After you rotate your OCI API key, every kubectl command fails with `Unauthorized`. The kubeconfig is fine — the exec plugin can no longer get a token. You update `~/.oci/config` and it works. Knowing the three parts tells you where to look.
+
+### Hands-on lab
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+echo "== Current context only, secrets hidden =="
+kubectl config view --minify
+echo; echo "== Set a default namespace on a NEW context (does not change kind-learn) =="
+kubectl create namespace team-a --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl config set-context learn-team-a --cluster=kind-learn --user=kind-learn --namespace=team-a
+kubectl config get-contexts
+echo; echo "== Use a context for one command only with --context =="
+kubectl --context learn-team-a get pods
+kubectl config delete-context learn-team-a
+kubectl delete namespace team-a --wait=false
+
+##MD
+**Expected output:** the minified config with `DATA+OMITTED` / `REDACTED` instead of secrets; a new context `learn-team-a` listed (current still `kind-learn`); `No resources found in team-a namespace.`; then the context is deleted.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `x509: certificate signed by unknown authority` | Wrong CA in `clusters` | Regenerate kubeconfig |
+| `Unauthorized` on OKE | Exec plugin cannot get a token (OCI CLI config/key/region) | Test `oci ce cluster generate-token --cluster-id ...` |
+| Commands go to wrong namespace | Context has a default namespace | `kubectl config view --minify \| grep namespace` |
+| `KUBECONFIG` with several files | Files are merged; first file's current-context wins | `echo $KUBECONFIG`; keep it simple |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Admin client certificate in kubeconfig | Short-lived tokens via SSO/OIDC or cloud IAM (OKE + OCI IAM); no shared admin certs |
+| One file | Separate files per environment; prod access via bastion/jump host |
+
+### Check yourself
+1. Name the three lists in a kubeconfig.
+2. What does `kubectl config view --minify` show?
+3. How do you run one command against another context without switching?
+
+<details><summary>Answer</summary>
+
+1. clusters, users, contexts.
+2. Only the current context, with its cluster and user (secrets redacted).
+3. `kubectl --context <name> ...`.
+</details>
+
+##MD
+## 11. Namespaces
+
+### What is it?
+A **namespace** is a virtual folder inside a cluster. Most objects (pods, services, deployments, secrets) live in one namespace. Names must be unique **within** a namespace, not across them. Some objects are cluster-wide (nodes, namespaces, PersistentVolumes, StorageClasses, ClusterRoles).
+
+Default namespaces: `default`, `kube-system` (cluster components), `kube-public`, `kube-node-lease` (node heartbeats).
+
+### Why do we need it?
+- Separate teams, apps, or environments (dev/test) in one cluster.
+- Scope for **RBAC** (who can do what where), **ResourceQuota** (how much CPU/memory a team can use), and **NetworkPolicy**.
+- Service DNS includes the namespace: `orders.shop.svc.cluster.local`.
+
+**Important:** namespaces are **not** a security boundary by themselves. Without RBAC and NetworkPolicies, pods in different namespaces can still talk to each other.
+
+### How it works
+```
+ cluster
+ ├── namespace: shop        → deploy/web, svc/web, secret/db
+ ├── namespace: payments    → deploy/web, svc/web   ← same names OK, different namespace
+ ├── namespace: monitoring  → prometheus, grafana
+ └── cluster-scoped: nodes, PVs, StorageClasses, ClusterRoles
+```
+
+### Real production scenario
+Two teams share one OKE cluster. Team A deploys a load test that requests 40 CPUs. Team B's pods go `Pending` during their release. Fix: one namespace per team, each with a `ResourceQuota` (e.g. 10 CPU, 20Gi) and `LimitRange` defaults. Now one team cannot starve the other.
+
+### Hands-on lab
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+kubectl create namespace shop
+kubectl create namespace payments
+kubectl -n shop     create deployment web --image=nginx:1.27
+kubectl -n payments create deployment web --image=nginx:1.27
+kubectl -n shop expose deployment web --port=80
+kubectl -n payments expose deployment web --port=80
+kubectl -n shop rollout status deploy/web --timeout=90s >/dev/null
+kubectl -n payments rollout status deploy/web --timeout=90s >/dev/null
+echo "== Same name 'web' in two namespaces =="
+kubectl get deploy -A -l app=web
+echo; echo "== Cross-namespace call by full DNS name (works: namespaces are not isolation) =="
+kubectl -n shop run tmp --rm -i --restart=Never --image=nicolaka/netshoot -- \
+  sh -c 'curl -s -o /dev/null -w "web.payments.svc.cluster.local -> HTTP %{http_code}\n" http://web.payments.svc.cluster.local/'
+
+##MD
+**Expected output:** two `web` deployments (one in `shop`, one in `payments`), then `web.payments.svc.cluster.local -> HTTP 200`. A pod in `shop` could reach `payments` — you will block this with a NetworkPolicy in notebook 04.
+
+##CODE
+%%bash
+echo "== Cluster-scoped vs namespaced =="
+kubectl api-resources --namespaced=false | head -8
+kubectl delete namespace shop payments --wait=false
+
+##MD
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `No resources found` but you know it exists | Wrong namespace | `-n <ns>` or `-A` |
+| Namespace stuck `Terminating` | An object has a finalizer that is not removed (often a CRD whose controller is gone) | `kubectl get all,<crds> -n <ns>`; fix the controller; remove finalizer only as last resort |
+| Service name not resolving across namespaces | Using short name `web` from another namespace | Use `web.<ns>` or the full FQDN |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Namespaces with no limits | Each namespace: RBAC, ResourceQuota, LimitRange, default-deny NetworkPolicy, Pod Security labels |
+| dev/test/prod in one cluster | Prod usually in a separate cluster (blast radius, upgrades, access) |
+
+### Check yourself
+1. Are namespaces a security boundary on their own?
+2. Name two cluster-scoped resources.
+3. What is the full DNS name of Service `api` in namespace `payments`?
+4. Why might a namespace be stuck in `Terminating`?
+
+<details><summary>Answer</summary>
+
+1. No. You need RBAC, NetworkPolicies, and quotas to make them a real boundary.
+2. Nodes, Namespaces, PersistentVolumes, StorageClasses, ClusterRoles, CRDs.
+3. `api.payments.svc.cluster.local`.
+4. A resource inside still has a finalizer that its controller does not remove (for example the controller was uninstalled).
+</details>
+
+##MD
+## 12. Labels, selectors, and annotations
+
+### What is it?
+- **Labels** — key/value pairs on objects, used to **identify and select**: `app: web`, `tier: frontend`, `env: prod`, `version: v2`. Short values (max 63 chars).
+- **Selectors** — queries over labels. **Equality**: `app=web`, `env!=dev`. **Set-based**: `env in (prod,staging)`, `!canary`.
+- **Annotations** — key/value pairs for **information**, not selection: build info, owner contact, tool config (e.g. Ingress controller settings, Prometheus scrape hints, OCI load balancer shape). Values can be large.
+
+### Why do we need it?
+Labels are the **glue** of Kubernetes. Objects do not reference each other by name; they find each other by labels:
+```
+ Deployment.spec.selector  ──matches──►  Pod labels  ◄──matches──  Service.spec.selector
+                                         app: web                    app: web
+ NetworkPolicy.podSelector ─────────────────┘  (also: PDB, HPA targets, affinity rules)
+```
+If labels do not match, nothing connects — and Kubernetes gives **no error**. A Service with a wrong selector just has zero endpoints.
+
+**Recommended labels** (used by many tools): `app.kubernetes.io/name`, `app.kubernetes.io/instance`, `app.kubernetes.io/version`, `app.kubernetes.io/component`, `app.kubernetes.io/part-of`, `app.kubernetes.io/managed-by`.
+
+### Real production scenario
+A new version uses label `app: checkout-v2` in the pod template but the Service still selects `app: checkout`. The deployment shows all pods `Running`. Users get 503. `kubectl get endpointslices -l kubernetes.io/service-name=checkout` shows no addresses. Fix the labels; traffic returns. This is one of the most common "everything is green but it does not work" problems.
+
+On OKE, annotations matter a lot: `service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"` on a Service controls which OCI load balancer is created.
+
+### Hands-on lab
+
+##CODE
+%%writefile labs/02/labels.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shop-frontend-prod
+  labels:                                  # Labels: for SELECTING.
+    app.kubernetes.io/name: shop
+    app.kubernetes.io/component: frontend
+    env: prod
+  annotations:                             # Annotations: for INFORMATION / tool config.
+    team.example.com/owner: "platform-team@example.com"
+    team.example.com/git-commit: "a1b2c3d"
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shop-frontend-staging
+  labels:
+    app.kubernetes.io/name: shop
+    app.kubernetes.io/component: frontend
+    env: staging
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shop-backend-prod
+  labels:
+    app.kubernetes.io/name: shop
+    app.kubernetes.io/component: backend
+    env: prod
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-frontend
+spec:
+  selector:                                # Selects pods with BOTH labels.
+    app.kubernetes.io/component: frontend
+    env: prod
+  ports:
+    - port: 80
+      targetPort: 80
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+kubectl apply -f labs/02/labels.yaml
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=shop --timeout=90s >/dev/null
+echo "== Show labels as columns =="
+kubectl get pods -l app.kubernetes.io/name=shop -L env,app.kubernetes.io/component
+echo; echo "== Equality selector: env=prod =="; kubectl get pods -l env=prod -o name
+echo; echo "== Set-based selector: env in (prod,staging), component != backend =="
+kubectl get pods -l 'env in (prod,staging),app.kubernetes.io/component!=backend' -o name
+echo; echo "== Which pods does the Service select? (its endpoints) =="
+kubectl get endpointslices -l kubernetes.io/service-name=shop-frontend -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}'
+echo; echo "== Annotations =="; kubectl get pod shop-frontend-prod -o jsonpath='{.metadata.annotations}'; echo
+
+##MD
+**Expected output:** a table with `ENV` and `COMPONENT` columns; `env=prod` returns `shop-frontend-prod` and `shop-backend-prod`; the set-based query returns the two frontends; the Service endpoint is only `shop-frontend-prod`; then the annotations JSON.
+
+Now **change a label live** and watch the Service drop the pod. This is also how you take a pod out of traffic for debugging without killing it.
+
+##CODE
+%%bash
+kubectl label pod shop-frontend-prod env=quarantine --overwrite
+sleep 2
+echo "== Service endpoints after relabel (expect none) =="
+kubectl get endpointslices -l kubernetes.io/service-name=shop-frontend -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}'
+echo "(empty = no backends → users would get errors)"
+kubectl annotate pod shop-frontend-prod team.example.com/note="quarantined for debugging"
+kubectl delete -f labs/02/labels.yaml --wait=false
+
+##MD
+**Expected output:** `pod/shop-frontend-prod labeled`, then no endpoints listed.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Service has no endpoints, pods Running | Selector does not match pod labels (typo, case, extra label) | Compare `kubectl get svc X -o yaml` selector with `kubectl get pods --show-labels` |
+| Deployment apply error: `selector does not match template labels` | `spec.selector` ≠ `template.metadata.labels` | Make them match |
+| Cannot change Deployment selector | `spec.selector` is immutable | Create a new Deployment |
+| Annotation ignored by Ingress/LB | Wrong key (controllers use exact annotation names) | Check controller docs for exact key |
+
+### Lab vs Production
+
+| Lab | Production |
+|---|---|
+| Ad-hoc labels | Labelling standard (recommended `app.kubernetes.io/*` + `env`, `team`, `cost-center`) enforced by policy |
+| Annotations for notes | Annotations drive tools: Prometheus scraping, OCI LB shape, cert-manager issuers, Argo CD sync options |
+
+### Check yourself
+1. Labels vs annotations — when do you use each?
+2. A Service has 0 endpoints but pods are Running. First thing to check?
+3. Write a selector for pods where `env` is `prod` or `staging` and `tier` is not `db`.
+4. How can you remove a pod from a Service's traffic without deleting it?
+
+<details><summary>Answer</summary>
+
+1. Labels to identify and select objects (short values). Annotations to attach information or tool configuration (not used for selection, can be large).
+2. That the Service selector matches the pod labels exactly.
+3. `-l 'env in (prod,staging),tier!=db'`.
+4. Change one of its labels so the Service selector no longer matches (the ReplicaSet will also create a replacement pod, because the pod no longer matches its selector either).
+</details>
+
+##MD
+---
+## Interview and real-world questions
+
+1. "Explain what happens when you run `kubectl apply -f deployment.yaml`."
+2. "What happens if etcd is lost? How do you protect against it?"
+3. "What happens to running pods if the control plane goes down?"
+4. "Why are there leader elections in the controller manager and scheduler?"
+5. "What's the difference between a Deployment and a ReplicaSet?"
+6. "How does a Service ClusterIP work if no interface has that IP?"
+7. "What does OKE manage for you, and what remains your responsibility?"
+
+<details><summary>Answers</summary>
+
+1. kubectl reads kubeconfig and sends the object to the API server. The API server authenticates, authorizes (RBAC), runs admission, validates, and stores it in etcd. The Deployment controller creates a ReplicaSet; the ReplicaSet controller creates Pods; the scheduler binds each pod to a node; the kubelet on that node uses CRI (containerd) and CNI to start the pod and reports status; when pods are Ready, EndpointSlices are updated and kube-proxy programs Service rules.
+2. All cluster state is gone (objects, secrets, config). Running containers may keep running for a while, but nothing can be managed or healed. Protection: an HA etcd cluster (3/5 members), regular `etcdctl snapshot save` backups stored off-cluster, tested restore procedures, and GitOps so manifests can be re-applied. With managed Kubernetes, the provider runs etcd.
+3. Existing pods keep running, because kubelets and containers do not need the control plane to run. But nothing new happens: no scheduling, no self-healing after crashes on other nodes, no scaling, no deployments, `kubectl` fails.
+4. In an HA control plane there are several copies. Only one may act at a time, or two schedulers could bind the same pod differently and two controllers could create duplicate pods. A lease object in the API decides the leader; the others wait.
+5. A ReplicaSet keeps N identical pods running. A Deployment manages ReplicaSets to give rolling updates, rollout history, and rollback: each version gets its own ReplicaSet. You normally never create ReplicaSets directly.
+6. kube-proxy on every node watches Services and EndpointSlices and writes iptables/IPVS/nftables rules that DNAT traffic to the virtual IP into a real pod IP. The IP exists only in those rules (or eBPF maps with Cilium).
+7. Oracle manages the control plane (API server, etcd, scheduler, controller manager, their HA, patching, and backup). You manage worker node pools (OS images, node pool upgrades, capacity), networking design (VCN, subnets, NSGs), add-ons, workloads, RBAC/IAM mapping, and your application data backups.
+</details>
+
+##MD
+## Practical assignment
+
+**Scenario:** You join a team running a small `catalog` service. The team lead wants proof you understand the cluster before you get production access.
+
+**Tasks**
+1. Create namespace `catalog`.
+2. Write `labs/02/catalog.yaml` with:
+   - a Deployment `catalog` with **2 replicas** of `nginx:1.27`, labels following the recommended standard (`app.kubernetes.io/name: catalog`, `app.kubernetes.io/component: api`), an annotation `team.example.com/owner`, and CPU/memory requests;
+   - a Service `catalog` (port 80) selecting those pods.
+3. Apply it. Prove with commands:
+   - which node each pod runs on (jsonpath),
+   - the Service has 2 endpoints,
+   - the etcd key of the Deployment exists,
+   - the events show the deployment-controller, replicaset-controller, scheduler, and kubelet steps.
+4. Delete one pod and show the replacement.
+5. Scale to 4 imperatively, then use `kubectl diff` to show the drift from your file, then re-apply the file.
+
+**Success criteria:** every proof command prints the expected result; at the end there are 2 replicas, matching the file.
+
+**Hints:** look back at sections 3, 4, 6, 8, 12. The etcd key is `/registry/deployments/catalog/catalog`.
+
+<details><summary>Solution</summary>
+
+```yaml
+# labs/02/catalog.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: catalog
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: catalog
+  labels:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/component: api
+  annotations:
+    team.example.com/owner: "catalog-team@example.com"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: catalog
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: catalog
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: api
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: catalog
+spec:
+  selector:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/component: api
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+```bash
+kubectl apply -f labs/02/catalog.yaml
+kubectl -n catalog rollout status deploy/catalog
+kubectl -n catalog get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+kubectl -n catalog get endpointslices -l kubernetes.io/service-name=catalog \
+  -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}'      # 2 IPs
+kubectl -n kube-system exec etcd-learn-control-plane -- etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key get /registry/deployments/catalog/catalog --keys-only
+kubectl -n catalog get events --sort-by=.metadata.creationTimestamp \
+  -o custom-columns=SOURCE:.source.component,REASON:.reason,MSG:.message
+kubectl -n catalog delete pod "$(kubectl -n catalog get pods -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n catalog get pods                                    # new pod with young AGE
+kubectl -n catalog scale deploy/catalog --replicas=4
+kubectl diff -f labs/02/catalog.yaml                           # shows replicas 4 -> 2
+kubectl apply -f labs/02/catalog.yaml
+kubectl -n catalog get deploy catalog                          # 2/2
+kubectl delete namespace catalog
+```
+</details>
+
+##MD
+## Break it challenge
+
+A teammate applies this file. The command succeeds, both pods are `Running`, but `curl http://orders` from another pod in the namespace **times out or is refused**, and `kubectl get endpointslices` shows **no endpoints**. There are **three** bugs. Find them using only `kubectl get`, `describe`, and `explain`.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orders
+  template:
+    metadata:
+      labels:
+        app: orders
+        tier: backend
+    spec:
+      containers:
+        - name: api
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+spec:
+  selector:
+    app: Orders
+    tier: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Try it: save as `labs/02/broken.yaml`, apply, and debug.
+
+<details><summary>Solution</summary>
+
+1. **Case-sensitive label:** the Service selects `app: Orders`, pods have `app: orders`. Labels are case-sensitive → no endpoints. Fix: `app: orders`.
+2. **Wrong targetPort:** nginx listens on 80, the Service sends to `8080`. Even with matching labels you would get `connection refused`. Fix: `targetPort: 80` (or name the port in the pod and use the name).
+3. **Namespace not set on either object:** both go to whatever the current context namespace is. If the teammate's context has a different default namespace, the test pod in "the namespace" is in a different one. Fix: set `metadata.namespace` explicitly in every manifest.
+
+How to find them:
+```bash
+kubectl get svc orders -o jsonpath='{.spec.selector}'; echo
+kubectl get pods --show-labels
+kubectl get endpointslices -l kubernetes.io/service-name=orders
+kubectl describe svc orders              # Endpoints: <none>, TargetPort: 8080
+kubectl config view --minify | grep namespace
+```
+</details>
+
+##MD
+## Cleanup
+Remove everything this notebook created. The cluster stays.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx'"; exit 1; }
+kubectl delete deployment web api --ignore-not-found
+kubectl delete service web shop-frontend --ignore-not-found
+kubectl delete pod needs-gpu shop-frontend-prod shop-frontend-staging shop-backend-prod --ignore-not-found
+kubectl delete namespace shop payments catalog team-a etcd-demo --ignore-not-found --wait=false
+kubectl label node learn-worker2 hardware- 2>/dev/null || true
+echo "== Remaining in default namespace =="; kubectl get all
+
+##MD
+**Expected output:** only `service/kubernetes` remains in `default`.
+
+---
+**Next notebook:** Notebook 03 — Workloads: Pods, ReplicaSets, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, and multi-container pods.

@@ -1,0 +1,592 @@
+##MD
+# 00 — Start Here: Lab Setup and Self-Assessment
+
+**Phase:** Setup (before Phase 1)
+
+**What you will learn**
+- Install the tools for this course: Docker (or Colima), kind, kubectl, Helm, Jupyter.
+- Open and run these notebooks in VS Code or Jupyter Lab.
+- Create your own local Kubernetes cluster called `learn`.
+- Keep your real clusters (like OKE) safe while you practise.
+- Test what you already know and choose where to start.
+- Reset the lab when something breaks.
+
+**Time:** 45–60 minutes (most of it is downloads).
+
+**Prerequisites:** A Mac with Apple Silicon, Homebrew installed, internet access. `kubectl` is already installed on your Mac.
+
+**How to use this notebook**
+- Run cells from top to bottom. Click a cell and press **Shift + Enter**.
+- Cells that start with `%%bash` run shell commands.
+- Cells that start with `%%writefile` create a file on disk.
+- Read the text before each cell. It tells you what the command does and what output to expect.
+- If a cell fails, read the **Troubleshooting** part of that section.
+
+##MD
+## 1. The tools and why we need each one
+
+| Tool | What it is | Why we need it |
+|---|---|---|
+| **Docker Desktop** or **Colima** | A container engine. It runs Linux containers on your Mac. | kind runs Kubernetes *inside* containers. No container engine = no cluster. |
+| **kind** | "Kubernetes IN Docker". It creates a real Kubernetes cluster where each node is a Docker container. | A free, fast, local cluster. You can break it and rebuild it in 1 minute. |
+| **kubectl** | The command-line client for Kubernetes. | Every lab uses it to talk to the cluster API. |
+| **Helm** | A package manager for Kubernetes. | Used from notebook 09 onwards (ingress controller, monitoring stack, Argo CD). |
+| **Jupyter** | Runs these `.ipynb` notebooks. | You read, run, and edit labs in one place. |
+
+**How it fits together**
+
+```
+  Your Mac (macOS, Apple Silicon)
+  ┌───────────────────────────────────────────────────────────┐
+  │  Jupyter / VS Code  ──runs──►  kubectl  ──HTTPS──┐        │
+  │                                                  │        │
+  │  Docker Desktop or Colima (a small Linux VM)     ▼        │
+  │  ┌─────────────────────────────────────────────────────┐  │
+  │  │ container: learn-control-plane  (API server, etcd…) │  │
+  │  │ container: learn-worker         (kubelet, your pods)│  │
+  │  │ container: learn-worker2        (kubelet, your pods)│  │
+  │  └─────────────────────────────────────────────────────┘  │
+  └───────────────────────────────────────────────────────────┘
+```
+
+Each "node" is a container. Inside each node container, `containerd` runs your pods. So you get containers inside containers. This is fine for learning. It is **not** how production works.
+
+##MD
+## 2. Choose your container engine: Docker Desktop or Colima
+
+macOS cannot run Linux containers directly. Both options start a small Linux virtual machine (VM) for you.
+
+| | Docker Desktop | Colima |
+|---|---|---|
+| Install | `brew install --cask docker` | `brew install colima docker` |
+| GUI | Yes, a desktop app | No, command line only |
+| License | Free for personal use and small companies. Paid for larger companies. | Free and open source |
+| Start | Open the app | `colima start --cpu 4 --memory 8` |
+| Good for | Beginners who like a GUI | People who like the terminal and want no license questions |
+
+**Recommendation:** If your company laptop policy is unclear about Docker Desktop licensing, use **Colima**. Both work the same for kind.
+
+Give the VM at least **4 CPUs and 8 GB RAM**. Later notebooks run Prometheus, Grafana, and Argo CD. They need memory.
+
+Run **only one** of the next two cells.
+
+##CODE
+%%bash
+# OPTION A — Colima (free, terminal only).
+# brew installs: colima (the VM manager) and docker (only the docker CLI client).
+brew install colima docker
+# Start the Linux VM with 4 CPUs, 8 GB RAM, 40 GB disk.
+colima start --cpu 4 --memory 8 --disk 40
+# 'docker info' talks to the engine. If it prints server details, the engine works.
+docker info --format 'Engine OK: {{.ServerVersion}}, CPUs={{.NCPU}}, Memory={{.MemTotal}}'
+
+##CODE
+%%bash
+# OPTION B — Docker Desktop (GUI).
+# --cask installs a macOS app instead of a command-line tool.
+brew install --cask docker
+echo "Now open Docker Desktop from Applications."
+echo "Go to Settings > Resources: set CPUs=4, Memory=8 GB. Apply & restart."
+echo "Then run the check cell below."
+
+##CODE
+%%bash
+# Check the engine is running (works for both options).
+docker info --format 'Engine OK: {{.ServerVersion}}, CPUs={{.NCPU}}, Memory={{.MemTotal}}' \
+  || echo "Engine NOT running. Start Colima ('colima start') or open Docker Desktop."
+
+##MD
+**Expected output** (numbers will differ):
+
+```
+Engine OK: 27.x.x, CPUs=4, Memory=8323543040
+```
+
+##MD
+## 3. Install kind, Helm, and Jupyter
+
+- `kind` creates clusters.
+- `helm` installs packaged apps (we use it later).
+- `jupyterlab` gives you the `jupyter lab` command. We install it with `brew` so it does not mix with your system Python.
+
+`kubectl` is already installed. We check its version too.
+
+##CODE
+%%bash
+brew install kind helm jupyterlab
+echo "---- versions ----"
+kind version
+helm version --short
+kubectl version --client
+jupyter --version | head -3
+
+##MD
+**Expected output** (versions will differ):
+
+```
+kind v0.2x.x go1.2x darwin/arm64
+v3.1x.x+g...
+Client Version: v1.3x.x
+Kustomize Version: v5.x.x
+Selected Jupyter core packages...
+```
+
+If `kind` or `helm` says `command not found`, close and reopen the terminal (or restart the notebook kernel) so the new PATH is loaded.
+
+##MD
+## 4. Open these notebooks
+
+**Option 1 — VS Code (recommended, you already use it)**
+1. Install VS Code if needed: `brew install --cask visual-studio-code`.
+2. Install the extensions **Python** and **Jupyter** (by Microsoft).
+3. Open the folder `~/Documents/Learning-Certifications/Kubernetes-Course`.
+4. Click a `.ipynb` file. At the top right, click **Select Kernel** → choose a Python 3 environment.
+
+**Option 2 — Jupyter Lab in the browser**
+
+```bash
+cd ~/Documents/Learning-Certifications/Kubernetes-Course
+jupyter lab
+```
+
+A browser tab opens. Double-click a notebook to open it.
+
+**Important:** All `%%bash` cells run in the folder where the notebook lives. Labs write YAML files into a `labs/` sub-folder, so your files stay organised.
+
+##MD
+## 5. Create your lab cluster `learn`
+
+### What is a kind config?
+A kind config is a small YAML file. It tells kind how many nodes to create and how to set them up.
+
+### Why this design?
+- **1 control plane + 2 workers.** With 2 workers you can see scheduling, spreading, node failures, and taints. One node cannot show these.
+- **extraPortMappings 80 and 443.** In notebook 04 we install an Ingress controller. These mappings forward `localhost:80` and `localhost:443` on your Mac into the cluster. Then `http://localhost` reaches your apps.
+- **node label `ingress-ready=true`.** The standard ingress-nginx manifest for kind only runs on nodes with this label.
+
+The next cell writes the config file to `labs/00/kind-learn.yaml`.
+
+##CODE
+%%bash
+mkdir -p labs/00
+
+##CODE
+%%writefile labs/00/kind-learn.yaml
+# kind cluster config for this course.
+kind: Cluster                         # The object type kind understands.
+apiVersion: kind.x-k8s.io/v1alpha4    # The kind config API version.
+name: learn                           # Cluster name. kubectl context becomes "kind-learn".
+nodes:
+  - role: control-plane               # Runs API server, etcd, scheduler, controller manager.
+    kubeadmConfigPatches:             # kind uses kubeadm to build the cluster. We patch it:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"   # Label used by ingress-nginx (notebook 04).
+    extraPortMappings:                # Forward ports from your Mac into this node container.
+      - containerPort: 80             # Port inside the node container (ingress HTTP).
+        hostPort: 80                  # Port on your Mac: http://localhost
+        protocol: TCP
+      - containerPort: 443            # Ingress HTTPS.
+        hostPort: 443                 # https://localhost
+        protocol: TCP
+  - role: worker                      # Worker node 1: runs your application pods.
+  - role: worker                      # Worker node 2: lets you see spreading and failover.
+
+##MD
+Now create the cluster. This takes 1–3 minutes the first time, because kind downloads the node image (about 400 MB).
+
+What `kind create cluster` does:
+1. Pulls the `kindest/node` image.
+2. Starts 3 containers (one per node).
+3. Runs `kubeadm init` on the control plane and `kubeadm join` on the workers.
+4. Installs a simple CNI (network plugin, called kindnet) and a storage class.
+5. Adds a context `kind-learn` to your `~/.kube/config` and switches to it.
+
+##CODE
+%%bash
+# Create the cluster only if it does not exist yet (safe to re-run).
+if kind get clusters 2>/dev/null | grep -qx learn; then
+  echo "Cluster 'learn' already exists. Skipping create."
+else
+  kind create cluster --config labs/00/kind-learn.yaml
+fi
+
+##MD
+**Expected output:**
+
+```
+Creating cluster "learn" ...
+ ✓ Ensuring node image (kindest/node:v1.3x.x) 🖼
+ ✓ Preparing nodes 📦 📦 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✓ Joining worker nodes 🚜
+Set kubectl context to "kind-learn"
+```
+
+##MD
+## 6. Verify the cluster
+
+We check three things:
+1. `kubectl cluster-info` — where the API server is.
+2. `kubectl get nodes -o wide` — all 3 nodes are `Ready`.
+3. `kubectl get pods -A` — system pods are `Running`.
+
+##CODE
+%%bash
+kubectl cluster-info --context kind-learn
+echo
+kubectl get nodes -o wide
+echo
+kubectl get pods -A
+
+##MD
+**Expected output (shortened):**
+
+```
+Kubernetes control plane is running at https://127.0.0.1:5xxxx
+CoreDNS is running at https://127.0.0.1:5xxxx/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+
+NAME                  STATUS   ROLES           AGE   VERSION
+learn-control-plane   Ready    control-plane   2m    v1.3x.x
+learn-worker          Ready    <none>          2m    v1.3x.x
+learn-worker2         Ready    <none>          2m    v1.3x.x
+
+NAMESPACE            NAME                                          READY   STATUS
+kube-system          coredns-xxxx                                  1/1     Running
+kube-system          etcd-learn-control-plane                      1/1     Running
+kube-system          kube-apiserver-learn-control-plane            1/1     Running
+...
+local-path-storage   local-path-provisioner-xxxx                   1/1     Running
+```
+
+Nodes can show `NotReady` for the first 30–60 seconds while the network plugin starts. Wait and run the cell again.
+
+##MD
+Run a quick smoke test: start one pod, wait for it, then delete it.
+
+##CODE
+%%bash
+kubectl run hello --image=nginx:1.27 --restart=Never
+kubectl wait --for=condition=Ready pod/hello --timeout=120s
+kubectl get pod hello -o wide
+kubectl delete pod hello
+
+##MD
+**Expected output:** `pod/hello condition met`, then a line showing the pod on `learn-worker` or `learn-worker2`, then `pod "hello" deleted`.
+
+##MD
+## 7. Context safety — protect your real clusters
+
+### What is a context?
+`kubectl` reads `~/.kube/config` (the **kubeconfig** file). It can hold many clusters. A **context** = cluster + user + default namespace. `kubectl` sends every command to the **current context**.
+
+### Why this matters for you
+You manage OKE clusters at work. If your current context points to a production OKE cluster and you run a lab command like `kubectl delete deployment --all`, you delete production workloads. This is one of the most common real incidents.
+
+```
+~/.kube/config
+ ├── context: kind-learn            → local kind cluster (SAFE to break)
+ ├── context: context-oke-prod-xxx  → real OKE cluster   (DANGER)
+ └── current-context: ???           ← every kubectl command goes here
+```
+
+### Rules for this course
+1. Every lab section starts with a **guard cell**. It stops if the context is not `kind-learn`.
+2. Never run lab cells against OKE.
+3. Optional and recommended: keep work kubeconfigs in separate files and only load them when needed with `export KUBECONFIG=~/.kube/oke-prod`.
+
+Run the guard cell now. You will see the same cell at the top of every lab.
+
+##CODE
+%%bash
+# GUARD: stop if we are not on the local lab cluster.
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx', not 'kind-learn'."
+  echo "Fix:  kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using kind-learn"
+
+##MD
+See all contexts. The `*` marks the current one.
+
+##CODE
+%%bash
+kubectl config get-contexts
+echo "Current: $(kubectl config current-context)"
+
+##MD
+### Troubleshooting setup
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Cannot connect to the Docker daemon` | Engine not running | `colima start` or open Docker Desktop |
+| `kind create` fails: `port is already allocated` (80/443) | Another program uses port 80/443 (local web server, another kind cluster) | Stop that program, or delete the old cluster: `kind delete cluster --name <old>` |
+| Nodes stuck `NotReady` > 3 min | VM too small or CNI not started | `kubectl describe node learn-worker`; give the VM more CPU/RAM; recreate cluster |
+| `kubectl` talks to the wrong cluster | Current context changed | `kubectl config use-context kind-learn` |
+| Pods `ImagePullBackOff` | No internet in the VM, or proxy/VPN blocks Docker Hub | Check VPN; `docker pull nginx:1.27` to test |
+| `%%bash` cell says `command not found: kind` | Kernel started before install, PATH old | Restart the kernel (Kernel → Restart) |
+| Mac is slow, fans loud | VM has too much or too little RAM | Colima: `colima stop && colima start --cpu 4 --memory 8` |
+
+##MD
+### Lab vs Production
+
+| This lab | Production (e.g. OKE) | Why it differs |
+|---|---|---|
+| Nodes are containers on one laptop | Nodes are VMs or bare metal across fault domains / availability domains | One laptop = one failure point |
+| 1 control plane node | 3+ control plane nodes, or managed by the cloud (OKE manages it for you) | Control plane must survive node loss |
+| kindnet CNI | OCI VCN-Native Pod Networking or Flannel; Cilium/Calico in many shops | Real networking, network policies, performance |
+| `local-path` storage (disk of the node container) | OCI Block Volume CSI, File Storage CSI | Data must survive node loss |
+| Admin access for everyone (you) | RBAC, OCI IAM, separate users per team | Least privilege |
+| Recreate cluster in 1 minute | Clusters are long-lived; upgrades planned | Real workloads and data |
+
+##MD
+## 8. Self-assessment
+
+Answer honestly. Give yourself **1 point** per question you can answer fully **without searching**. Open the answer to check.
+
+### Linux (5 points)
+1. What is the difference between a process and a thread?
+2. What does `systemctl status kubelet` show, and where do its logs go?
+3. What are Linux **namespaces** and **cgroups**? Which one limits memory?
+4. A file has mode `0640`. Who can read it?
+5. How do you find which process listens on port 8080?
+
+<details><summary>Answers</summary>
+
+1. A process has its own memory space. Threads share the memory of their process.
+2. Service state (active/failed), main PID, recent log lines. Full logs: `journalctl -u kubelet`.
+3. Namespaces isolate what a process can **see** (PIDs, network, mounts, hostname, users). Cgroups limit what it can **use** (CPU, memory, I/O). Cgroups limit memory.
+4. Owner can read and write, group can read, others nothing.
+5. `ss -ltnp | grep 8080` (or `lsof -i :8080`).
+</details>
+
+### Networking (5 points)
+6. What is the difference between TCP and UDP? Which one does DNS use mostly?
+7. What does `10.0.0.0/16` mean? How many addresses?
+8. What happens step by step when you type `https://example.com` in a browser?
+9. Layer 4 vs Layer 7 load balancer — what is the difference?
+10. What is a default route?
+
+<details><summary>Answers</summary>
+
+6. TCP is connection-based and reliable (handshake, retransmit). UDP is connectionless and fast. DNS uses UDP port 53 mostly, TCP for large answers and zone transfers.
+7. The first 16 bits are the network. 2^16 = 65,536 addresses (10.0.0.0–10.0.255.255).
+8. DNS lookup → TCP connect to port 443 → TLS handshake (certificate check) → HTTP request → response.
+9. L4 forwards TCP/UDP connections by IP and port. L7 understands HTTP: it can route by host name, path, headers, and terminate TLS.
+10. The route used when no more specific route matches (`0.0.0.0/0`), usually to the gateway/router.
+</details>
+
+### Docker (5 points)
+11. Image vs container?
+12. Why do Dockerfiles copy `package.json` and install dependencies *before* copying the rest of the code?
+13. What is a multi-stage build and why use it?
+14. What happens to data written inside a container when you delete it?
+15. What does `-p 8080:80` do?
+
+<details><summary>Answers</summary>
+
+11. An image is a read-only template (layers). A container is a running (or stopped) instance of an image with a writable layer.
+12. Layer caching. If only code changes, the dependency layer is reused and builds are fast.
+13. Build in one stage with all tools, then copy only the result into a small final image. Smaller, safer images.
+14. It is lost, unless it was written to a volume or bind mount.
+15. Maps host port 8080 to container port 80.
+</details>
+
+### Kubernetes (5 points)
+16. What does the scheduler do? What does it NOT do?
+17. Deployment vs Pod — why not create Pods directly?
+18. What is a Service and why do Pods need one?
+19. Where does Kubernetes store cluster state?
+20. A pod is `CrashLoopBackOff`. Name your first three commands.
+
+<details><summary>Answers</summary>
+
+16. It chooses a node for each unscheduled pod. It does not start containers (the kubelet does that).
+17. A Deployment keeps the desired number of Pods running, replaces failed ones, and does rolling updates. A bare Pod is not recreated if its node dies.
+18. Pods get new IPs when recreated. A Service gives a stable virtual IP and DNS name and load-balances to matching pods.
+19. etcd.
+20. `kubectl describe pod <p>`, `kubectl logs <p> --previous`, `kubectl get events --sort-by=.lastTimestamp`.
+</details>
+
+##MD
+### Scoring guide — where to start
+
+| Your score | Start at | Reason |
+|---|---|---|
+| Linux < 4 **or** Networking < 4 | **01 Prerequisites**, all sections | Kubernetes is Linux + networking. Gaps here cause confusion later. |
+| Docker < 4 | **01 Prerequisites**, Docker part | Kubernetes runs containers. You must build images yourself. |
+| Kubernetes 0–2 | **02 Fundamentals** | Learn the architecture before workloads. |
+| Kubernetes 3–4 | **02** quickly (labs only), then **03** | Fill small gaps, move on. |
+| Kubernetes 5 and all others ≥ 4 | **03 Workloads**, but do every "Break it" challenge in 01–02 | You know the basics. Prove it by debugging. |
+
+Even if you score high: **do the labs**. Knowing a concept and building it are different skills.
+
+##MD
+## 9. Your learning plan
+
+Follow the notebooks in order. Each one has labs, a practical assignment, and a "Break it" challenge.
+
+| # | Notebook | Main topics | Time |
+|---|---|---|---|
+| 00 | Start Here | Tools, kind cluster, self-assessment | 1 h |
+| 01 | Prerequisites | Linux, namespaces/cgroups, networking, DNS, TLS, Docker, Dockerfiles | 4–6 h |
+| 02 | Kubernetes Fundamentals | Architecture, API server, etcd, scheduler, kubelet, kubectl, namespaces, labels | 4–5 h |
+| 03 | Workloads | Pods, ReplicaSets, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, init/sidecar containers | 5–6 h |
+| 04 | Networking | Services, CoreDNS, Ingress, Gateway API, Network Policies, CNI | 5–6 h |
+| 05 | Storage | Volumes, PV, PVC, StorageClass, CSI, snapshots, backup | 3–4 h |
+| 06 | Configuration and Secrets | ConfigMaps, Secrets, External Secrets, encryption at rest | 3 h |
+| 07 | Scheduling and Resources | Requests/limits, QoS, affinity, taints, PDB, HPA, VPA, autoscalers | 5 h |
+| 08 | Security | RBAC, service accounts, Pod Security, security contexts, image security | 5 h |
+| 09 | Helm | Charts, values, templates, upgrades, rollbacks | 3–4 h |
+| 10 | Advanced Kubernetes | CRDs, controllers, operators, webhooks, finalizers | 4 h |
+| 11 | CI/CD and GitOps | Pipelines, Argo CD, Flux, blue-green, canary | 4–5 h |
+| 12 | Observability | Logs, metrics, Prometheus, Grafana, Alertmanager, Loki, OpenTelemetry | 4–5 h |
+| 13 | Troubleshooting | Real incidents: CrashLoopBackOff, Pending, OOMKilled, DNS, NotReady… | 5–6 h |
+| 14 | Production Architecture | HA, multi-zone, DR, upgrades, multi-tenancy, cost | 4 h |
+| 15 | Cloud Kubernetes | EKS, AKS, GKE (and OKE), IAM, cloud LB and storage | 4 h |
+| 16 | Capstone Projects | 13 hands-on projects that combine everything | 15–25 h |
+
+**Suggested pace:** 1 notebook per week, 1 hour per day. Do the assignment at the end of each week.
+
+**Extra practice:** your folder `../Repos/learning/` already has `kubernetes-katas-main`, `learn_kubernetes-main`, and `kubernetes-the-hard-way-master`. Use the katas as extra exercises. Do *Kubernetes the Hard Way* after notebook 02 to see every component built by hand.
+
+##MD
+## 10. How to reset the lab
+
+When the cluster is in a bad state (you broke it on purpose or by accident), the fastest fix is to delete and recreate it. Your YAML files stay in `labs/`.
+
+| Situation | Command |
+|---|---|
+| Clean one namespace | `kubectl delete namespace <name>` |
+| Full reset | `kind delete cluster --name learn` then re-run section 5 |
+| Pause to save laptop battery | `colima stop` (or quit Docker Desktop). Start again later; kind nodes restart with the engine. |
+| Free disk space | `docker system prune -a` (removes unused images — the next cluster create downloads again) |
+
+The next cell does a **full reset**. Run it only when you need it.
+
+##CODE
+%%bash
+# FULL RESET — deletes and recreates the 'learn' cluster. Uncomment to use.
+# kind delete cluster --name learn
+# kind create cluster --config labs/00/kind-learn.yaml
+echo "Reset cell is commented out on purpose. Remove the # signs to use it."
+
+##MD
+## Check yourself
+
+1. Why does kind need Docker or Colima?
+2. Why does our cluster have 2 worker nodes instead of 1?
+3. What is the name of the kubectl context for our lab cluster?
+4. What do `extraPortMappings` 80 and 443 allow us to do later?
+5. What is the fastest way to recover from a broken lab cluster?
+
+<details><summary>Answer</summary>
+
+1. kind runs each Kubernetes node as a container. It needs a container engine. macOS needs a Linux VM for that.
+2. To see scheduling across nodes, spreading, node failure, and taints/tolerations.
+3. `kind-learn`.
+4. Reach the Ingress controller from the Mac at `http://localhost` and `https://localhost`.
+5. `kind delete cluster --name learn` and create it again from `labs/00/kind-learn.yaml`.
+</details>
+
+##MD
+## Interview and real-world questions
+
+1. **"Why use kind or Minikube instead of practising on the company cluster?"**
+2. **"How do you avoid running a command against the wrong cluster?"**
+3. **"What are the limits of kind compared with a managed service like OKE, EKS, or AKS?"**
+
+<details><summary>Answers</summary>
+
+1. A local cluster is free, isolated, and disposable. You can break it without risk to users or data. You can test destructive actions (node failure, deleting etcd data) that you can never test on production.
+2. Use separate kubeconfig files per environment, show the current context in the shell prompt (for example with `kube-ps1`), use read-only credentials by default, and add guard checks in scripts. Some teams also use tools like `kubectx` and colour-code production.
+3. kind has no real cloud load balancer (Services of type LoadBalancer stay `Pending` unless you add a tool like cloud-provider-kind or MetalLB), no cloud block storage, no real multi-zone failure domains, and runs on one machine. It is perfect for learning and CI tests, not for production.
+</details>
+
+##MD
+## Practical assignment
+
+**Scenario:** Your team lead asks you to prepare a laptop lab so a new joiner can practise safely.
+
+**Tasks**
+1. Create a second cluster called `scratch` with **1 control plane and 1 worker**, and **no** port mappings (so it does not clash with `learn`).
+2. Show both contexts with `kubectl config get-contexts`.
+3. Deploy `nginx:1.27` as a pod in `scratch` only.
+4. Switch back to `kind-learn` and prove the pod is not there.
+5. Delete the `scratch` cluster.
+
+**Success criteria:** `kind get clusters` shows only `learn` at the end. You never ran a command on the wrong cluster.
+
+**Hints:** `kind create cluster --name ... --config ...`, `kubectl --context kind-scratch ...`.
+
+<details><summary>Solution</summary>
+
+```bash
+cat > labs/00/kind-scratch.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: scratch
+nodes:
+  - role: control-plane
+  - role: worker
+EOF
+kind create cluster --config labs/00/kind-scratch.yaml
+kubectl config get-contexts
+kubectl --context kind-scratch run web --image=nginx:1.27
+kubectl --context kind-scratch get pods
+kubectl config use-context kind-learn
+kubectl get pods            # 'web' is NOT here
+kind delete cluster --name scratch
+kind get clusters           # only: learn
+```
+
+Note: `kind create cluster` switches the current context to the new cluster. That is why we switch back explicitly. Using `--context` on every command is the safest habit.
+</details>
+
+##MD
+## Break it challenge
+
+A colleague's kind config fails with an error. Find **two** problems.
+
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: Learn_Lab
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+  - role: worker
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+```
+
+<details><summary>Solution</summary>
+
+1. **Cluster name** `Learn_Lab` is invalid. Names must be lowercase DNS-style: letters, numbers, `-`. Use `learn-lab`.
+2. **Two nodes map the same host port 80.** Only one container on your Mac can bind host port 80. The second node fails with `port is already allocated`. Map port 80 on one node only (the one labelled `ingress-ready=true`).
+</details>
+
+##MD
+## Cleanup
+
+Keep the `learn` cluster. All next notebooks use it. If you want to free memory between study sessions, stop the engine:
+
+##CODE
+%%bash
+# Optional: pause everything to save battery/RAM. The cluster comes back when the engine starts.
+# colima stop          # if you use Colima
+echo "Nothing to clean. Keep the 'learn' cluster for the next notebook."
+
+##MD
+---
+**Next notebook:** [01-Prerequisites.ipynb](01-Prerequisites.ipynb) — Linux, networking, and Docker: the foundations under Kubernetes.

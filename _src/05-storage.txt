@@ -1,0 +1,1802 @@
+##MD
+# Phase 5 — Kubernetes Storage
+
+**What you will learn**
+- Volumes: `emptyDir`, `hostPath`, `configMap`, `secret`, `projected`
+- PersistentVolume (PV) and PersistentVolumeClaim (PVC)
+- StorageClasses and dynamic provisioning
+- CSI drivers (how storage plugins work)
+- Storage for stateful apps (StatefulSet + MySQL)
+- Volume snapshots
+- Backup and restore (Velero, Commvault-style CSI snapshot flow, `mysqldump` Job)
+- Storage troubleshooting (Pending PVC, Multi-Attach, reclaim policy, access modes)
+
+**Time:** about 4–5 hours (do it over 2–3 sessions).
+
+**Prerequisites**
+- Notebook 00 done: kind cluster `learn` is running (1 control plane + 2 workers).
+- Notebooks 02–04 (architecture, workloads, networking).
+- `kubectl`, `helm`, `git` installed.
+
+**How to use this notebook**
+- Run cells from top to bottom. Press **Shift+Enter** to run a cell.
+- Cells starting with `%%bash` run shell commands.
+- Cells starting with `%%writefile` create a YAML file in `labs/05/`. Read the comments in the YAML. They explain every field.
+- Before running a command, read the text above it. It says what the command does.
+- Answers are hidden. Click **Answer** to open them. Try first, then check.
+
+##MD
+## Setup: safety check and lab namespace
+
+This cell checks that `kubectl` points to your **local** kind cluster. If it points to anything else (for example an OKE cluster), it stops. Run this check before every lab section.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx', not 'kind-learn'."
+  echo "Fix:  kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+
+##MD
+Now create a folder for the YAML files and a namespace for this notebook. A **namespace** is a folder inside the cluster. Everything we create goes into `lab-05`, so cleanup is one command.
+
+##CODE
+%%bash
+mkdir -p labs/05
+kubectl create namespace lab-05 --dry-run=client -o yaml | kubectl apply -f -
+kubectl config set-context --current --namespace=lab-05
+kubectl get nodes -o wide
+
+##MD
+**Expected output** (names may differ slightly):
+```
+namespace/lab-05 created
+Context "kind-learn" modified.
+NAME                  STATUS   ROLES           ...
+learn-control-plane   Ready    control-plane
+learn-worker          Ready    <none>
+learn-worker2         Ready    <none>
+```
+`set-context --namespace=lab-05` makes `lab-05` the default. You do not need `-n lab-05` on every command.
+
+##MD
+---
+# Topic 1 — Volumes: emptyDir, hostPath, configMap, secret, projected
+
+### What is it?
+A **container filesystem is temporary**. When a container restarts, every file it wrote is gone. A **volume** is a directory that Kubernetes attaches to a Pod. Containers in the Pod mount it at a path.
+
+### Why do we need it?
+- Keep data across **container restarts** (not Pod deletion — see below).
+- **Share files** between containers in the same Pod (for example an app and a log shipper sidecar).
+- Inject **configuration and secrets** as files.
+
+### Volume types in this topic
+| Type | Lives as long as | Use it for |
+|---|---|---|
+| `emptyDir` | the **Pod** | scratch space, cache, sharing files between containers |
+| `hostPath` | the **node** | node agents that read node files (log collectors, node-exporter). Avoid for apps. |
+| `configMap` | the ConfigMap object | config files |
+| `secret` | the Secret object | passwords, keys, certificates as files (stored in memory, `tmpfs`) |
+| `projected` | its sources | combine configMap + secret + downwardAPI + serviceAccountToken in **one** directory |
+
+### How it works internally
+```
+ kube-apiserver --(Pod spec with volumes)--> kubelet on the node
+                                               |
+                       kubelet creates the directory on the node:
+                       /var/lib/kubelet/pods/<pod-uid>/volumes/<plugin>/<name>
+                                               |
+                       container runtime (containerd) bind-mounts it
+                       into the container at volumeMounts.mountPath
+```
+- `emptyDir` is a plain directory under `/var/lib/kubelet/pods/<uid>/`. It is deleted when the Pod is deleted.
+- `emptyDir.medium: Memory` uses `tmpfs` (RAM). It counts toward the container memory limit.
+- `secret` volumes always use `tmpfs`, so secret data never touches the node disk.
+- `hostPath` mounts a real node path. The Pod sees the node's files. This is a security risk.
+
+### Real production scenario
+Your web app on OKE writes access logs to `/var/log/app`. You want Fluent Bit to ship them to OCI Logging. You run Fluent Bit as a **sidecar** in the same Pod. Both containers mount the same `emptyDir`. The app writes, the sidecar reads. No shared disk is needed.
+
+##MD
+### Hands-on lab 1.1 — emptyDir shared between two containers
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/05/emptydir.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-logs
+  namespace: lab-05
+spec:
+  volumes:
+    - name: logs              # volume name; containers refer to it by this name
+      emptyDir:               # empty directory, created when the Pod starts on a node
+        sizeLimit: 100Mi      # kubelet evicts the Pod if it writes more than this
+  containers:
+    - name: app               # "writer" container
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do date >> /var/log/app/access.log; sleep 2; done"]
+      volumeMounts:
+        - name: logs          # must match volumes[].name
+          mountPath: /var/log/app   # path inside THIS container
+    - name: shipper           # "reader" container (a fake log shipper)
+      image: busybox:1.36
+      command: ["sh", "-c", "tail -F /logs/access.log"]
+      volumeMounts:
+        - name: logs
+          mountPath: /logs    # same volume, different path is fine
+          readOnly: true      # the shipper only reads
+
+##MD
+Apply the Pod. Wait until it is Ready. Then read the logs of the **shipper** container. It prints lines that the **app** container wrote.
+
+##CODE
+%%bash
+kubectl apply -f labs/05/emptydir.yaml
+kubectl wait --for=condition=Ready pod/shared-logs --timeout=90s
+sleep 5
+kubectl logs shared-logs -c shipper --tail=3
+
+##MD
+**Expected output**
+```
+pod/shared-logs created
+pod/shared-logs condition met
+Mon Oct 27 10:00:01 UTC 2026
+Mon Oct 27 10:00:03 UTC 2026
+Mon Oct 27 10:00:05 UTC 2026
+```
+
+Now prove **where** the data lives. kind nodes are Docker containers, so `docker exec` opens a shell on the node. We find the Pod UID and list the emptyDir directory on the node.
+
+##CODE
+%%bash
+NODE=$(kubectl get pod shared-logs -o jsonpath='{.spec.nodeName}')
+UID_=$(kubectl get pod shared-logs -o jsonpath='{.metadata.uid}')
+echo "Pod runs on node: $NODE, uid: $UID_"
+docker exec "$NODE" ls -l /var/lib/kubelet/pods/$UID_/volumes/kubernetes.io~empty-dir/logs/
+
+##MD
+**Expected output**
+```
+Pod runs on node: learn-worker2, uid: 3f1c...
+-rw-r--r-- 1 root root 812 Oct 27 10:00 access.log
+```
+Now delete the Pod. The directory is gone too. That is the meaning of "emptyDir lives as long as the Pod".
+
+##CODE
+%%bash
+kubectl delete pod shared-logs --wait=true
+echo "Pod deleted. The emptyDir directory on the node is removed."
+
+##MD
+### Hands-on lab 1.2 — hostPath (read node files)
+
+`hostPath` mounts a path from the node. Here we read the node's `/etc/os-release`. We mount it **read-only**. Never mount `/` or `/var/run/containerd` in normal apps — that gives full control of the node.
+
+##CODE
+%%writefile labs/05/hostpath.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-reader
+  namespace: lab-05
+spec:
+  volumes:
+    - name: node-etc
+      hostPath:
+        path: /etc            # path on the NODE
+        type: Directory       # fail if it is not an existing directory (safer than "")
+  containers:
+    - name: reader
+      image: busybox:1.36
+      command: ["sh", "-c", "cat /host-etc/os-release; sleep 3600"]
+      volumeMounts:
+        - name: node-etc
+          mountPath: /host-etc
+          readOnly: true      # ALWAYS read-only unless you really must write
+
+##CODE
+%%bash
+kubectl apply -f labs/05/hostpath.yaml
+kubectl wait --for=condition=Ready pod/node-reader --timeout=90s
+kubectl logs node-reader | head -3
+kubectl delete pod node-reader --wait=false
+
+##MD
+**Expected output** — the node OS, not busybox:
+```
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+```
+kind nodes run Debian. On OKE you would see Oracle Linux.
+
+##MD
+### Hands-on lab 1.3 — configMap, secret and projected volumes
+
+We create one ConfigMap and one Secret. Then one Pod mounts them with a **projected** volume, so both appear in a single directory `/etc/app`. We also project the Pod's own labels with the **downward API** (Pod information exposed to the container).
+
+##CODE
+%%bash
+kubectl create configmap app-config --from-literal=app.properties='log.level=INFO
+cache.size=256' --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic app-secret --from-literal=db-password='Lab-Only-Pass-123' --dry-run=client -o yaml | kubectl apply -f -
+
+##CODE
+%%writefile labs/05/projected.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: projected-demo
+  namespace: lab-05
+  labels:
+    app: projected-demo
+    team: platform
+spec:
+  volumes:
+    - name: all-in-one
+      projected:              # merge several sources into ONE directory
+        defaultMode: 0440     # file permissions (octal): owner+group read only
+        sources:
+          - configMap:
+              name: app-config          # ConfigMap created above
+              items:
+                - key: app.properties   # which key to use
+                  path: app.properties  # file name inside the mount
+          - secret:
+              name: app-secret
+              items:
+                - key: db-password
+                  path: secrets/db-password   # sub-folder is allowed
+          - downwardAPI:
+              items:
+                - path: labels                # file with the Pod's labels
+                  fieldRef:
+                    fieldPath: metadata.labels
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: all-in-one
+          mountPath: /etc/app
+          readOnly: true
+
+##CODE
+%%bash
+kubectl apply -f labs/05/projected.yaml
+kubectl wait --for=condition=Ready pod/projected-demo --timeout=90s
+kubectl exec projected-demo -- sh -c 'cd /etc/app && find . -type l -o -type f | sort; echo ---; cat app.properties; echo ---; cat labels; echo; echo ---; mount | grep /etc/app'
+
+##MD
+**Expected output** (short):
+```
+./app.properties
+./labels
+./secrets/db-password
+---
+log.level=INFO
+cache.size=256
+---
+app="projected-demo"
+team="platform"
+---
+tmpfs on /etc/app type tmpfs (ro,relatime,...)
+```
+Notice: the projected volume is **tmpfs** because it contains a secret. Files are symlinks to a hidden `..data` folder. kubelet swaps that link atomically when the ConfigMap changes (more in notebook 06).
+
+##MD
+### Troubleshooting volumes
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pod stuck `ContainerCreating`, event `MountVolume.SetUp failed ... configmap "x" not found` | ConfigMap/Secret missing or in another namespace | Create it in the **same namespace**, or set `optional: true` |
+| Pod `Evicted`, reason `ephemeral local storage usage exceeds ... emptyDir` | `emptyDir.sizeLimit` exceeded | Raise limit, clean files, or use a PVC |
+| Pod `OOMKilled` with `emptyDir.medium: Memory` | tmpfs counts as memory | Raise memory limit or use disk emptyDir |
+| `hostPath` Pod works on one node, fails on another | path exists only on some nodes | Use `type: DirectoryOrCreate`, or a DaemonSet, or a PVC |
+| Data lost after `kubectl delete pod` | emptyDir is Pod-scoped | Use a PVC for data that must survive |
+
+Useful commands:
+```
+kubectl describe pod <pod>           # read Events at the bottom
+kubectl get events --sort-by=.lastTimestamp
+```
+
+### Lab vs Production
+| This lab | Production | Why |
+|---|---|---|
+| hostPath to read `/etc` | hostPath only in node agents (DaemonSets), blocked for apps by Pod Security "restricted"/"baseline" | hostPath can escape the container |
+| emptyDir with `sizeLimit` | Always set `sizeLimit` and ephemeral-storage requests/limits | One Pod must not fill the node disk |
+| Secret from a literal | Secret from External Secrets / OCI Vault (notebook 06) | Literals end up in shell history and Git |
+
+##MD
+### Check yourself
+1. A container in a Pod crashes and restarts. Is the data in its `emptyDir` still there?
+<details><summary>Answer</summary>Yes. emptyDir lives as long as the <b>Pod</b>. A container restart keeps the Pod. Deleting the Pod (or it moving to another node) deletes the data.</details>
+
+2. Why do Secret volumes use tmpfs?
+<details><summary>Answer</summary>So secret data stays in RAM and is never written to the node disk.</details>
+
+3. You need a ConfigMap, a Secret and the Pod name in one folder. Which volume type?
+<details><summary>Answer</summary><code>projected</code> with configMap, secret and downwardAPI sources.</details>
+
+4. Why is `hostPath` dangerous for normal apps?
+<details><summary>Answer</summary>It gives the container access to node files. A writable mount of a sensitive path (for example the containerd socket or /etc) can take over the node. It also ties the Pod to one node's data.</details>
+
+##MD
+---
+# Topic 2 — PersistentVolume (PV) and PersistentVolumeClaim (PVC)
+
+### What is it?
+- A **PersistentVolume (PV)** is a piece of real storage in the cluster: an OCI Block Volume, an NFS share, a local disk. It is a **cluster-wide** object (no namespace).
+- A **PersistentVolumeClaim (PVC)** is a **request** for storage by a user: "I need 5Gi, ReadWriteOnce". It lives in a namespace.
+- Kubernetes **binds** one PVC to one PV. The Pod mounts the PVC, never the PV directly.
+
+### Why do we need it?
+It separates two jobs:
+- The **platform team** knows the storage (OCI Block Volume, NFS, iSCSI).
+- The **app team** only says how much storage and what access they need.
+The app YAML does not change between kind, OKE and EKS. Only the PV/StorageClass changes.
+
+### Key fields
+| Field | Meaning |
+|---|---|
+| `capacity.storage` / `resources.requests.storage` | size of the PV / size the PVC asks for |
+| `accessModes` | `ReadWriteOnce` (RWO: one **node** can mount read-write), `ReadOnlyMany` (ROX), `ReadWriteMany` (RWX: many nodes read-write, e.g. NFS / OCI File Storage), `ReadWriteOncePod` (RWOP: only one **Pod**) |
+| `persistentVolumeReclaimPolicy` | what happens to the PV when the PVC is deleted: `Delete` or `Retain` |
+| `storageClassName` | groups PVs and PVCs. PVC and PV must match. `""` means "no class" (static only) |
+| `volumeMode` | `Filesystem` (default) or `Block` (raw device) |
+
+### How it works internally
+```
+ PVC created --> PV controller (in kube-controller-manager) looks for a PV that matches:
+                 same storageClassName, enough capacity, compatible accessModes
+                     |
+            match found? --yes--> PV.spec.claimRef = PVC ; both become "Bound"
+                     |
+                     no --> PVC stays "Pending" (or dynamic provisioning, Topic 3)
+
+ Pod uses PVC --> scheduler checks PV nodeAffinity --> kubelet mounts the volume
+```
+PV lifecycle: `Available` -> `Bound` -> (PVC deleted) -> `Released` -> deleted (`Delete`) or kept (`Retain`).
+
+### Real production scenario
+You migrate an old reporting server to OKE. Its data is already on an existing OCI Block Volume with 200 GB of files. You do **not** want a new empty disk. You create a **static PV** that points to the existing volume OCID, and a PVC that binds to it. The app now mounts the old data.
+
+##MD
+### Hands-on lab 2 — a static `local` PV on a specific node
+
+On kind, the closest thing to a "real disk" is a directory on a node. A `local` PV points to that directory and has **nodeAffinity**. The scheduler then always puts the Pod on that node.
+
+First we create the directory on the node `learn-worker`. kind nodes are containers, so we use `docker exec`.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+docker exec learn-worker mkdir -p /mnt/disks/vol1
+docker exec learn-worker sh -c 'echo "old report data from the legacy server" > /mnt/disks/vol1/report-2025.txt'
+docker exec learn-worker ls -l /mnt/disks/vol1
+
+##CODE
+%%writefile labs/05/static-pv.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lab05-local-pv        # PVs have NO namespace (cluster-wide)
+spec:
+  capacity:
+    storage: 1Gi              # size this PV offers
+  accessModes:
+    - ReadWriteOnce           # one node can mount it read-write
+  persistentVolumeReclaimPolicy: Retain   # keep the data if the PVC is deleted
+  storageClassName: manual    # a class name we invent; the PVC must use the same
+  volumeMode: Filesystem
+  local:
+    path: /mnt/disks/vol1     # directory on the node
+  nodeAffinity:               # REQUIRED for local PVs: which node has this disk
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["learn-worker"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: report-data
+  namespace: lab-05
+spec:
+  storageClassName: manual    # must match the PV
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi            # PVC asks for <= PV capacity
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: report-app
+  namespace: lab-05
+spec:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: report-data   # the Pod refers to the PVC, not the PV
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "cat /data/report-2025.txt; sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+##CODE
+%%bash
+kubectl apply -f labs/05/static-pv.yaml
+kubectl wait --for=condition=Ready pod/report-app --timeout=90s
+kubectl get pv lab05-local-pv
+kubectl get pvc report-data
+kubectl get pod report-app -o wide
+kubectl logs report-app
+
+##MD
+**Expected output**
+```
+NAME             CAPACITY  ACCESS MODES  RECLAIM POLICY  STATUS  CLAIM               STORAGECLASS
+lab05-local-pv   1Gi       RWO           Retain          Bound   lab-05/report-data  manual
+NAME          STATUS   VOLUME           CAPACITY   ACCESS MODES   STORAGECLASS
+report-data   Bound    lab05-local-pv   1Gi        RWO            manual
+NAME         READY   STATUS    ...   NODE
+report-app   1/1     Running   ...   learn-worker
+old report data from the legacy server
+```
+The Pod landed on `learn-worker` because the PV's nodeAffinity forced it.
+
+### See the "Released" state and the Retain policy
+Delete the Pod and the PVC. The PV is **not** deleted (Retain). It becomes `Released`. A Released PV is **not reused automatically** — it still remembers the old claim (`claimRef`).
+
+##CODE
+%%bash
+kubectl delete pod report-app --wait=true
+kubectl delete pvc report-data --wait=true
+kubectl get pv lab05-local-pv
+echo "--- old claimRef still set:"
+kubectl get pv lab05-local-pv -o jsonpath='{.spec.claimRef.name}{"\n"}'
+echo "--- data is still on the node:"
+docker exec learn-worker cat /mnt/disks/vol1/report-2025.txt
+
+##MD
+**Expected output**
+```
+NAME             ...  STATUS     CLAIM
+lab05-local-pv   ...  Released   lab-05/report-data
+--- old claimRef still set:
+report-data
+--- data is still on the node:
+old report data from the legacy server
+```
+To make the PV usable again, an admin **checks the data** and then removes `claimRef`:
+
+##CODE
+%%bash
+kubectl patch pv lab05-local-pv --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]'
+kubectl get pv lab05-local-pv
+
+##MD
+**Expected output:** `STATUS` is now `Available`. A new PVC with class `manual` can bind to it.
+
+### Troubleshooting PV/PVC binding
+| Symptom | Cause | Fix |
+|---|---|---|
+| PVC `Pending`, no events about provisioning | No PV matches (class, size, access mode) | `kubectl describe pvc`; compare with `kubectl get pv` |
+| PVC with `storageClassName` missing binds to a NEW dynamic volume, not your static PV | Default StorageClass was applied | Set `storageClassName` explicitly (`manual` or `""`) |
+| PV `Released`, new PVC stays Pending | Old `claimRef` is still set | Check data, then remove `claimRef` |
+| Pod Pending: `node(s) had volume node affinity conflict` | PV is tied to a node/zone the Pod cannot use | Fix nodeAffinity, or OCI: volume and node must be in the **same AD** |
+
+### Lab vs Production
+| This lab | Production (OKE) |
+|---|---|
+| `local` PV on a directory | Static PV with `csi.driver: blockvolume.csi.oraclecloud.com` and `volumeHandle: <block volume OCID>` |
+| Manual class name | Usually dynamic provisioning (Topic 3). Static PVs only for imports/migrations |
+| Removing claimRef by hand | Documented runbook, with a data check first; Retain for important data |
+
+##MD
+### Check yourself
+1. Does a PV belong to a namespace?
+<details><summary>Answer</summary>No. PVs are cluster-wide. PVCs are namespaced.</details>
+
+2. What does `ReadWriteOnce` really limit: Pods or nodes?
+<details><summary>Answer</summary>Nodes. Several Pods on the <b>same node</b> can mount an RWO volume. Use <code>ReadWriteOncePod</code> to limit to one Pod.</details>
+
+3. A PVC is deleted and the PV has `Retain`. What happens to the PV and the data?
+<details><summary>Answer</summary>The PV becomes <code>Released</code>. Data stays. The PV is not reused until an admin removes <code>claimRef</code> (or deletes and recreates the PV).</details>
+
+4. Why do `local` PVs need `nodeAffinity`?
+<details><summary>Answer</summary>The data exists on one node only. The scheduler must place the Pod on that node.</details>
+
+##MD
+---
+# Topic 3 — StorageClasses and dynamic provisioning
+
+### What is it?
+A **StorageClass** describes a *type* of storage ("fast block", "shared file", "cheap"). With **dynamic provisioning**, a PVC that names a StorageClass makes Kubernetes **create a new disk automatically**. Nobody creates PVs by hand.
+
+### Why do we need it?
+With 50 teams and 500 PVCs, creating static PVs by hand is slow and error-prone. Dynamic provisioning is self-service: create a PVC, get a disk.
+
+### Key StorageClass fields
+| Field | Meaning |
+|---|---|
+| `provisioner` | which driver creates the disk, e.g. `blockvolume.csi.oraclecloud.com` (OKE), `rancher.io/local-path` (kind) |
+| `parameters` | driver-specific options (OCI: `vpusPerGB` for performance) |
+| `reclaimPolicy` | `Delete` (default) or `Retain` for PVs created by this class |
+| `volumeBindingMode` | `Immediate` (create disk now) or `WaitForFirstConsumer` (create when a Pod is scheduled — picks the right zone/AD/node) |
+| `allowVolumeExpansion` | allow growing a PVC by editing its size |
+| annotation `storageclass.kubernetes.io/is-default-class: "true"` | PVCs without a class use this one |
+
+### How it works internally
+```
+ PVC (storageClassName: standard)
+   |  volumeBindingMode = WaitForFirstConsumer -> PVC waits ("Pending") until a Pod uses it
+   v
+ scheduler picks a node for the Pod --> writes annotation volume.kubernetes.io/selected-node on PVC
+   v
+ external provisioner (part of the CSI driver) sees the PVC
+   --> calls the storage backend: "create 1Gi disk near node X"   (OCI: create Block Volume in the node's AD)
+   --> creates a PV object with the disk ID --> PV controller binds PVC <-> PV
+   v
+ kubelet on node X mounts the volume, Pod starts
+```
+
+### Real production scenario
+On OKE, the default class `oci-bv` uses `WaitForFirstConsumer`. Your 3 worker nodes are in 3 Availability Domains (ADs). If the class used `Immediate`, a disk could be created in AD-1 while the Pod is scheduled in AD-2. Block Volumes cannot attach across ADs, so the Pod would stay Pending. `WaitForFirstConsumer` avoids this.
+
+##MD
+### Hands-on lab 3 — see the default class, then dynamic provisioning
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl get storageclass
+echo "---"
+kubectl get storageclass standard -o yaml | grep -E 'provisioner|reclaimPolicy|volumeBindingMode|is-default'
+
+##MD
+**Expected output**
+```
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false
+---
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+```
+kind uses **local-path-provisioner**. It creates a directory on the chosen node for each PVC.
+
+Now we create our own class with `Retain`, plus a PVC that uses it. Watch: the PVC stays **Pending** until a Pod uses it.
+
+##CODE
+%%writefile labs/05/sc-and-pvc.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lab05-retain          # cluster-wide object
+provisioner: rancher.io/local-path   # same driver as "standard"
+reclaimPolicy: Retain         # keep the disk when the PVC is deleted
+volumeBindingMode: WaitForFirstConsumer   # create the disk only when a Pod is scheduled
+allowVolumeExpansion: false   # local-path cannot grow volumes
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dyn-data
+  namespace: lab-05
+spec:
+  storageClassName: lab05-retain   # ask this class to create the disk
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 500Mi
+
+##CODE
+%%bash
+kubectl apply -f labs/05/sc-and-pvc.yaml
+sleep 3
+kubectl get pvc dyn-data
+kubectl describe pvc dyn-data | tail -4
+
+##MD
+**Expected output**
+```
+NAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+dyn-data   Pending                                      lab05-retain
+...
+Normal  WaitForFirstConsumer  ...  waiting for first consumer to be created before binding
+```
+This is **normal**. Now create a Pod that uses the PVC.
+
+##CODE
+%%writefile labs/05/dyn-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dyn-writer
+  namespace: lab-05
+spec:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: dyn-data
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo hello-from-$(hostname) > /data/hello.txt; sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+##CODE
+%%bash
+kubectl apply -f labs/05/dyn-pod.yaml
+kubectl wait --for=condition=Ready pod/dyn-writer --timeout=120s
+kubectl get pvc dyn-data
+PV=$(kubectl get pvc dyn-data -o jsonpath='{.spec.volumeName}')
+echo "PV created automatically: $PV"
+kubectl get pv "$PV" -o jsonpath='{.spec.hostPath.path}{"  node="}{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}{"\n"}'
+
+##MD
+**Expected output**
+```
+NAME       STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+dyn-data   Bound    pvc-8a1d...                                500Mi      RWO            lab05-retain
+PV created automatically: pvc-8a1d...
+/var/local-path-provisioner/pvc-8a1d..._lab-05_dyn-data  node=learn-worker2
+```
+The provisioner created the PV and a directory on the node where the Pod was scheduled.
+
+> **Note:** local-path does not enforce the 500Mi size. Real block drivers (OCI Block Volume) create a disk of exactly that size.
+
+### Troubleshooting dynamic provisioning
+| Symptom | Cause | Fix |
+|---|---|---|
+| PVC Pending: `waiting for first consumer` | Normal for WaitForFirstConsumer | Create the Pod |
+| PVC Pending: `storageclass.storage.k8s.io "x" not found` | Typo in class name | `kubectl get sc` |
+| PVC Pending: `failed to provision volume ... ` | Driver/backend error (quota, IAM, wrong AD) | `kubectl logs` of the CSI controller pod; on OKE check the block volume service limits and policies |
+| Two default classes | Both have the default annotation | Remove the annotation from one |
+| Resize does nothing | `allowVolumeExpansion: false` or driver does not support it | Use a class that allows expansion |
+
+### Lab vs Production
+| This lab | Production (OKE) |
+|---|---|
+| `rancher.io/local-path` (directory on one node) | `oci-bv` (OCI Block Volume CSI): real network disk, survives node loss, can move to another node in the same AD |
+| No real size limit | Exact size, performance via `vpusPerGB` (10 = Balanced, 20 = Higher Performance) |
+| `Retain` class for practice | `Retain` for databases, `Delete` for scratch/test; for RWX use OCI File Storage (FSS) CSI |
+
+Example OKE class (do not apply here):
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: oci-bv-high
+provisioner: blockvolume.csi.oraclecloud.com
+parameters:
+  vpusPerGB: "20"            # Higher Performance tier
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+##MD
+### Check yourself
+1. Why is `WaitForFirstConsumer` important in a multi-AD or multi-zone cluster?
+<details><summary>Answer</summary>The disk is created only after the scheduler picks a node, so the disk is created in the same AD/zone as that node. With <code>Immediate</code>, the disk may land in an AD where the Pod cannot run.</details>
+
+2. A PVC has no `storageClassName`. What happens?
+<details><summary>Answer</summary>The default StorageClass is used (an admission controller fills it in). If there is no default, it only binds to static PVs with no class.</details>
+
+3. Who creates the PV in dynamic provisioning?
+<details><summary>Answer</summary>The external provisioner of the storage driver (a CSI sidecar), after the backend disk is created.</details>
+
+##MD
+---
+# Topic 4 — CSI drivers
+
+### What is it?
+**CSI (Container Storage Interface)** is a standard API between Kubernetes and storage systems. A storage vendor writes one **CSI driver**. Kubernetes talks to every driver the same way.
+
+### Why do we need it?
+Before CSI, storage code lived **inside** Kubernetes ("in-tree"). Every new storage system needed a Kubernetes release. CSI moved drivers **out of tree**. Oracle, AWS, NetApp ship and upgrade drivers on their own schedule.
+
+### How it works internally
+A CSI driver has two parts:
+```
+ CONTROL PLANE SIDE (Deployment: "controller plugin")
+ +-----------------------------------------------------------------+
+ | external-provisioner  -> CreateVolume / DeleteVolume            |
+ | external-attacher     -> ControllerPublish (attach disk to node)|
+ | external-resizer      -> ControllerExpandVolume                 |
+ | external-snapshotter  -> CreateSnapshot                         |
+ |        all talk gRPC over a unix socket to -> vendor driver     |
+ +-----------------------------------------------------------------+
+ NODE SIDE (DaemonSet: "node plugin", one per node)
+ +-----------------------------------------------------------------+
+ | node-driver-registrar -> registers driver with kubelet          |
+ | vendor driver         -> NodeStage (format + mount to global dir)|
+ |                          NodePublish (bind-mount into the Pod)   |
+ +-----------------------------------------------------------------+
+
+ Full flow for a block volume:
+ CreateVolume -> (Pod scheduled) -> VolumeAttachment object -> ControllerPublish (iSCSI/paravirtual attach)
+ -> NodeStage (mkfs if new, mount /var/lib/kubelet/plugins/.../globalmount) -> NodePublish (bind into pod)
+```
+Kubernetes objects you can inspect: `CSIDriver`, `CSINode`, `VolumeAttachment`.
+
+### Real production scenario
+A Pod on OKE is stuck in `ContainerCreating` with `AttachVolume.Attach failed`. You check `kubectl get volumeattachment` and see the volume is still attached to an old node that was terminated. Knowing the CSI flow tells you where to look: the **attacher** (controller side), not the app.
+
+##MD
+### Hands-on lab 4 — inspect CSI objects, then install a real CSI driver
+
+The kind default (local-path) is **not** a CSI driver. To learn CSI and snapshots, we install the **CSI hostpath driver**. It is the official CSI test driver. It keeps data on one node, so it is for labs only.
+
+Step 1: install the **snapshot CRDs** and **snapshot controller** (needed in Topic 6). These are the same components managed clusters (EKS, OKE add-ons) install for you.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+SNAP_VERSION=v8.2.0
+kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=${SNAP_VERSION}"
+kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=${SNAP_VERSION}"
+kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=180s
+
+##MD
+**Expected output** (end):
+```
+customresourcedefinition.apiextensions.k8s.io/volumesnapshotclasses.snapshot.storage.k8s.io created
+customresourcedefinition.apiextensions.k8s.io/volumesnapshotcontents.snapshot.storage.k8s.io created
+customresourcedefinition.apiextensions.k8s.io/volumesnapshots.snapshot.storage.k8s.io created
+...
+deployment "snapshot-controller" successfully rolled out
+```
+
+Step 2: clone and deploy the CSI hostpath driver. The repo's `deploy.sh` script applies the driver and its sidecars. It takes 1–3 minutes.
+
+##CODE
+%%bash
+cd labs/05
+[ -d csi-driver-host-path ] || git clone --depth 1 https://github.com/kubernetes-csi/csi-driver-host-path.git
+./csi-driver-host-path/deploy/kubernetes-latest/deploy.sh 2>&1 | tail -15
+kubectl apply -f csi-driver-host-path/examples/csi-storageclass.yaml
+
+##MD
+**Expected output** (end):
+```
+deploying hostpath components
+...
+csi-hostpathplugin-0   8/8   Running
+storageclass.storage.k8s.io/csi-hostpath-sc created
+```
+If `deploy.sh` fails, read the last error line. Common cause: no internet, or Docker Desktop has too little memory (give it 6 GB+). This lab part is optional; you can still read the rest.
+
+Now inspect the CSI objects:
+
+##CODE
+%%bash
+echo "== CSIDriver objects (registered drivers)"; kubectl get csidriver
+echo "== CSINode (which drivers each node has)"; kubectl get csinode -o custom-columns=NODE:.metadata.name,DRIVERS:.spec.drivers[*].name
+echo "== Driver pod and its sidecar containers"
+kubectl get pod -A -l app.kubernetes.io/name=csi-hostpathplugin -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}: {range .spec.containers[*]}{.name} {end}{"\n"}{end}'
+
+##MD
+**Expected output**
+```
+== CSIDriver objects (registered drivers)
+NAME                  ATTACHREQUIRED   PODINFOONMOUNT   ...
+hostpath.csi.k8s.io   true             true
+== CSINode (which drivers each node has)
+NODE                  DRIVERS
+learn-worker          hostpath.csi.k8s.io      <- only the node running the plugin
+...
+== Driver pod and its sidecar containers
+default/csi-hostpathplugin-0: hostpath csi-external-health-monitor-controller node-driver-registrar liveness-probe csi-attacher csi-provisioner csi-resizer csi-snapshotter
+```
+You can see the **sidecars** from the diagram: provisioner, attacher, resizer, snapshotter, registrar.
+
+Create a PVC with the CSI class and a Pod. Then look at the **VolumeAttachment** object — this is the "attach to node" step.
+
+##CODE
+%%writefile labs/05/csi-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-data
+  namespace: lab-05
+spec:
+  storageClassName: csi-hostpath-sc   # CSI hostpath driver class
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-app
+  namespace: lab-05
+spec:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: csi-data
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'version 1 of important data' > /data/file.txt; sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+##CODE
+%%bash
+kubectl apply -f labs/05/csi-pvc.yaml
+kubectl wait --for=condition=Ready pod/csi-app --timeout=180s
+kubectl get pvc csi-data
+kubectl get volumeattachment
+kubectl exec csi-app -- cat /data/file.txt
+
+##MD
+**Expected output**
+```
+NAME       STATUS   VOLUME        CAPACITY   ACCESS MODES   STORAGECLASS
+csi-data   Bound    pvc-5b2e...   1Gi        RWO            csi-hostpath-sc
+NAME          ATTACHER              PV            NODE           ATTACHED
+csi-5c1f...   hostpath.csi.k8s.io   pvc-5b2e...   learn-worker   true
+version 1 of important data
+```
+
+### Troubleshooting CSI
+| Symptom | Where to look | Typical cause |
+|---|---|---|
+| PVC Pending, `failed to provision` | logs of `csi-provisioner` container | backend API error, quota, permissions (OCI IAM policy for the cluster) |
+| Pod `ContainerCreating`, `AttachVolume.Attach failed` | `kubectl get volumeattachment`, `csi-attacher` logs | volume still attached to old node, wrong AD |
+| `MountVolume.MountDevice failed` | node plugin logs on that node (DaemonSet pod) | iSCSI login failed, filesystem error |
+| Driver not on a node | `kubectl get csinode` | node plugin DaemonSet not running on that node (taints!) |
+
+Commands:
+```
+kubectl logs -n <ns> <csi-controller-pod> -c csi-provisioner
+kubectl logs -n <ns> <csi-controller-pod> -c csi-attacher
+kubectl describe volumeattachment <name>
+```
+On OKE the block volume CSI pods run in `kube-system` (`csi-oci-node-*` DaemonSet).
+
+### Lab vs Production
+| Lab: CSI hostpath | Production: OCI Block Volume CSI |
+|---|---|
+| Data on one node only; node dies = data gone | Network-attached disk, re-attached to another node in the same AD |
+| Installed by script | Installed and upgraded by OKE |
+| No IAM | Needs IAM policies so the cluster can manage volumes in the compartment |
+
+##MD
+### Check yourself
+1. Which CSI component creates the PV object?
+<details><summary>Answer</summary>The <b>external-provisioner</b> sidecar, after the driver's CreateVolume call succeeds.</details>
+
+2. What is the difference between NodeStage and NodePublish?
+<details><summary>Answer</summary>NodeStage prepares the device once per node (format if needed, mount to a global path). NodePublish bind-mounts it into each Pod's volume path.</details>
+
+3. Which object shows that a volume is attached to a node?
+<details><summary>Answer</summary><code>VolumeAttachment</code>.</details>
+
+##MD
+---
+# Topic 5 — Storage for stateful apps (StatefulSet + MySQL)
+
+### What is it?
+A **StatefulSet** runs Pods that need a **stable identity** and **their own disk**: databases, Kafka, Elasticsearch. With `volumeClaimTemplates`, each Pod gets its own PVC: `data-mysql-0`, `data-mysql-1`, ...
+
+### Why do we need it?
+A Deployment's Pods are interchangeable and share one PVC template badly: all replicas would try to use the **same** PVC. A database replica needs **its own** data, and it must get the **same** disk back after a restart.
+
+### How it works internally
+```
+ StatefulSet "mysql", replicas: 1, volumeClaimTemplates: [data]
+   |
+   +--> Pod mysql-0  --> PVC data-mysql-0 --> PV --> disk
+   |    (stable DNS name: mysql-0.mysql.lab-05.svc.cluster.local via headless Service)
+   |
+ Pod deleted or node fails  --> controller recreates mysql-0 --> SAME PVC data-mysql-0 --> same data
+ StatefulSet scaled down/deleted --> PVCs are KEPT by default (persistentVolumeClaimRetentionPolicy)
+```
+
+### Real production scenario
+A team runs MySQL as a StatefulSet on OKE with `oci-bv`. A worker node is patched and rebooted. `mysql-0` is recreated on another node in the same AD. The CSI driver detaches the Block Volume from the old node and attaches it to the new node. MySQL starts with all its data.
+
+##MD
+### Hands-on lab 5 — MySQL StatefulSet with its own PVC
+
+We store the root password in a Secret (lab only — see notebook 06 for proper secret handling).
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl create secret generic mysql-root --from-literal=password='Lab-Root-Only-123' --dry-run=client -o yaml | kubectl apply -f -
+
+##CODE
+%%writefile labs/05/mysql-sts.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: lab-05
+spec:
+  clusterIP: None             # HEADLESS service: gives each Pod a stable DNS name
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: lab-05
+spec:
+  serviceName: mysql          # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain       # keep PVCs if the StatefulSet is deleted (safe default)
+    whenScaled: Retain        # keep PVCs when scaling down
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      terminationGracePeriodSeconds: 30   # give MySQL time to flush and shut down cleanly
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-root
+                  key: password
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: data              # matches volumeClaimTemplates name
+              mountPath: /var/lib/mysql
+          readinessProbe:             # Pod is Ready only when MySQL answers
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits:   {memory: 1Gi}
+  volumeClaimTemplates:               # one PVC PER POD: data-mysql-0, data-mysql-1 ...
+    - metadata:
+        name: data
+      spec:
+        storageClassName: standard    # kind default; on OKE: oci-bv
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+
+##CODE
+%%bash
+kubectl apply -f labs/05/mysql-sts.yaml
+kubectl rollout status statefulset/mysql --timeout=300s
+kubectl get pod,pvc -l app=mysql
+kubectl get pvc data-mysql-0
+
+##MD
+**Expected output** (MySQL first start takes 30–90 seconds):
+```
+partitioned roll out complete: 1 new pods have been updated...
+NAME          READY   STATUS    RESTARTS   AGE
+pod/mysql-0   1/1     Running   0          60s
+NAME           STATUS   VOLUME        CAPACITY   ACCESS MODES   STORAGECLASS
+data-mysql-0   Bound    pvc-91c3...   2Gi        RWO            standard
+```
+Now write some data, **delete the Pod**, and check that the data is still there after it comes back.
+
+##CODE
+%%bash
+PASS='Lab-Root-Only-123'
+kubectl exec mysql-0 -- mysql -uroot -p"$PASS" -e "CREATE DATABASE IF NOT EXISTS shop; CREATE TABLE IF NOT EXISTS shop.orders(id INT PRIMARY KEY, item VARCHAR(50)); INSERT IGNORE INTO shop.orders VALUES (1,'laptop'),(2,'phone');" 2>/dev/null
+echo "Deleting pod mysql-0 ..."
+kubectl delete pod mysql-0 --wait=true
+kubectl wait --for=condition=Ready pod/mysql-0 --timeout=180s
+kubectl exec mysql-0 -- mysql -uroot -p"$PASS" -e "SELECT * FROM shop.orders;" 2>/dev/null
+
+##MD
+**Expected output**
+```
+Deleting pod mysql-0 ...
+pod "mysql-0" deleted
+pod/mysql-0 condition met
+id	item
+1	laptop
+2	phone
+```
+The new `mysql-0` used the **same PVC** `data-mysql-0`, so the data survived.
+
+> Note: on kind, `local-path` volumes are tied to one node, so `mysql-0` always returns to the same node. With `oci-bv` it can move to any node in the same AD.
+
+### Troubleshooting stateful storage
+| Symptom | Cause | Fix |
+|---|---|---|
+| `mysql-0` Pending after node loss, `volume node affinity conflict` | Disk tied to a node/AD with no healthy node | Add a node in that AD; for local disks, restore from backup |
+| Pod `CrashLoopBackOff`: MySQL "data directory has files" / permission denied | Wrong ownership on the volume, or a `lost+found` dir | `securityContext.fsGroup: 999`, or mount a sub-directory with `subPath` |
+| Scaled down, then up: old data appears | PVCs are retained by design | Delete PVCs if you really want fresh data |
+| Data corrupted after forced delete | `kubectl delete pod --force` while the disk was still writing | Avoid force delete on databases; let graceful shutdown finish |
+
+### Lab vs Production
+| This lab | Production |
+|---|---|
+| 1 replica, no replication | Use an **operator** (MySQL Operator for Kubernetes, Percona) or a managed DB (OCI MySQL HeatWave). Replication + failover |
+| local-path | `oci-bv` with `Retain`, higher VPUs for IO |
+| Password in a plain Secret | External Secrets + OCI Vault |
+| No backup | Scheduled logical + snapshot backups, tested restores (Topic 7) |
+| Simple requests/limits | Tuned `innodb_buffer_pool_size` to match the memory limit, PodDisruptionBudget, anti-affinity |
+
+##MD
+### Check yourself
+1. What is the PVC name for the Pod `mysql-2` with a template named `data`?
+<details><summary>Answer</summary><code>data-mysql-2</code> (template name + "-" + Pod name).</details>
+
+2. Why do StatefulSets keep PVCs when you scale down?
+<details><summary>Answer</summary>Safety. Data is important; Kubernetes never deletes it automatically unless you set <code>persistentVolumeClaimRetentionPolicy</code> to Delete.</details>
+
+3. Why does a StatefulSet need a headless Service?
+<details><summary>Answer</summary>It gives each Pod a stable DNS name (<code>mysql-0.mysql</code>), so clients and replicas can reach a specific Pod.</details>
+
+##MD
+---
+# Topic 6 — Volume snapshots
+
+### What is it?
+A **VolumeSnapshot** is a point-in-time copy of a PVC, made by the storage system (for example an OCI Block Volume backup). You can create a **new PVC from a snapshot**.
+
+Three objects (same pattern as PV/PVC/StorageClass):
+| Object | Like | Scope |
+|---|---|---|
+| `VolumeSnapshotClass` | StorageClass | cluster |
+| `VolumeSnapshot` | PVC (user request) | namespace |
+| `VolumeSnapshotContent` | PV (the real snapshot) | cluster |
+
+### Why do we need it?
+- Fast backup before a risky change (upgrade, schema migration).
+- Clone production data into a test namespace.
+- Backup tools (Velero, **Commvault**, Kasten) use snapshots as their first step.
+
+### How it works internally
+```
+ VolumeSnapshot (source: PVC csi-data)
+     |
+ snapshot-controller (cluster-wide)  -> creates VolumeSnapshotContent
+     |
+ csi-snapshotter sidecar (in the driver) -> CreateSnapshot gRPC -> storage backend
+     |                                                       (OCI: block volume backup)
+ readyToUse: true
+     |
+ New PVC with dataSource: {kind: VolumeSnapshot, name: ...} -> provisioner creates disk FROM snapshot
+```
+Important: a snapshot is **crash-consistent** (like pulling the power cable). For databases, flush or freeze first, or the snapshot may need crash recovery.
+
+### Real production scenario
+Before upgrading MySQL from 8.0 to 8.4 on OKE, you snapshot `data-mysql-0`. The upgrade fails. You create a new PVC from the snapshot and start MySQL 8.0 again. Downtime: minutes, not hours.
+
+##MD
+### Hands-on lab 6 — snapshot and restore a CSI volume
+
+This needs the CSI hostpath driver and snapshot controller from Topic 4. First create a **VolumeSnapshotClass**.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl get crd volumesnapshots.snapshot.storage.k8s.io >/dev/null 2>&1 || { echo "Snapshot CRDs missing: run Topic 4 first"; exit 1; }
+kubectl get pvc csi-data >/dev/null 2>&1 || { echo "PVC csi-data missing: run Topic 4 lab first"; exit 1; }
+echo "Ready for snapshots"
+
+##CODE
+%%writefile labs/05/snapshot.yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: lab05-snapclass       # cluster-wide
+driver: hostpath.csi.k8s.io   # must match the CSI driver of the PVC
+deletionPolicy: Delete        # delete backend snapshot when VolumeSnapshot is deleted (Retain also exists)
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: csi-data-snap-v1
+  namespace: lab-05
+spec:
+  volumeSnapshotClassName: lab05-snapclass
+  source:
+    persistentVolumeClaimName: csi-data   # the PVC to snapshot
+
+##CODE
+%%bash
+kubectl apply -f labs/05/snapshot.yaml
+for i in $(seq 1 30); do
+  r=$(kubectl get volumesnapshot csi-data-snap-v1 -o jsonpath='{.status.readyToUse}')
+  [ "$r" = "true" ] && break; sleep 2
+done
+kubectl get volumesnapshot csi-data-snap-v1
+kubectl get volumesnapshotcontent
+
+##MD
+**Expected output**
+```
+NAME               READYTOUSE   SOURCEPVC   RESTORESIZE   SNAPSHOTCLASS     SNAPSHOTCONTENT        AGE
+csi-data-snap-v1   true         csi-data    1Gi           lab05-snapclass   snapcontent-7d2a...    6s
+NAME                   READYTOUSE   RESTORESIZE   DELETIONPOLICY   DRIVER                ...
+snapcontent-7d2a...    true         1073741824    Delete           hostpath.csi.k8s.io
+```
+Now simulate a mistake: overwrite the file. Then restore the snapshot into a **new PVC** and mount it.
+
+##CODE
+%%bash
+kubectl exec csi-app -- sh -c "echo 'OOPS: data destroyed by bad deploy' > /data/file.txt; cat /data/file.txt"
+
+##CODE
+%%writefile labs/05/restore.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-data-restored
+  namespace: lab-05
+spec:
+  storageClassName: csi-hostpath-sc
+  dataSource:                       # create this disk FROM a snapshot
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: csi-data-snap-v1
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi                  # must be >= snapshot restoreSize
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restore-check
+  namespace: lab-05
+spec:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: csi-data-restored
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "cat /data/file.txt; sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
+##CODE
+%%bash
+kubectl apply -f labs/05/restore.yaml
+kubectl wait --for=condition=Ready pod/restore-check --timeout=180s
+echo "Restored content:"; kubectl logs restore-check
+echo "Current (broken) content:"; kubectl exec csi-app -- cat /data/file.txt
+
+##MD
+**Expected output**
+```
+Restored content:
+version 1 of important data
+Current (broken) content:
+OOPS: data destroyed by bad deploy
+```
+The snapshot kept the good version.
+
+### Troubleshooting snapshots
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no matches for kind "VolumeSnapshot"` | Snapshot CRDs not installed | Install external-snapshotter CRDs |
+| VolumeSnapshot never `readyToUse` | snapshot-controller missing, or driver has no snapshot support | Check `kube-system` snapshot-controller, `csi-snapshotter` logs |
+| Error: driver mismatch | VolumeSnapshotClass `driver` differs from PVC's driver | Use matching class |
+| Restored PVC Pending | Size smaller than `restoreSize`, or different StorageClass driver | Request >= restoreSize, same driver |
+| Restored DB needs recovery / is corrupted | Crash-consistent snapshot of a busy DB | Freeze/flush first (`FLUSH TABLES WITH READ LOCK`, `fsfreeze`) or use logical backup |
+
+### Lab vs Production
+| Lab | Production (OKE) |
+|---|---|
+| hostpath snapshot = copy of a directory on the same node | OCI Block Volume backup stored in Object Storage, survives node and volume loss |
+| `deletionPolicy: Delete` | Often `Retain` for backup classes, plus lifecycle/retention rules |
+| Manual snapshot | Scheduled by a backup tool (Commvault, Velero) with app hooks |
+
+##MD
+### Check yourself
+1. Which object is like a PV for snapshots?
+<details><summary>Answer</summary><code>VolumeSnapshotContent</code>.</details>
+
+2. How do you restore a snapshot?
+<details><summary>Answer</summary>Create a new PVC with <code>dataSource</code> pointing to the VolumeSnapshot. Snapshots never overwrite the original PVC in place.</details>
+
+3. Is a snapshot of a running MySQL always consistent?
+<details><summary>Answer</summary>No. It is crash-consistent. Use pre-snapshot hooks (flush/lock, fsfreeze) or a logical dump for application consistency.</details>
+
+##MD
+---
+# Topic 7 — Backup and restore
+
+### What is it?
+A **backup** is a copy of data **and** Kubernetes objects stored **outside** the cluster, so you can restore after a disaster. Three common methods:
+
+| Method | What it copies | Example tools |
+|---|---|---|
+| **Logical backup** | data exported by the app (SQL dump) | `mysqldump` Job/CronJob, `pg_dump` |
+| **Snapshot-based backup** | whole disk via CSI snapshots, then copied out | Commvault, Velero with CSI, Kasten |
+| **Object (manifest) backup** | Deployments, Services, Secrets, PVC definitions | Velero, Commvault, GitOps repo |
+
+### Why do we need it?
+A snapshot on the same storage system is **not a backup** if the whole region or account is lost. A YAML-only backup has no data. You need **data + objects**, stored off-cluster, and **tested restores**.
+
+### How it works internally — Commvault-style CSI snapshot flow
+You already run Commvault for Kubernetes. Under the hood it does roughly this:
+```
+ 1. Discover:   list namespaces, PVCs, objects via the Kubernetes API (service account + RBAC)
+ 2. Pre-hook:   optional command in the app pod (e.g. FLUSH TABLES / fsfreeze) for consistency
+ 3. Snapshot:   create VolumeSnapshot for each PVC  (CSI snapshotter -> OCI block volume backup)
+ 4. Post-hook:  unfreeze the app
+ 5. Copy out:   create a temporary PVC FROM the snapshot, mount it in a worker pod,
+                stream files to the backup media (e.g. OCI Object Storage bucket)
+ 6. Cleanup:    delete the temp PVC and (optionally) the snapshot
+ 7. Metadata:   save object YAML (Deployments, Secrets, PVC specs) with the backup
+ Restore = recreate objects + new PVCs filled from backup data (in same or another cluster/region)
+```
+**Velero** does the same: it stores manifests in object storage, and either CSI snapshots or file-level copies (Kopia "data mover") of volumes.
+
+### Real production scenario
+Ransomware or a bad script deletes the namespace `payments` on OKE in Jeddah. Snapshots in the same compartment are deleted too. Your backup copy in an Object Storage bucket in Riyadh (with retention lock) is untouched. You restore the namespace into the DR cluster in Riyadh.
+
+##MD
+### Hands-on lab 7 — logical backup with a mysqldump Job, then restore
+
+We back up the `shop` database from Topic 5 to a backup PVC. In production the target is object storage (OCI bucket), not a PVC in the same cluster.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl get pod mysql-0 >/dev/null 2>&1 || { echo "Run Topic 5 lab first (mysql-0 missing)"; exit 1; }
+
+##CODE
+%%writefile labs/05/backup-job.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-backups
+  namespace: lab-05
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mysql-backup-manual
+  namespace: lab-05
+spec:
+  backoffLimit: 2                 # retry at most 2 times on failure
+  ttlSecondsAfterFinished: 3600   # auto-delete the Job 1 hour after it finishes
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: mysql-backups
+      containers:
+        - name: dump
+          image: mysql:8.4          # same client version as the server
+          env:
+            - name: MYSQL_PWD       # mysql clients read the password from this env var (no -p on cmdline)
+              valueFrom:
+                secretKeyRef: {name: mysql-root, key: password}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              FILE=/backups/all-$(date +%Y%m%d-%H%M%S).sql.gz
+              # --single-transaction: consistent InnoDB dump without locking tables
+              mysqldump -h mysql-0.mysql -uroot --all-databases --single-transaction --routines --events | gzip > "$FILE"
+              sha256sum "$FILE" > "$FILE.sha256"   # checksum to verify later
+              ls -lh /backups
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+
+##CODE
+%%bash
+kubectl apply -f labs/05/backup-job.yaml
+kubectl wait --for=condition=complete job/mysql-backup-manual --timeout=180s
+kubectl logs job/mysql-backup-manual
+
+##MD
+**Expected output**
+```
+job.batch/mysql-backup-manual condition met
+total 1M
+-rw-r--r-- 1 root root 1.1M Oct 27 11:00 all-20261027-110000.sql.gz
+-rw-r--r-- 1 root root  103 Oct 27 11:00 all-20261027-110000.sql.gz.sha256
+```
+Now simulate data loss and restore with a second Job.
+
+##CODE
+%%bash
+kubectl exec mysql-0 -- mysql -uroot -p'Lab-Root-Only-123' -e "DROP DATABASE shop;" 2>/dev/null
+kubectl exec mysql-0 -- mysql -uroot -p'Lab-Root-Only-123' -e "SHOW DATABASES LIKE 'shop';" 2>/dev/null
+echo "(empty above = shop database is gone)"
+
+##CODE
+%%writefile labs/05/restore-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mysql-restore
+  namespace: lab-05
+spec:
+  backoffLimit: 0                 # do not retry a restore automatically
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: mysql-backups
+      containers:
+        - name: restore
+          image: mysql:8.4
+          env:
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef: {name: mysql-root, key: password}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              LATEST=$(ls -1t /backups/*.sql.gz | head -1)
+              echo "Verifying $LATEST"
+              sha256sum -c "$LATEST.sha256"        # stop if the file is corrupted
+              echo "Restoring $LATEST"
+              gunzip -c "$LATEST" | mysql -h mysql-0.mysql -uroot
+              echo "Restore done"
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+
+##CODE
+%%bash
+kubectl apply -f labs/05/restore-job.yaml
+kubectl wait --for=condition=complete job/mysql-restore --timeout=180s
+kubectl logs job/mysql-restore
+kubectl exec mysql-0 -- mysql -uroot -p'Lab-Root-Only-123' -e "SELECT * FROM shop.orders;" 2>/dev/null
+
+##MD
+**Expected output**
+```
+Verifying /backups/all-20261027-110000.sql.gz
+/backups/all-20261027-110000.sql.gz: OK
+Restoring /backups/all-20261027-110000.sql.gz
+Restore done
+id	item
+1	laptop
+2	phone
+```
+To run the backup every night, wrap the Job template in a **CronJob** (`schedule: "0 1 * * *"`, `concurrencyPolicy: Forbid`). You will do this in the assignment.
+
+### Velero — the main concepts (not installed here)
+```
+velero install --provider aws --plugins velero/velero-plugin-for-aws \
+  --bucket k8s-backups --backup-location-config region=me-jeddah-1,s3ForcePathStyle=true,s3Url=https://<namespace>.compat.objectstorage.me-jeddah-1.oraclecloud.com \
+  --features=EnableCSI --use-node-agent          # OCI Object Storage via its S3-compatible API
+velero backup create shop-daily --include-namespaces lab-05 --snapshot-move-data
+velero restore create --from-backup shop-daily --namespace-mappings lab-05:lab-05-restore
+```
+- `BackupStorageLocation`: where manifests + data go (bucket).
+- `--snapshot-move-data`: take a CSI snapshot, then copy the data into the bucket (real off-cluster backup).
+- Schedules: `velero schedule create daily --schedule "0 1 * * *" ...`
+
+### Troubleshooting backups
+| Symptom | Cause | Fix |
+|---|---|---|
+| Dump Job fails `Access denied` | Wrong password / user privileges | Use a dedicated backup user with `SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, PROCESS` |
+| Dump Job `Unknown MySQL server host` | Wrong DNS name | Use `<pod>.<headless-svc>` or the Service name |
+| Restore "works" but app data is old | You restored an old file | Name files with timestamps, keep a catalog, verify checksums |
+| Backups succeed but nobody tested restore | No restore drills | Schedule monthly restore tests into a separate namespace/cluster |
+| Backup PVC lost with the cluster | Backup stored in the same cluster | Ship to object storage in another region |
+
+### Lab vs Production
+| This lab | Production |
+|---|---|
+| Backup to a PVC in the same cluster | Backup to OCI Object Storage (other region), with retention and immutability |
+| Root user | Dedicated least-privilege backup user |
+| Manual Job | CronJob or Commvault/Velero schedule, alert on failure |
+| One restore test | Regular documented restore drills with measured RTO/RPO |
+
+##MD
+### Check yourself
+1. Why is a CSI snapshot alone not a full DR backup?
+<details><summary>Answer</summary>It usually stays in the same storage system/region/account. If that is lost or compromised, the snapshot is lost too. Copy the data off-cluster and off-region.</details>
+
+2. What does `--single-transaction` do in mysqldump?
+<details><summary>Answer</summary>It takes a consistent snapshot of InnoDB tables using a transaction, without locking tables for the whole dump.</details>
+
+3. Name the two things a complete Kubernetes backup must contain.
+<details><summary>Answer</summary>The data (volumes / DB dumps) and the Kubernetes objects (manifests: Deployments, Services, Secrets, PVC specs, etc.).</details>
+
+##MD
+---
+# Topic 8 — Storage troubleshooting
+
+You already saw small tables per topic. Here we **reproduce** the four most common real problems.
+
+### The investigation method
+```
+ 1. kubectl get pvc,pv              -> STATUS? Pending / Bound / Released / Lost
+ 2. kubectl describe pvc <name>     -> Events: provisioning errors, waiting for consumer
+ 3. kubectl describe pod <name>     -> Events: FailedScheduling, FailedAttachVolume, FailedMount
+ 4. kubectl get volumeattachment    -> attached to which node?
+ 5. CSI controller / node plugin logs
+ 6. Node: lsblk, mount, dmesg (via debug pod or SSH)
+```
+
+##MD
+### Problem A — PVC stuck in Pending (no matching storage)
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: broken-a, namespace: lab-05}
+spec:
+  storageClassName: fast-ssd        # this class does NOT exist
+  accessModes: ["ReadWriteOnce"]
+  resources: {requests: {storage: 1Gi}}
+EOF
+sleep 3
+kubectl get pvc broken-a
+kubectl describe pvc broken-a | tail -3
+
+##MD
+**Expected output**
+```
+NAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+broken-a   Pending                                      fast-ssd
+  Warning  ProvisioningFailed  ...  storageclass.storage.k8s.io "fast-ssd" not found
+```
+**Fix:** use an existing class (`kubectl get sc`). `storageClassName` cannot be changed on an existing PVC, so delete and recreate it.
+
+### Problem B — Wrong access mode
+local-path supports only `ReadWriteOnce`. Ask for `ReadWriteMany`:
+
+##CODE
+%%bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: broken-b, namespace: lab-05}
+spec:
+  storageClassName: standard
+  accessModes: ["ReadWriteMany"]     # local-path cannot do RWX
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: broken-b-pod, namespace: lab-05}
+spec:
+  volumes: [{name: d, persistentVolumeClaim: {claimName: broken-b}}]
+  containers: [{name: c, image: busybox:1.36, command: ["sleep","3600"], volumeMounts: [{name: d, mountPath: /d}]}]
+EOF
+sleep 15
+kubectl get pvc broken-b
+kubectl describe pvc broken-b | grep -iE 'warning|error' | tail -2
+
+##MD
+**Expected output**
+```
+broken-b   Pending ...  standard
+  Warning  ProvisioningFailed ... NodePath only supports ReadWriteOnce and ReadWriteOncePod (1.22+) access modes
+```
+**Fix:** Block storage is RWO. For RWX use a file system: OCI File Storage (FSS) CSI, NFS, EFS, Azure Files.
+
+### Problem C — Multi-Attach error (explained) and node affinity conflict (reproduced)
+**Multi-Attach error** happens with network block disks (OCI Block Volume, EBS):
+```
+Warning FailedAttachVolume  Multi-Attach error for volume "pvc-..." Volume is already used by pod(s) web-6d8..., exclusively attached to node A
+```
+Typical cause: a **Deployment** with an RWO PVC and `strategy: RollingUpdate`. The new Pod starts on node B while the old Pod still holds the disk on node A.
+Fixes: use `strategy: Recreate` for single-replica apps with RWO volumes; use a StatefulSet; or use RWX storage. After a node crash, the attach is released only after the node is confirmed gone (Kubernetes waits ~6 min, or the node gets the `node.kubernetes.io/out-of-service` taint).
+
+local-path disks cannot "attach", so on kind we see the **local** version of this problem: a second Pod that must run on another node cannot use the disk.
+
+##CODE
+%%bash
+kubectl get pvc dyn-data >/dev/null 2>&1 || { echo "Run Topic 3 lab first"; exit 1; }
+DISK_NODE=$(kubectl get pod dyn-writer -o jsonpath='{.spec.nodeName}')
+OTHER=$( [ "$DISK_NODE" = "learn-worker" ] && echo learn-worker2 || echo learn-worker )
+echo "Disk lives on $DISK_NODE. Forcing a second pod onto $OTHER ..."
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: broken-c, namespace: lab-05}
+spec:
+  nodeSelector: {kubernetes.io/hostname: $OTHER}
+  volumes: [{name: d, persistentVolumeClaim: {claimName: dyn-data}}]
+  containers: [{name: c, image: busybox:1.36, command: ["sleep","3600"], volumeMounts: [{name: d, mountPath: /d}]}]
+EOF
+sleep 5
+kubectl get pod broken-c
+kubectl describe pod broken-c | grep -A2 FailedScheduling | head -3
+
+##MD
+**Expected output**
+```
+broken-c   0/1   Pending ...
+  Warning  FailedScheduling ... 0/3 nodes are available: 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) had volume node affinity conflict, 1 node(s) had untolerated taint ...
+```
+**Fix:** let the scheduler choose the node (remove the forced `nodeSelector`), or use storage that is not node-bound.
+
+### Problem D — Reclaim policy surprise
+The default class has `reclaimPolicy: Delete`. Deleting a PVC **deletes the data**. Watch:
+
+##CODE
+%%bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: precious, namespace: lab-05}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: {requests: {storage: 100Mi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: precious-pod, namespace: lab-05}
+spec:
+  volumes: [{name: d, persistentVolumeClaim: {claimName: precious}}]
+  containers: [{name: c, image: busybox:1.36, command: ["sh","-c","echo important > /d/x; sleep 3600"], volumeMounts: [{name: d, mountPath: /d}]}]
+EOF
+kubectl wait --for=condition=Ready pod/precious-pod --timeout=90s
+PV=$(kubectl get pvc precious -o jsonpath='{.spec.volumeName}')
+echo "PV is $PV, policy: $(kubectl get pv $PV -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')"
+kubectl delete pod precious-pod --wait=true; kubectl delete pvc precious --wait=true
+sleep 5
+kubectl get pv "$PV" 2>&1 | tail -1
+
+##MD
+**Expected output**
+```
+PV is pvc-3e..., policy: Delete
+Error from server (NotFound): persistentvolumes "pvc-3e..." not found
+```
+The PV **and the data** are gone. **Protection for important data:**
+- Use a `Retain` StorageClass for databases, or patch an existing PV:
+  `kubectl patch pv <pv> -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'`
+- Kubernetes has a safety net: `kubernetes.io/pvc-protection` finalizer stops a PVC from being deleted **while a Pod uses it**. It does not protect after the Pod is gone.
+
+### Full troubleshooting table
+| Symptom | Cause | Fix |
+|---|---|---|
+| PVC Pending, `storageclass not found` | Typo/missing class | Recreate PVC with valid class |
+| PVC Pending, `only supports ReadWriteOnce` | Access mode not supported by driver | Use RWX-capable storage (FSS/NFS) |
+| Pod Pending, `volume node affinity conflict` | Disk is in another node/zone/AD | Schedule in the same zone/AD; add nodes there |
+| `Multi-Attach error` | RWO disk still attached to another node | `strategy: Recreate`, StatefulSet, or wait/force detach after node is confirmed dead |
+| PVC stuck `Terminating` | Still used by a Pod (pvc-protection finalizer) | Delete the Pod first |
+| Data gone after PVC delete | `reclaimPolicy: Delete` | Use Retain for important data + backups |
+| `MountVolume ... permission denied` | Volume owned by root, app runs as non-root | `securityContext.fsGroup` |
+
+##MD
+---
+# Interview and real-world questions
+
+1. **A Pod using an OCI Block Volume is stuck after its node failed. What happens and how do you speed it up?**
+<details><summary>Answer</summary>The VolumeAttachment still points to the dead node. Kubernetes will not detach until it is sure the node is down (to avoid two writers). After ~6 minutes the attach-detach controller force-detaches. You can speed it up by deleting the dead Node object after confirming it is terminated, or adding the <code>node.kubernetes.io/out-of-service=nodeshutdown:NoExecute</code> taint. Then the disk attaches to the new node.</details>
+
+2. **Deployment vs StatefulSet for a database — what is the storage difference?**
+<details><summary>Answer</summary>A Deployment's replicas share one PVC reference; with RWO this breaks for more than one replica or during rolling updates. A StatefulSet creates one PVC per Pod via volumeClaimTemplates, keeps stable identity and reattaches the same PVC to the same Pod name.</details>
+
+3. **How do you grow a PVC from 50Gi to 100Gi on OKE?**
+<details><summary>Answer</summary>The StorageClass must have <code>allowVolumeExpansion: true</code>. Edit <code>spec.resources.requests.storage</code> on the PVC. The CSI resizer expands the block volume, then the node plugin grows the filesystem (online for oci-bv). You can never shrink a PVC.</details>
+
+4. **Your Commvault Kubernetes backup job fails at the snapshot step. What do you check?**
+<details><summary>Answer</summary>Snapshot CRDs and snapshot-controller exist; a VolumeSnapshotClass exists for the PVC's driver (<code>blockvolume.csi.oraclecloud.com</code>); the backup service account has RBAC for volumesnapshots/volumesnapshotcontents and PVCs; the CSI snapshotter sidecar logs; OCI IAM policy allows volume backups in that compartment; service limits for block volume backups.</details>
+
+5. **What is the difference between `Retain` on a StorageClass and on a VolumeSnapshotClass?**
+<details><summary>Answer</summary>StorageClass <code>reclaimPolicy: Retain</code> keeps the disk when the PVC is deleted. VolumeSnapshotClass <code>deletionPolicy: Retain</code> keeps the backend snapshot when the VolumeSnapshot object is deleted.</details>
+
+6. **Why is emptyDir not good for a database even if the Pod rarely restarts?**
+<details><summary>Answer</summary>Pod deletion, eviction, node drain or rescheduling deletes emptyDir data. Databases need a PVC that outlives the Pod.</details>
+
+##MD
+---
+# Practical Assignment — "Nightly backups for the shop database"
+
+**Scenario:** The shop team runs MySQL (`mysql` StatefulSet in `lab-05`). They lost data last month. Your job:
+
+1. Create a StorageClass `lab05-backup` (local-path, `Retain`).
+2. Create a PVC `shop-backups` (1Gi) using that class.
+3. Create a **CronJob** `mysql-nightly` that runs `mysqldump` for **only** the `shop` database every night at 01:00, writes a gzip file with a timestamp and a sha256 file, and **deletes files older than 7 days**.
+4. The CronJob must never run two backups at the same time and must keep the last 3 successful and 1 failed Job.
+5. Trigger it once by hand and prove the file exists.
+
+**Success criteria**
+- `kubectl get cronjob mysql-nightly` shows schedule `0 1 * * *`.
+- `kubectl create job --from=cronjob/mysql-nightly test-run` completes.
+- The log shows a `shop-*.sql.gz` file and its checksum.
+
+**Hints**
+- `concurrencyPolicy`, `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`.
+- `find /backups -name '*.sql.gz*' -mtime +7 -delete`
+- Reuse the Secret `mysql-root` and the env var `MYSQL_PWD`.
+
+<details><summary>Full solution</summary>
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lab05-backup
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: shop-backups, namespace: lab-05}
+spec:
+  storageClassName: lab05-backup
+  accessModes: ["ReadWriteOnce"]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: mysql-nightly, namespace: lab-05}
+spec:
+  schedule: "0 1 * * *"
+  timeZone: "Asia/Riyadh"            # supported since Kubernetes 1.27
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          volumes: [{name: b, persistentVolumeClaim: {claimName: shop-backups}}]
+          containers:
+            - name: dump
+              image: mysql:8.4
+              env:
+                - name: MYSQL_PWD
+                  valueFrom: {secretKeyRef: {name: mysql-root, key: password}}
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  F=/backups/shop-$(date +%Y%m%d-%H%M%S).sql.gz
+                  mysqldump -h mysql-0.mysql -uroot --single-transaction --routines shop | gzip > "$F"
+                  sha256sum "$F" > "$F.sha256"
+                  find /backups -name '*.sql.gz*' -mtime +7 -delete
+                  ls -lh /backups
+              volumeMounts: [{name: b, mountPath: /backups}]
+```
+```bash
+kubectl apply -f solution.yaml
+kubectl create job --from=cronjob/mysql-nightly test-run
+kubectl wait --for=condition=complete job/test-run --timeout=180s
+kubectl logs job/test-run
+```
+</details>
+
+##MD
+---
+# "Break it" challenge
+
+Your colleague applied this. The Pod never starts. Find **all** problems before opening the answer. You can apply it to see the errors.
+
+##CODE
+%%writefile labs/05/break-it.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: web-data
+  namespace: lab-05
+spec:
+  storageClassName: Standard
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: lab-05
+spec:
+  volumes:
+    - name: content
+      persistentVolumeClaim:
+        claimName: web-data
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      volumeMounts:
+        - name: web-content
+          mountPath: /usr/share/nginx/html
+
+##CODE
+%%bash
+kubectl apply -f labs/05/break-it.yaml 2>&1
+sleep 5
+kubectl get pvc web-data 2>&1; kubectl get pod web 2>&1
+
+##MD
+<details><summary>Answer</summary>
+
+1. `volumeMounts[].name: web-content` does not match `volumes[].name: content`. The API server rejects the Pod: `volumeMounts[0].name: Not found: "web-content"`.
+2. `storageClassName: Standard` — names are **case-sensitive**; the class is `standard`. PVC stays Pending with "not found".
+3. `ReadWriteMany` is not supported by local-path (and not by block storage in general). Use `ReadWriteOnce`.
+
+Fixed version: class `standard`, `accessModes: ["ReadWriteOnce"]`, mount name `content`. Note: you must delete and recreate the PVC, because `storageClassName` and `accessModes` cannot be edited after creation.
+</details>
+
+##MD
+---
+# Cleanup
+
+This deletes the lab namespace (Pods, PVCs, snapshots), the cluster-wide objects we created, and the CSI hostpath driver. It also resets your default namespace.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }
+kubectl delete namespace lab-05 --wait=true --timeout=180s
+kubectl delete storageclass lab05-retain lab05-backup --ignore-not-found
+kubectl delete volumesnapshotclass lab05-snapclass --ignore-not-found 2>/dev/null || true
+kubectl delete pv lab05-local-pv --ignore-not-found
+# Retained PVs from the lab05-retain class are now Released; delete them too
+for pv in $(kubectl get pv -o jsonpath='{range .items[?(@.status.phase=="Released")]}{.metadata.name}{" "}{end}'); do
+  [ "$(kubectl get pv $pv -o jsonpath='{.spec.claimRef.namespace}')" = "lab-05" ] && kubectl delete pv "$pv"
+done
+docker exec learn-worker rm -rf /mnt/disks/vol1
+# Remove CSI hostpath driver (keep snapshot CRDs/controller: later notebooks may use them)
+[ -d labs/05/csi-driver-host-path ] && ./labs/05/csi-driver-host-path/deploy/kubernetes-latest/destroy.sh 2>/dev/null || true
+kubectl delete storageclass csi-hostpath-sc --ignore-not-found
+kubectl config set-context --current --namespace=default
+echo "Cleanup done"
+
+##MD
+---
+**Next notebook:** [06-Config-and-Secrets.ipynb](06-Config-and-Secrets.ipynb) — ConfigMaps, Secrets, External Secrets and encryption at rest.

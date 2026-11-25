@@ -1,0 +1,1637 @@
+##MD
+# Phase 14: Production Kubernetes Architecture
+
+**What you will learn**
+- How to make a cluster highly available (HA): control plane, etcd quorum, workers
+- How to spread workloads across zones, availability domains (ADs) and fault domains (FDs)
+- How to design node pools, load balancers, private clusters and secure access
+- How to design ingress, autoscaling, disaster recovery (DR), backup and restore
+- How to upgrade a cluster with zero downtime
+- How to run many clusters and many tenants
+- How to control cost and plan capacity with real numbers
+- A full Production Readiness Review (PRR) checklist you can use at work
+
+**Time:** 8–12 hours (do it over several days)
+
+**Prerequisites:** Notebooks 00–13. kind cluster `learn` exists. Docker Desktop has at least **8 GB RAM** for the HA lab (Settings → Resources).
+
+**How to use this notebook**
+1. Read each "What / Why / How" part first. Do not skip the diagrams.
+2. Run the cells in order. Read "Expected output" and compare.
+3. Answer every "Check yourself" quiz **before** you open the answer.
+4. This phase is mostly **design**. Many sections are design exercises. Write your answer in a text file before you read the model answer.
+
+> **Word list (used a lot in this notebook)**
+> - **HA (high availability):** the system keeps working when one part fails.
+> - **SPOF (single point of failure):** one part that, if it fails, stops everything.
+> - **RPO (Recovery Point Objective):** how much data you can lose (time). RPO 15 min = you can lose the last 15 minutes of data.
+> - **RTO (Recovery Time Objective):** how long the service can be down. RTO 1 h = service must be back within 1 hour.
+> - **Quorum:** the minimum number of members that must agree before a change is accepted.
+
+##MD
+## Safety check
+
+The local labs must only run on kind clusters. This cell stops if your current context is something else (for example a real OKE cluster).
+
+##CODE
+%%bash
+mkdir -p labs/14          # %%writefile needs the folder to exist
+ctx=$(kubectl config current-context 2>/dev/null)
+echo "Current context: $ctx"
+case "$ctx" in
+  kind-learn|kind-ha-lab) echo "OK: local kind cluster";;
+  *) echo "STOP: switch to a kind cluster first: kubectl config use-context kind-learn"; exit 1;;
+esac
+
+##MD
+---
+# Topic 1: Highly Available Clusters
+
+### What is it?
+An HA cluster has **no single point of failure**. If one control plane node, one etcd member or one worker dies, the cluster and the apps keep running.
+
+### Why do we need it?
+With one control plane node:
+- If it dies, you **cannot deploy, scale or heal** anything. Running Pods keep running, but nobody fixes them when they crash on a dead node.
+- If its disk dies and you have no etcd backup, you **lose the whole cluster state**.
+
+### How it works internally
+
+The control plane has 4 main parts:
+
+| Part | Stateless? | How HA works |
+|---|---|---|
+| kube-apiserver | Yes | Run 3+ copies behind a load balancer. All are active. |
+| kube-scheduler | Yes | Run 3 copies. **Leader election**: only one is active, the others wait. |
+| kube-controller-manager | Yes | Same: leader election through a `Lease` object. |
+| etcd | **No, it stores state** | Raft consensus. Needs a **quorum** (majority) of members. |
+
+##MD
+### Stacked etcd vs external etcd
+
+```
+STACKED etcd (kubeadm default, simpler)        EXTERNAL etcd (more nodes, more isolation)
+
+        +-------------------+                         +-------------------+
+        |   Load Balancer   | :6443                   |   Load Balancer   | :6443
+        +---------+---------+                         +---------+---------+
+      +-----------+-----------+                     +-----------+-----------+
+      |           |           |                     |           |           |
+ +----v----+ +----v----+ +----v----+           +----v----+ +----v----+ +----v----+
+ | CP-1    | | CP-2    | | CP-3    |           | CP-1    | | CP-2    | | CP-3    |
+ | apiserver| apiserver| apiserver |           | apiserver| apiserver| apiserver |
+ | sched   | | sched   | | sched   |           | sched   | | sched   | | sched   |
+ | ctrl-mgr| | ctrl-mgr| | ctrl-mgr|           | ctrl-mgr| | ctrl-mgr| | ctrl-mgr|
+ | etcd    | | etcd    | | etcd    |           +----+----+ +----+----+ +----+----+
+ +---------+ +---------+ +---------+                |           |           |
+                                               +----v----+ +----v----+ +----v----+
+ Lose 1 node = lose 1 apiserver AND            | etcd-1  | | etcd-2  | | etcd-3  |
+ 1 etcd member at the same time.               +---------+ +---------+ +---------+
+                                               6 machines. A CP node failure does
+                                               not touch etcd.
+```
+
+| | Stacked | External |
+|---|---|---|
+| Machines | 3 | 6 (3 CP + 3 etcd) |
+| Setup | Simple (kubeadm default) | More work, more certificates |
+| Failure coupling | CP node loss = etcd member loss | Independent |
+| Used by | Most self-managed clusters | Very large clusters, strict isolation |
+
+In **managed Kubernetes** (OKE, EKS, AKS, GKE) the provider runs the control plane and etcd for you. You still must understand this, because you design everything around it.
+
+##MD
+### Quorum math (very important)
+
+etcd uses the **Raft** algorithm. A write is accepted only when a **majority** of members save it.
+
+**Quorum = floor(N / 2) + 1**
+
+| Members (N) | Quorum | Failures tolerated |
+|---|---|---|
+| 1 | 1 | 0 |
+| 2 | 2 | **0** (worse than 1! two machines that can fail) |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 (no gain over 3) |
+| 5 | 3 | 2 |
+| 7 | 4 | 3 |
+
+**Rules:**
+- Always use an **odd** number: 3 or 5.
+- More members = slower writes (more machines must agree). 5 is the normal maximum.
+- Put members in **different zones / fault domains**. 3 members in one zone = one zone outage kills quorum.
+
+**Two zones problem:** with 3 members across 2 zones, one zone has 2 members. If that zone fails you lose quorum. This is why HA designs want **3 zones** (or 3 fault domains in a single-AD OCI region like Jeddah or Riyadh).
+
+##MD
+### Real production scenario
+A company ran a self-managed cluster with 1 control plane VM. A kernel patch made the VM fail to boot. Apps kept running for 3 hours. Then a worker node died. Its Pods were never rescheduled because the controller manager was down. The website went down. Recovery took 6 hours because the last etcd backup was 2 weeks old.
+
+**Fix:** 3 control plane nodes in 3 fault domains, load balancer in front of the API, etcd snapshots every hour to object storage, tested restore every quarter.
+
+##MD
+### Hands-on lab: build an HA cluster with kind
+
+kind can create **3 control plane nodes** with stacked etcd, plus a load balancer container (`haproxy`) in front of them.
+
+> **RAM warning:** this cluster uses about 5–6 GB. Close other heavy apps. You can delete the `learn` cluster temporarily if needed (`kind delete cluster --name learn`) and recreate it later from notebook 00.
+
+##CODE
+%%writefile labs/14/kind-ha.yaml
+# kind cluster with 3 control planes (stacked etcd) and 3 workers
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ha-lab
+nodes:
+  - role: control-plane      # each control-plane node runs apiserver, scheduler, controller-manager AND etcd (stacked)
+  - role: control-plane
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-a   # we fake zones with labels so we can practice topology spread
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-b
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-c
+
+##MD
+Create the cluster. kind automatically adds an `external-load-balancer` container because there is more than one control plane. This takes 2–4 minutes.
+
+##CODE
+%%bash
+mkdir -p labs/14
+kind create cluster --config labs/14/kind-ha.yaml
+kubectl config use-context kind-ha-lab
+kubectl get nodes -o wide
+
+##MD
+**Expected output** (names may differ):
+```
+NAME                    STATUS   ROLES           AGE   VERSION
+ha-lab-control-plane    Ready    control-plane   2m    v1.3x.x
+ha-lab-control-plane2   Ready    control-plane   2m    v1.3x.x
+ha-lab-control-plane3   Ready    control-plane   1m    v1.3x.x
+ha-lab-worker           Ready    <none>          1m    v1.3x.x
+ha-lab-worker2          Ready    <none>          1m    v1.3x.x
+ha-lab-worker3          Ready    <none>          1m    v1.3x.x
+```
+
+Now look at the load balancer container and the etcd members.
+
+##CODE
+%%bash
+echo "== Docker containers (note the external-load-balancer) =="
+docker ps --format '{{.Names}}\t{{.Ports}}' | grep ha-lab
+echo
+echo "== Which address does kubectl talk to? =="
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'; echo
+echo
+echo "== etcd Pods (one per control plane) =="
+kubectl -n kube-system get pods -l component=etcd -o wide
+
+##MD
+`kubectl` talks to the **load balancer port**, not to one control plane. That is why one control plane can die without breaking `kubectl`.
+
+Now list etcd members from inside one etcd Pod:
+
+##CODE
+%%bash
+POD=$(kubectl -n kube-system get pods -l component=etcd -o jsonpath='{.items[0].metadata.name}')
+kubectl -n kube-system exec "$POD" -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list -w table
+
+##MD
+**Expected:** a table with 3 members, all `started`.
+
+### Leader election
+Only one scheduler and one controller-manager are active. They hold a **Lease** object. Let us see who the leader is.
+
+##CODE
+%%bash
+kubectl -n kube-system get lease kube-scheduler kube-controller-manager \
+  -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity,RENEWED:.spec.renewTime
+
+##MD
+### Failure test: kill one control plane
+
+We stop one control plane container. We expect:
+- `kubectl` still works (load balancer sends traffic to the other two).
+- etcd still has quorum (2 of 3).
+- If the stopped node was the leader, another node takes the lease within ~15–30 seconds.
+
+##CODE
+%%bash
+docker stop ha-lab-control-plane2
+sleep 40
+kubectl get nodes
+kubectl -n kube-system get lease kube-scheduler -o jsonpath='{.spec.holderIdentity}'; echo
+kubectl create deployment ha-test --image=nginx --replicas=3 && kubectl rollout status deploy/ha-test --timeout=120s
+
+##MD
+**Expected:** `ha-lab-control-plane2` shows `NotReady`. The Deployment still rolls out. The cluster survived one failure.
+
+Now stop a **second** control plane. With 1 of 3 etcd members left, there is **no quorum**. Writes must fail.
+
+##CODE
+%%bash
+docker stop ha-lab-control-plane3
+sleep 20
+timeout 20 kubectl scale deploy/ha-test --replicas=5 || echo ">>> Write FAILED as expected: etcd lost quorum (1 of 3)"
+
+##MD
+Bring them back. etcd members rejoin and quorum returns.
+
+##CODE
+%%bash
+docker start ha-lab-control-plane2 ha-lab-control-plane3
+sleep 60
+kubectl get nodes
+kubectl scale deploy/ha-test --replicas=5 && kubectl get deploy ha-test
+
+##MD
+### Troubleshooting HA control planes
+
+| Symptom | Likely cause | Check |
+|---|---|---|
+| `kubectl` timeouts sometimes | One apiserver unhealthy but LB still sends traffic | LB health check must use `/readyz`, not just TCP |
+| `etcdserver: request timed out` | Slow disk, or lost quorum | `etcdctl endpoint status`, disk fsync latency metric `etcd_disk_wal_fsync_duration_seconds` |
+| Two schedulers act at once | Never happens if leases work; check clock skew | NTP/chrony on all nodes |
+| Cannot add etcd member | Old member still listed | `etcdctl member remove <id>` then re-add |
+
+### Lab vs Production
+
+| | This lab | Production |
+|---|---|---|
+| Control plane | 3 containers on 1 laptop | 3 VMs in 3 FDs/zones, or managed (OKE/EKS/AKS/GKE) |
+| Load balancer | haproxy container | Cloud NLB/LB with `/readyz` health check |
+| etcd backup | None | Hourly snapshot to object storage, encrypted, restore tested |
+| Zones | Fake labels | Real zones / ADs / FDs |
+
+##MD
+### Production questions
+- **Production-suitable?** 3 CP across 3 failure domains + LB + etcd backups = yes. The kind lab = no (one laptop).
+- **Security risks:** etcd holds all Secrets. Encrypt at rest (`EncryptionConfiguration`), restrict port 2379/2380 to CP nodes only.
+- **Node failure:** 1 of 3 CP fails → no impact. 2 of 3 → API read-only/unavailable, apps keep running but nothing heals.
+- **Scaling:** add workers freely. Do not grow etcd beyond 5.
+- **Monitoring:** `etcd_server_has_leader`, `etcd_mvcc_db_total_size_in_bytes`, apiserver `apiserver_request_duration_seconds`, certificate expiry.
+- **Backup / recovery:** etcd snapshot + restore runbook (Topic 9).
+- **Cost:** 3 extra VMs for self-managed. Managed control planes cost a fixed fee (or are free in some providers' basic tiers).
+
+##MD
+### Check yourself
+1. You have 4 etcd members. How many failures can you tolerate?
+2. Why is a TCP health check on port 6443 not enough for the API load balancer?
+3. Scheduler leader dies. What happens to Pods that are already running?
+
+<details><summary>Answer</summary>
+
+1. **1.** Quorum of 4 is 3. So 4 is no better than 3, and has one more machine that can fail.
+2. The port can be open while the apiserver cannot reach etcd. `/readyz` checks etcd and other dependencies, so the LB removes a broken apiserver.
+3. Nothing. Running Pods are managed by kubelet on each node. Only **new** Pods wait for scheduling until a new leader takes the lease (seconds).
+</details>
+
+##MD
+---
+# Topic 2: Multi-Node and Multi-Zone Design
+
+### What is it?
+Spreading nodes and Pods across **failure domains** so one failure does not take all replicas.
+
+### Failure domains in each cloud
+
+| Cloud | Big domain (separate data centers) | Small domain (inside a data center) |
+|---|---|---|
+| AWS | Availability Zone (AZ) | — (use placement groups) |
+| Azure | Availability Zone | Fault/Update domains (availability sets) |
+| GCP | Zone | — |
+| **OCI** | **Availability Domain (AD)** | **Fault Domain (FD)**: 3 per AD |
+
+**Important for you:** OCI Jeddah (`me-jeddah-1`) and Riyadh (`me-riyadh-1`) are **single-AD regions**. Inside one AD you spread across the **3 fault domains**. Fault domains protect against hardware and rack failure, **not** against a full data center outage. For that you need a second region (DR, Topic 8).
+
+### Well-known node labels
+Kubernetes uses standard labels. Cloud providers set them for you:
+- `topology.kubernetes.io/region` — e.g. `me-jeddah-1`
+- `topology.kubernetes.io/zone` — AD or zone. On OKE single-AD regions all nodes have the same AD value.
+- `oci.oraclecloud.com/fault-domain` — on OKE, the fault domain (e.g. `FAULT-DOMAIN-1`)
+- `kubernetes.io/hostname` — the node
+
+##MD
+### How Pods get spread
+
+```
+                     Deployment: web, replicas=6
+                               |
+              topologySpreadConstraints (maxSkew=1, zone)
+                               |
+     +-------------------------+-------------------------+
+     |                         |                         |
+ zone-a (FD-1)             zone-b (FD-2)             zone-c (FD-3)
+ +---------+              +---------+              +---------+
+ | web web |              | web web |              | web web |
+ +---------+              +---------+              +---------+
+ Lose zone-a -> 4 of 6 replicas still serve traffic.
+```
+
+Without a spread rule, the scheduler may put all 6 on the emptiest node.
+
+### Lab: topology spread across fake zones
+
+##CODE
+%%writefile labs/14/spread.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1                                  # difference between the most and least loaded zone can be at most 1
+          topologyKey: topology.kubernetes.io/zone    # spread by zone label
+          whenUnsatisfiable: DoNotSchedule            # hard rule. Use ScheduleAnyway for a soft rule
+          labelSelector:
+            matchLabels: {app: web}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname         # also spread across nodes
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: web}
+      containers:
+        - name: web
+          image: nginx:1.27
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/14/spread.yaml
+kubectl rollout status deploy/web --timeout=120s
+echo "== Pods per zone =="
+for n in $(kubectl get pods -l app=web -o jsonpath='{.items[*].spec.nodeName}'); do
+  kubectl get node $n -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}'
+done | sort | uniq -c
+
+##MD
+**Expected:** `2 zone-a`, `2 zone-b`, `2 zone-c`.
+
+Now simulate a **zone outage**: cordon and drain the zone-a worker.
+
+##CODE
+%%bash
+NODE=$(kubectl get nodes -l topology.kubernetes.io/zone=zone-a -o jsonpath='{.items[0].metadata.name}')
+kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --timeout=60s
+sleep 5
+kubectl get pods -l app=web -o wide
+kubectl get deploy web
+
+##MD
+**What happened?** With `DoNotSchedule` and `maxSkew: 1`, the 2 evicted Pods can only go where skew stays ≤1. zone-a now has 0 nodes eligible, so kube-scheduler ignores that domain for skew (domains with no eligible nodes are not counted). The Pods land in zone-b and zone-c. Check: are all 6 Running? If some are `Pending`, read the event with `kubectl describe pod` — this is a classic interview topic.
+
+Undo:
+
+##CODE
+%%bash
+NODE=$(kubectl get nodes -l topology.kubernetes.io/zone=zone-a -o jsonpath='{.items[0].metadata.name}')
+kubectl uncordon "$NODE"
+kubectl get nodes
+
+##MD
+> **Note:** Kubernetes does **not** move Pods back after the zone returns. The spread is fixed only on new scheduling. Use a rollout restart or the `descheduler` project to rebalance.
+
+### Production design rules
+- Minimum **3 replicas** for anything critical, spread over 3 domains.
+- Use **zone/FD spread (hard)** + **hostname spread (soft)**.
+- Stateful sets with zonal disks: a block volume lives in **one AD/zone**. A Pod with that volume can only run in that zone. On OKE, block volumes are per-AD, so in a single-AD region they can attach to any FD. In multi-AD regions plan StatefulSet replicas per AD.
+
+### Check yourself
+Why is `whenUnsatisfiable: DoNotSchedule` on hostname dangerous with 6 replicas and 3 nodes during a node drain?
+
+<details><summary>Answer</summary>
+After one node is drained, only 2 nodes remain. 6 Pods on 2 nodes = 3 each. Skew vs the drained node is not counted, so it can work, but if you also have maxSkew on hostname with other constraints (or 4 nodes and one tainted) Pods can become Pending and block the drain or leave you under capacity. Use hard rules only on the domain you really need (zone/FD) and soft rules on hostname.
+</details>
+
+##MD
+---
+# Topic 3: Production Control Plane
+
+### What you design (self-managed or managed)
+
+| Area | Production choice |
+|---|---|
+| Count | 3 (or 5 for very large clusters) |
+| Placement | 1 per zone / FD |
+| API access | Private endpoint, LB with `/readyz` check |
+| etcd | SSD/NVMe disks, dedicated, low latency (<10 ms fsync), encrypted at rest |
+| Certificates | Auto-rotation; alert 30 days before expiry |
+| Audit logging | API audit policy → log system (who did what) |
+| Admission | Pod Security Admission, policy engine (Kyverno/Gatekeeper) |
+| Versions | Supported minor version (Kubernetes supports the last 3 minors, ~14 months each) |
+
+### Managed control planes: what you still own
+Even on OKE you still own:
+- API endpoint exposure (public vs private) and NSG rules
+- IAM policies and RBAC
+- Kubernetes version upgrades (you trigger them)
+- Add-ons (CoreDNS, CNI, autoscaler)
+- Everything on worker nodes and in the cluster
+
+### Check yourself
+Your OKE cluster API endpoint is public with `0.0.0.0/0` allowed. What two changes do you make first?
+
+<details><summary>Answer</summary>
+1. Move to a **private API endpoint** (in a private subnet) or at minimum restrict the endpoint NSG to known admin CIDRs.
+2. Access via **OCI Bastion service** or a VPN/jump host, and enforce IAM + RBAC with short-lived tokens (`oci ce cluster generate-token`).
+</details>
+
+##MD
+---
+# Topic 4: Worker Node Architecture and Node Pools
+
+### What is a node pool?
+A **node pool** is a group of worker nodes with the **same shape, image and labels**. You use several pools for different jobs.
+
+```
+                          Cluster
+   +--------------------------------------------------------------+
+   |  system pool (3 nodes, 2 OCPU/16GB)  taint: CriticalAddonsOnly|
+   |    CoreDNS, ingress controller, metrics-server, autoscaler    |
+   |--------------------------------------------------------------|
+   |  app pool (3-12 nodes, 4 OCPU/32GB)  autoscaled               |
+   |    web, api, workers                                          |
+   |--------------------------------------------------------------|
+   |  memory pool (2-6 nodes, E5.Flex 8 OCPU/128GB) taint: mem=true|
+   |    caches, JVM apps                                           |
+   |--------------------------------------------------------------|
+   |  batch / preemptible pool (0-20 nodes)  taint: spot=true      |
+   |    jobs that can be killed                                    |
+   +--------------------------------------------------------------+
+```
+
+### Why separate a system pool?
+If an app has a memory leak and fills an app node, the kernel kills processes. If CoreDNS runs on that node, **DNS breaks for the whole cluster**. Putting system add-ons on their own tainted pool protects them.
+
+### Lab: system pool with taint + toleration
+
+We pretend `ha-lab-worker3` is the system pool.
+
+##CODE
+%%bash
+kubectl label node ha-lab-worker3 pool=system --overwrite
+kubectl taint node ha-lab-worker3 CriticalAddonsOnly=true:NoSchedule --overwrite
+kubectl get nodes -L pool
+
+##CODE
+%%writefile labs/14/system-addon.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-addon
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fake-addon}
+  template:
+    metadata:
+      labels: {app: fake-addon}
+    spec:
+      priorityClassName: system-cluster-critical   # high priority: evicts lower pods if node is full
+      nodeSelector:
+        pool: system                                # must run on the system pool
+      tolerations:
+        - key: CriticalAddonsOnly                   # allowed on the tainted node
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/14/system-addon.yaml
+kubectl -n kube-system rollout status deploy/fake-addon --timeout=60s
+kubectl -n kube-system get pod -l app=fake-addon -o wide
+echo "== App pods must NOT be on worker3 =="
+kubectl rollout restart deploy/web && kubectl rollout status deploy/web --timeout=120s
+kubectl get pods -l app=web -o wide | awk '{print $7}' | sort | uniq -c
+
+##MD
+**Expected:** fake-addon runs on `ha-lab-worker3`. No `web` Pod runs there.
+
+### Node sizing: small vs big nodes
+
+| | Many small nodes | Few big nodes |
+|---|---|---|
+| Blast radius of 1 node failure | Small | Large |
+| Overhead (kubelet, DaemonSets, OS) | High % | Low % |
+| Pod density limit | Hit max Pods per node (OKE VCN-native: limited by VNICs/IPs) | Fine |
+| Bin packing | Wastes resources if pods are big | Better |
+| Autoscaling granularity | Fine | Coarse |
+
+**Rule of thumb:** no node should hold more than ~1/3 of an app's replicas, and losing one node should not drop you below N-1 capacity. Typical app pool node: 4–8 OCPU, 32–64 GB.
+
+### Check yourself
+Why should DaemonSets (log agent, node exporter) tolerate **all** taints?
+
+<details><summary>Answer</summary>
+They must run on **every** node, including tainted system, memory and spot pools. Otherwise those nodes have no logs or metrics. Use `tolerations: [{operator: Exists}]`.
+</details>
+
+##MD
+---
+# Topic 5: Load Balancers (L4 vs L7)
+
+### What is it?
+A load balancer (LB) spreads traffic over many backends.
+
+| | Layer 4 (L4) | Layer 7 (L7) |
+|---|---|---|
+| Sees | IP + port (TCP/UDP) | HTTP: host, path, headers, cookies |
+| Can do | Forward packets, keep client IP | TLS termination, path routing, WAF, redirects |
+| OCI | **Network Load Balancer (NLB)** | **Load Balancer (LB)** (flexible shape) |
+| AWS | NLB | ALB |
+| K8s object | `Service type: LoadBalancer` | Ingress / Gateway (via controller) or LB annotations |
+
+### How Kubernetes uses them
+
+```
+Internet
+   |
+[ OCI NLB / LB ]   <- created by the cloud controller manager (CCM) for a Service type=LoadBalancer
+   |  health check NodePort on each node
+   v
++--------+  +--------+  +--------+
+| node-1 |  | node-2 |  | node-3 |   kube-proxy / CNI forwards NodePort -> Pod
++--------+  +--------+  +--------+
+```
+
+**`externalTrafficPolicy`:**
+- `Cluster` (default): any node accepts traffic and forwards to a Pod on any node. Extra hop. **Client IP is lost** (SNAT).
+- `Local`: only nodes with a ready Pod pass the health check. **Client IP is kept**. No extra hop. Risk: uneven load if Pods are not spread.
+
+### OKE annotations you will use often
+
+```yaml
+metadata:
+  annotations:
+    oci.oraclecloud.com/load-balancer-type: "nlb"                     # NLB instead of LB
+    service.beta.kubernetes.io/oci-load-balancer-internal: "true"     # private LB (classic LB)
+    oci-network-load-balancer.oraclecloud.com/internal: "true"        # private NLB
+    oci.oraclecloud.com/oci-network-security-groups: "ocid1.networksecuritygroup.oc1..xxx"
+    service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "100"
+    oci.oraclecloud.com/security-rule-management-mode: "NSG"           # let CCM manage NSG rules
+```
+
+### Production scenario
+A team created a new `type: LoadBalancer` Service for every microservice: 25 public LBs. Cost was high and each LB was an attack surface. **Fix:** one public L7 entry (ingress controller behind one NLB, WAF in front), all other Services `ClusterIP`.
+
+##MD
+### Lab: Service type LoadBalancer on kind
+
+kind has no cloud LB. We install **cloud-provider-kind**, which gives LoadBalancer IPs on Docker, so you can see the flow. If you cannot install it, read the YAML and skip to the quiz.
+
+##CODE
+%%bash
+# Installs a small controller that fakes a cloud LB for kind (runs as a local process).
+command -v cloud-provider-kind >/dev/null || brew install cloud-provider-kind || echo "Install failed: read only"
+echo "Run in a separate terminal (needs sudo on macOS):  sudo cloud-provider-kind"
+
+##CODE
+%%writefile labs/14/lb-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+  annotations:
+    oci.oraclecloud.com/load-balancer-type: "nlb"   # ignored by kind; shows how you would ask for an OCI NLB
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local     # keep client IP; only nodes with a web pod are healthy
+  selector: {app: web}
+  ports:
+    - port: 80
+      targetPort: 80
+
+##CODE
+%%bash
+kubectl apply -f labs/14/lb-svc.yaml
+sleep 20
+kubectl get svc web-lb
+echo "healthCheckNodePort (used by cloud LB with policy Local):"
+kubectl get svc web-lb -o jsonpath='{.spec.healthCheckNodePort}'; echo
+
+##MD
+**Expected:** `EXTERNAL-IP` gets an address if cloud-provider-kind runs, else stays `<pending>` (normal on plain kind).
+
+### Check yourself
+You need the real client IP in nginx logs behind an OCI NLB. What do you set?
+
+<details><summary>Answer</summary>
+`externalTrafficPolicy: Local` on the Service (NLB preserves source IP). Spread Pods across nodes so traffic is balanced. For a classic L7 LB, read `X-Forwarded-For` instead.
+</details>
+
+##MD
+---
+# Topic 6: Private Clusters and Secure Access
+
+### What is a private cluster?
+- **API endpoint** is in a **private subnet**, no public IP.
+- **Worker nodes** are in private subnets, no public IPs.
+- Outbound internet through **NAT gateway**; OCI services through **Service Gateway**.
+- Only **load balancers** for public apps sit in a public subnet.
+
+```
+                      OCI VCN 10.0.0.0/16
+ +-------------------------------------------------------------------+
+ |  public LB subnet 10.0.20.0/24   [ Public LB / NLB ] <--- Internet |
+ |-------------------------------------------------------------------|
+ |  private API subnet 10.0.0.0/28  [ K8s API endpoint :6443 ]        |
+ |         ^                                                          |
+ |         |  SSH port-forward session (time limited)                 |
+ |   [ OCI Bastion service ] <--- admin laptop (IAM-authenticated)    |
+ |-------------------------------------------------------------------|
+ |  private worker subnet 10.0.10.0/24   [node][node][node]           |
+ |  private pod subnet 10.0.32.0/19 (VCN-native pod networking)       |
+ +---------------------------+----------------+----------------------+
+                             |                |
+                       NAT Gateway      Service Gateway (OCIR, Object Storage)
+```
+
+### Secure access options
+
+| Option | How | Notes |
+|---|---|---|
+| **OCI Bastion service** (managed) | Create session → SSH port-forward to API private IP:6443 | No VM to patch. Sessions expire (max 3 h). IAM controls who. |
+| Jump host VM | SSH to VM in public subnet, then kubectl | You patch and harden it |
+| VPN / FastConnect | Office network routes to VCN | Best for daily admin |
+| CI/CD agents in VCN | Azure DevOps self-hosted agent in private subnet | Pipelines never need public API |
+
+### Example: kubectl through OCI Bastion (port forwarding)
+
+```bash
+# 1) Create a port-forwarding session to the private API endpoint (replace OCIDs and IP)
+oci bastion session create-port-forwarding \
+  --bastion-id ocid1.bastion.oc1.me-jeddah-1.xxxx \
+  --target-private-ip 10.0.0.5 --target-port 6443 \
+  --ssh-public-key-file ~/.ssh/id_ed25519.pub --session-ttl 10800
+
+# 2) Start the tunnel (command is shown in the session details in the console)
+ssh -i ~/.ssh/id_ed25519 -N -L 6443:10.0.0.5:6443 -p 22 ocid1.bastionsession.oc1...@host.bastion.me-jeddah-1.oci.oraclecloud.com
+
+# 3) Point kubeconfig to localhost; keep TLS name = original endpoint
+kubectl config set-cluster my-oke --server=https://127.0.0.1:6443 --tls-server-name=10.0.0.5
+kubectl get nodes
+```
+
+### Production questions
+- **Security risks** removed: API brute force, scanning, leaked kubeconfig used from anywhere.
+- **New risk:** bastion IAM policy too wide. Limit `manage bastion-session` to an admin group and to one bastion.
+- **Availability:** if bastion service has an issue, use VPN or CI agents. Keep a break-glass path documented.
+
+### Check yourself
+Workers are private. Image pulls from OCIR fail. What is missing?
+
+<details><summary>Answer</summary>
+A route to OCIR: a **Service Gateway** ("All <region> Services in Oracle Services Network") in the worker subnet route table, or a NAT gateway. Also check the worker NSG/security list egress rules.
+</details>
+
+##MD
+---
+# Topic 7: Production Ingress Architecture
+
+### Reference design
+
+```
+ Clients
+   |
+ [ Cloudflare / OCI WAF ]      DDoS, WAF rules, bot protection, TLS at edge
+   |
+ [ OCI NLB (L4, public) ]      1 public IP, preserves client IP
+   |
+ [ ingress-nginx or Gateway API controller ]  3+ replicas, spread across FDs, on system/edge pool
+   |   TLS from cert-manager (Let's Encrypt / internal CA)
+   |   host/path routing, rate limits
+   +-------------------+------------------+
+   |                   |                  |
+ svc: web          svc: api          svc: admin (IP allow-list)
+ (ClusterIP)       (ClusterIP)       (ClusterIP)
+```
+
+### Design decisions
+| Decision | Recommendation |
+|---|---|
+| Controller replicas | 3+, PDB `minAvailable: 2`, spread across FDs |
+| Where | Dedicated edge/system pool |
+| TLS | cert-manager; alert on cert expiry (<14 days) |
+| Public vs private | Two controllers: public class and internal class (private LB) |
+| New API | **Gateway API** is the successor to Ingress (role split: infra team owns Gateway, app team owns HTTPRoute) |
+| Security | Rate limits, request size limits, hide server headers, WAF in front |
+
+### Check yourself
+Why run **two** ingress controllers (public and internal) instead of one with IP allow-lists?
+
+<details><summary>Answer</summary>
+Separation: internal apps are never reachable from the internet even if someone makes a mistake in an allow-list annotation. Internal controller sits behind a **private** LB. Also you can scale and upgrade them separately.
+</details>
+
+##MD
+---
+# Topic 8: Autoscaling Architecture
+
+### Three layers
+
+```
+  Load goes up
+      |
+  [1] HPA (Horizontal Pod Autoscaler)   adds Pods based on CPU / memory / custom metrics
+      |  new Pods cannot fit -> Pending
+  [2] Cluster Autoscaler (or Karpenter)  sees Pending Pods -> adds nodes to the node pool
+      |  node boots (2-5 min on cloud)
+  [3] Scheduler places Pending Pods on new nodes
+
+  Load goes down
+  HPA removes Pods -> nodes become underused (<50% requests) for 10 min
+  -> Cluster Autoscaler drains and removes the node (respects PDBs)
+```
+
+### Key points
+- Cluster Autoscaler looks at **requests**, not real usage. No requests = autoscaler is blind.
+- Scale-up time = HPA reaction (15–30 s) + node boot (2–5 min) + image pull. For sudden spikes keep **headroom**: over-provisioning with a low-priority "balloon" Deployment that is evicted first.
+- `minReplicas` covers the normal load; `maxReplicas` protects your budget.
+- HPA `behavior` slows scale-down to avoid flapping.
+- On OKE: the **Cluster Autoscaler add-on** manages node pools; set min/max per pool.
+
+### Over-provisioning pattern (headroom)
+
+##CODE
+%%writefile labs/14/overprovision.yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: overprovisioning
+value: -10                      # lower than default (0): these pods are evicted first
+globalDefault: false
+description: "Placeholder pods that reserve headroom"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: balloon
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: balloon}
+  template:
+    metadata:
+      labels: {app: balloon}
+    spec:
+      priorityClassName: overprovisioning
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}   # size of the headroom you want to keep warm
+
+##MD
+When a real Pod needs space, the scheduler **preempts** (evicts) a balloon Pod immediately. The balloon becomes Pending, which makes the Cluster Autoscaler add a node **in the background**. Real Pods start in seconds, not minutes.
+
+##CODE
+%%bash
+kubectl apply -f labs/14/overprovision.yaml
+kubectl get pods -l app=balloon -o wide
+
+##MD
+### Check yourself
+HPA scaled to 20 Pods but 8 are Pending for 15 minutes. Cluster Autoscaler is installed. List 3 possible reasons.
+
+<details><summary>Answer</summary>
+1. Node pool reached **max** size.
+2. Pods request more than one node can give (e.g. 10 CPU on 8 OCPU nodes) — autoscaler will not add a node that cannot fit them.
+3. Pods have nodeSelector/affinity/toleration that matches no autoscaled pool, or a zonal PVC binds them to a zone with no capacity. Also: cloud quota / service limits reached (check autoscaler logs and events).
+</details>
+
+##MD
+---
+# Topic 9: Backup and Restore (etcd snapshot vs app-level)
+
+### Two kinds of backup
+
+| | etcd snapshot | App-level backup (Velero, Commvault, Kasten) |
+|---|---|---|
+| What | Whole cluster state (all objects) | Selected namespaces/objects + **volume data** |
+| Volume data (PV contents) | **No** | Yes (snapshots or file copy) |
+| Restore granularity | All or nothing | One namespace, one app |
+| Restore to another cluster | Hard (same IPs/certs expected) | Easy — main DR method |
+| Managed K8s (OKE/EKS/…) | You **cannot** access etcd | The only option |
+
+**Lesson:** on managed Kubernetes, your backup is app-level (you already use Commvault for this). On self-managed, do **both**.
+
+### Lab: etcd snapshot on the kind HA cluster
+
+##CODE
+%%bash
+POD=$(kubectl -n kube-system get pods -l component=etcd -o jsonpath='{.items[0].metadata.name}')
+kubectl -n kube-system exec "$POD" -- sh -c '
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /var/lib/etcd/snap.db && ls -lh /var/lib/etcd/snap.db'
+
+##MD
+**Expected:** `Snapshot saved at /var/lib/etcd/snap.db` and a file of a few MB.
+
+**Restore (self-managed, read only — do not run on kind):**
+```bash
+# on every control plane node, with kube-apiserver and etcd stopped:
+etcdutl snapshot restore snap.db --data-dir /var/lib/etcd-restored \
+  --name cp-1 --initial-cluster cp-1=https://10.0.0.11:2380,cp-2=...,cp-3=... \
+  --initial-advertise-peer-urls https://10.0.0.11:2380
+# then point the etcd static pod manifest to /var/lib/etcd-restored and start it
+```
+
+##MD
+---
+# Topic 10: Disaster Recovery (DR)
+
+### What is it?
+DR is how you bring the service back when a **whole region or cluster** is lost.
+
+### DR strategies
+
+| Strategy | Standby cluster | RTO | RPO | Cost |
+|---|---|---|---|---|
+| Backup & restore | None. Build new cluster, restore backup | Hours | Last backup | Low |
+| Pilot light | Small cluster in DR region, scaled down | 30–60 min | Minutes (replication) | Medium |
+| Warm standby | Full cluster, smaller size, apps deployed | 5–15 min | Seconds–minutes | Higher |
+| Active-active | Both regions serve traffic | ~0 | ~0 | Highest, complex data layer |
+
+### Active-passive across OCI regions (your world)
+
+```
+   Jeddah (primary)                               Riyadh (standby)
+ +----------------------+                      +----------------------+
+ | OKE cluster (active) |   GitOps/Helm same    | OKE cluster (standby)|
+ |  apps, ingress       |  ===================> |  apps scaled to 0/1  |
+ +----------+-----------+   manifests in Git    +----------+-----------+
+            |                                              |
+  Block volumes ---- cross-region replication ----> replicas (volume group)
+  DB (MySQL HeatWave / ADB) -- replication / Data Guard --> standby DB
+  Object Storage --- bucket replication -----------> DR bucket
+  Velero/Commvault backups -> Object Storage (replicated)
+            |                                              |
+       DNS (Cloudflare / OCI DNS) health-check failover --> points to Riyadh LB
+```
+
+**OCI Full Stack DR** can orchestrate this: it has **plan groups** for OKE that back up the cluster resources and restore them in the standby cluster, plus volume group switchover, DB role change, and LB/DNS steps — all as one runbook (switchover / failover plan) with prechecks. You know this from your Events CMS work.
+
+### Rules for DR that works
+1. **Infrastructure as Code**: the DR cluster is built from the same Terraform.
+2. **Same manifests**: GitOps (Argo CD) points both clusters at Git.
+3. **Data is the hard part**: decide RPO per data store.
+4. **Region-specific values**: image registry region, secrets, LB OCIDs, DNS names — keep them in per-region values files.
+5. **Test** at least twice a year (game day). Untested DR = no DR.
+
+##MD
+### Lab: Velero backup and restore with MinIO (S3) on kind
+
+**Velero** backs up Kubernetes objects (and volumes) to object storage. Here **MinIO** acts as S3 in the same cluster. In production the target would be OCI Object Storage (S3-compatible API) in the **other region**.
+
+Steps: install MinIO → create bucket → install Velero → deploy an app → backup → delete the namespace (disaster) → restore.
+
+##CODE
+%%bash
+command -v velero >/dev/null || brew install velero
+velero version --client-only
+
+##CODE
+%%writefile labs/14/minio.yaml
+apiVersion: v1
+kind: Namespace
+metadata: {name: minio}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: minio, namespace: minio}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: minio}}
+  template:
+    metadata: {labels: {app: minio}}
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - {name: MINIO_ROOT_USER, value: minio}          # lab only. Production: never hardcode credentials
+            - {name: MINIO_ROOT_PASSWORD, value: minio12345}
+          ports: [{containerPort: 9000}]
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes: [{name: data, emptyDir: {}}]                  # lab only: data lost if pod restarts
+---
+apiVersion: v1
+kind: Service
+metadata: {name: minio, namespace: minio}
+spec:
+  selector: {app: minio}
+  ports: [{port: 9000, targetPort: 9000}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: make-bucket, namespace: minio}
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          command: ["sh", "-c", "mc alias set m http://minio:9000 minio minio12345 && mc mb -p m/velero"]
+
+##CODE
+%%bash
+kubectl apply -f labs/14/minio.yaml
+kubectl -n minio rollout status deploy/minio --timeout=180s
+kubectl -n minio wait --for=condition=complete job/make-bucket --timeout=180s
+printf '[default]\naws_access_key_id = minio\naws_secret_access_key = minio12345\n' > labs/14/velero-creds
+
+##MD
+Install Velero into the cluster. Flags:
+- `--provider aws` + AWS plugin: uses the S3 API (MinIO and OCI Object Storage both speak S3).
+- `s3ForcePathStyle=true`: needed for MinIO and OCI.
+- `--use-node-agent`: file-level backup of volume data (kopia), since kind has no snapshot support.
+
+##CODE
+%%bash
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.10.0 \
+  --bucket velero \
+  --secret-file labs/14/velero-creds \
+  --use-volume-snapshots=false \
+  --use-node-agent \
+  --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc:9000
+kubectl -n velero rollout status deploy/velero --timeout=180s
+sleep 15
+velero backup-location get
+
+##MD
+**Expected:** backup location `default` with phase `Available`.
+
+Now create an app with a ConfigMap and a volume with data.
+
+##CODE
+%%bash
+kubectl create namespace shop
+kubectl -n shop create configmap settings --from-literal=currency=SAR
+kubectl -n shop create deployment shop --image=nginx:1.27 --replicas=2
+kubectl -n shop expose deployment shop --port=80
+kubectl -n shop rollout status deploy/shop --timeout=120s
+kubectl -n shop get all,cm
+
+##CODE
+%%bash
+# Back up the whole namespace
+velero backup create shop-backup --include-namespaces shop --wait
+velero backup describe shop-backup | head -30
+
+##MD
+**Disaster:** someone deletes the namespace.
+
+##CODE
+%%bash
+kubectl delete namespace shop --wait=true
+kubectl get ns shop || echo ">>> namespace is gone"
+
+##CODE
+%%bash
+velero restore create shop-restore --from-backup shop-backup --wait
+kubectl -n shop get all,cm
+kubectl -n shop get cm settings -o jsonpath='{.data.currency}'; echo
+
+##MD
+**Expected:** Deployment, Service, Pods and ConfigMap are back. `currency` = `SAR`.
+
+**In production (OCI):**
+- Backup location: OCI Object Storage, S3 endpoint `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com`, customer secret keys, bucket in the **DR region** (or replicated).
+- Schedule: `velero schedule create daily --schedule="0 1 * * *" --ttl 720h`.
+- Restore drill into the **standby cluster** in Riyadh. Change region-specific values (LB annotations, storage class) with Velero **resource modifiers** or Helm values.
+
+### Troubleshooting DR / backups
+| Symptom | Cause |
+|---|---|
+| Backup location `Unavailable` | Wrong S3 URL, keys, bucket, or no network route (Service Gateway) |
+| Restore: PVC Pending | StorageClass name differs in target cluster → use storage class mapping ConfigMap |
+| Restore: Service has old LB IP/OCID annotations | Clean region-specific annotations before restore |
+| Pods start but app broken | Data store not restored / DB still points to primary |
+
+### Check yourself
+Your RTO is 30 minutes and RPO is 5 minutes for the shop database. Daily Velero backups only. Do you meet it?
+
+<details><summary>Answer</summary>
+No. Daily backups give RPO up to 24 hours, and building/restoring takes time. You need **continuous database replication** (e.g. MySQL HeatWave cross-region replica / Data Guard) for RPO 5 min, and a **pre-built standby cluster** with manifests already applied (warm standby / Full Stack DR plan) for RTO 30 min. Velero/Commvault stay as the safety net for config and object restore.
+</details>
+
+##MD
+---
+# Topic 11: Cluster Upgrades
+
+### Version skew policy (Kubernetes v1.30+)
+- Kubernetes releases a minor version about every **4 months**. Each is supported ~**14 months**.
+- **Upgrade one minor version at a time** (1.29 → 1.30 → 1.31). Never skip.
+- `kube-apiserver` instances may differ by at most **1 minor** during the upgrade.
+- **kubelet** may be up to **3 minors older** than the apiserver (since v1.28), never newer.
+- `kubectl` should be within ±1 minor of the apiserver.
+- **Order:** control plane first → then node pools.
+
+```
+ Step 1: Read release notes, check deprecated APIs (kubent / pluto)
+ Step 2: Upgrade control plane  (managed: one click/API call)    v1.30 -> v1.31
+ Step 3: Upgrade add-ons (CNI, CoreDNS, CSI, ingress) to compatible versions
+ Step 4: Node pools, one at a time:
+           new node pool v1.31  OR  surge replace in place
+           cordon old node -> drain (respects PDB) -> delete
+ Step 5: Verify, then repeat for next minor
+```
+
+### Two node pool methods
+| Method | How | Pros | Cons |
+|---|---|---|---|
+| **Blue/green node pool** | Create new pool on new version, drain old pool, delete it | Easy rollback (old pool still there) | Temporary double cost, quota |
+| **In-place surge** (OKE "cycle nodes" with maxSurge/maxUnavailable) | Replace nodes one by one | Less capacity needed | Rollback is slower |
+
+### Lab: cordon and drain workers on the HA cluster
+We cannot change kind's Kubernetes version in place, but we practice the **drain process**, which is what keeps apps alive during upgrades. First add a PodDisruptionBudget (PDB).
+
+##CODE
+%%writefile labs/14/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-pdb
+spec:
+  minAvailable: 4          # at least 4 of 6 web pods must stay up during voluntary disruptions (drain)
+  selector:
+    matchLabels: {app: web}
+
+##CODE
+%%bash
+kubectl apply -f labs/14/pdb.yaml
+kubectl get pdb web-pdb
+for n in ha-lab-worker ha-lab-worker2; do
+  echo "=== Upgrading (simulated) $n ==="
+  kubectl cordon $n                                   # 1. no new pods here
+  kubectl drain $n --ignore-daemonsets --delete-emptydir-data --timeout=120s   # 2. evict pods, PDB is respected
+  echo "   ...here you would upgrade/replace the node..."
+  kubectl uncordon $n                                 # 3. back in service
+  kubectl rollout status deploy/web --timeout=120s
+done
+kubectl get pods -l app=web -o wide
+
+##MD
+**Watch:** during each drain, `kubectl get pdb` shows `ALLOWED DISRUPTIONS`. If it is 0, drain **waits** — that is the PDB protecting you.
+
+### Common upgrade failures
+| Problem | Cause | Fix |
+|---|---|---|
+| Drain hangs forever | PDB `minAvailable` = replicas (0 disruptions allowed), or single-replica app with PDB | Fix PDB (use maxUnavailable: 1), scale up first |
+| Apps fail after upgrade | Removed API version (e.g. old `flowcontrol` or `autoscaling/v2beta2`) | Scan manifests before upgrade (`pluto detect-all-in-cluster`) |
+| Node not Ready after upgrade | CNI version incompatible | Upgrade CNI add-on first |
+| Webhook timeouts block everything | Admission webhook Pods were on drained node | Run webhooks with 2+ replicas + PDB, `failurePolicy` thought through |
+
+### Check yourself
+Cluster is v1.29. Target v1.32. Node pools are v1.29. Write the order.
+
+<details><summary>Answer</summary>
+CP 1.29→1.30 → CP 1.30→1.31 → CP 1.31→1.32 (kubelets at 1.29 are still within 3 minors of 1.32, so allowed) → upgrade add-ons → node pools to 1.32 (blue/green). Check deprecated APIs before each control plane step. Many teams also upgrade nodes at each step to keep skew small.
+</details>
+
+##MD
+---
+# Topic 12: Zero-Downtime Deployments
+
+### Why do users see errors during a rollout?
+When a Pod is deleted, two things happen **in parallel**:
+1. kubelet sends `SIGTERM` to the container.
+2. The endpoint controller removes the Pod from the Service; kube-proxy / ingress / cloud LB update **a few seconds later**.
+
+If the app exits immediately on SIGTERM, traffic still arriving in those seconds gets **connection refused / 502**.
+
+```
+ t=0   Pod marked Terminating
+        |-- SIGTERM to app ----------> app stops (BAD if instant)
+        |-- endpoints updated -> kube-proxy/ingress update (takes 1-10 s)
+ Fix:  preStop: sleep 10  -> app keeps serving while endpoints update
+       then SIGTERM -> app finishes in-flight requests -> exits
+       terminationGracePeriodSeconds must be > preStop + shutdown time
+```
+
+### The 5 ingredients
+1. **readinessProbe**: new Pod gets traffic only when really ready.
+2. **RollingUpdate** with `maxUnavailable: 0`, `maxSurge: 25%`.
+3. **preStop** hook (sleep) to wait for endpoint removal.
+4. **terminationGracePeriodSeconds** big enough.
+5. **PDB** for drains and node upgrades.
+
+##CODE
+%%writefile labs/14/zero-downtime.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zdt
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0          # never go below 3 ready pods
+      maxSurge: 1                # create 1 new pod at a time
+  selector:
+    matchLabels: {app: zdt}
+  template:
+    metadata:
+      labels: {app: zdt}
+    spec:
+      terminationGracePeriodSeconds: 40     # > preStop (10s) + app shutdown time
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports: [{containerPort: 80}]
+          readinessProbe:                   # only ready pods are in Service endpoints
+            httpGet: {path: /, port: 80}
+            periodSeconds: 2
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]   # keep serving while endpoints are removed
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: zdt}
+spec:
+  selector: {app: zdt}
+  ports: [{port: 80, targetPort: 80}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: zdt}
+spec:
+  maxUnavailable: 1
+  selector: {matchLabels: {app: zdt}}
+
+##MD
+Test: run a load loop from inside the cluster while we roll out a new version. Count failed requests.
+
+##CODE
+%%bash
+kubectl apply -f labs/14/zero-downtime.yaml
+kubectl rollout status deploy/zdt --timeout=120s
+kubectl run loadtest --image=busybox:1.36 --restart=Never -- sh -c \
+  'ok=0; fail=0; end=$(( $(date +%s) + 60 )); while [ $(date +%s) -lt $end ]; do if wget -q -T 2 -O /dev/null http://zdt; then ok=$((ok+1)); else fail=$((fail+1)); fi; done; echo "OK=$ok FAIL=$fail"'
+sleep 5
+kubectl set image deploy/zdt web=nginx:1.27-alpine
+kubectl rollout status deploy/zdt --timeout=180s
+sleep 45
+kubectl logs loadtest
+kubectl delete pod loadtest --now
+
+##MD
+**Expected:** `FAIL=0` (or very close). Try again after removing `preStop` and setting `maxUnavailable: 1`: failures usually appear.
+
+### Check yourself
+Your app needs 50 s to finish long uploads. preStop sleeps 10 s. What grace period do you set?
+
+<details><summary>Answer</summary>
+At least 60 s (10 s preStop + 50 s drain), plus a small buffer, e.g. 70 s. The grace period timer **includes** the preStop time. After it ends, the container is killed with SIGKILL.
+</details>
+
+##MD
+---
+# Topic 13: Multi-Cluster Architecture
+
+### Why more than one cluster?
+- **DR** (second region)
+- **Blast radius**: a bad cluster-wide change (CRD, CNI, admission webhook) hits only one cluster
+- **Environments**: dev / staging / prod separated
+- **Compliance / tenancy**: data must stay in a country or tenancy
+- **Scale limits**: one cluster has limits (nodes, Pods, etcd size)
+
+### Patterns
+| Pattern | How |
+|---|---|
+| Same app, many clusters | Argo CD ApplicationSet with a cluster generator |
+| Global traffic | DNS-based failover / geo routing (Cloudflare LB, OCI DNS traffic steering) |
+| Cross-cluster service calls | Service mesh multi-cluster (Istio, Cilium Cluster Mesh) — adds complexity |
+| Central observability | Prometheus per cluster → Thanos/Mimir central (you run Thanos already) |
+| Central policy | Same Kyverno/Gatekeeper policies from Git |
+
+```
+                Git (manifests, Helm values per cluster)
+                         |
+                    Argo CD (mgmt cluster)
+           +-------------+--------------+
+           |             |              |
+      prod-jeddah   prod-riyadh(DR)   nonprod
+           |             |              |
+     Prometheus     Prometheus     Prometheus  --remote_write/sidecar--> Thanos -> Grafana
+```
+
+### Check yourself
+Name one big risk of a single "mega cluster" for all environments.
+
+<details><summary>Answer</summary>
+A cluster-wide failure or mistake (bad CNI upgrade, broken admission webhook, API overload from a dev job, etcd full) takes down **prod and dev together**. Also RBAC mistakes can expose prod to dev users.
+</details>
+
+##MD
+---
+# Topic 14: Multi-Tenant Kubernetes
+
+### Soft vs hard multi-tenancy
+
+| | Namespace per tenant (soft) | Cluster per tenant (hard) |
+|---|---|---|
+| Isolation | Logical (shared kernel, shared control plane) | Strong |
+| Cost | Low (shared nodes, one control plane) | High |
+| Ops effort | One cluster to upgrade | N clusters (need automation) |
+| Noisy neighbor | Controlled with quotas | None |
+| Good for | Teams of one company | Untrusted tenants, strict compliance |
+
+### The 5 controls for namespace-per-tenant
+1. **Namespace** per tenant
+2. **RBAC**: tenant group → `edit` role only in its namespace
+3. **ResourceQuota + LimitRange**: cap CPU/memory/objects
+4. **NetworkPolicy**: default deny, allow only same namespace + ingress controller
+5. **Pod Security Admission**: `restricted` level
+
+### Lab: create a tenant
+
+##CODE
+%%writefile labs/14/tenant.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    tenant: a
+    pod-security.kubernetes.io/enforce: restricted     # block privileged/root pods
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: quota, namespace: tenant-a}
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "40"
+    services.loadbalancers: "0"     # tenants may not create public LBs
+    persistentvolumeclaims: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: defaults, namespace: tenant-a}
+spec:
+  limits:
+    - type: Container
+      default: {cpu: 500m, memory: 512Mi}          # limit if not set
+      defaultRequest: {cpu: 100m, memory: 128Mi}   # request if not set
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: tenant-a}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-same-ns, namespace: tenant-a}
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}                   # pods in the same namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx   # the ingress controller namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: tenant-a-edit, namespace: tenant-a}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit                                # built-in role: manage apps, not RBAC or quotas
+subjects:
+  - kind: Group
+    name: tenant-a-devs                     # in OKE, map to an OCI IAM group OCID
+    apiGroup: rbac.authorization.k8s.io
+
+##CODE
+%%bash
+kubectl apply -f labs/14/tenant.yaml
+echo "== Can tenant-a-devs create a deployment in tenant-a? =="
+kubectl auth can-i create deployments -n tenant-a --as=someone --as-group=tenant-a-devs
+echo "== In default namespace? =="
+kubectl auth can-i create deployments -n default --as=someone --as-group=tenant-a-devs
+echo "== Try a LoadBalancer service (quota = 0) =="
+kubectl -n tenant-a create service loadbalancer bad --tcp=80:80 2>&1 | tail -1
+echo "== Try a privileged pod (PSA restricted) =="
+kubectl -n tenant-a run priv --image=nginx --privileged 2>&1 | tail -2
+
+##MD
+**Expected:** `yes`, `no`, LB creation `forbidden: exceeded quota`, privileged Pod `forbidden: violates PodSecurity "restricted"`.
+
+> **Note:** kind's default CNI (kindnet) does **not** enforce NetworkPolicy. The policy objects are created but not enforced. In production use a CNI that enforces them (Calico, Cilium; OKE flannel needs Calico added; OKE VCN-native supports network policies via Calico).
+
+### Check yourself
+Which namespace-level controls stop tenant A from starving tenant B of CPU?
+
+<details><summary>Answer</summary>
+ResourceQuota (caps total requests/limits per namespace) + LimitRange (forces default requests/limits so every Pod is counted). Optionally PriorityClasses and dedicated node pools with taints for big tenants.
+</details>
+
+##MD
+---
+# Topic 15: Cost Optimization
+
+### Where Kubernetes money goes
+1. **Over-requested Pods** (requests 2 CPU, uses 0.1) → nodes look full → more nodes.
+2. **Idle node pools** (nonprod running nights and weekends).
+3. **Too many load balancers** and public IPs.
+4. **Unattached block volumes** after PVC deletes (`reclaimPolicy: Retain`) and old snapshots.
+5. **Wrong shapes** (memory-heavy apps on CPU-heavy shapes).
+6. **Logs and metrics** with no retention limits.
+
+### Actions
+| Action | Saving |
+|---|---|
+| Right-size requests using real usage (VPA recommender, Goldilocks, Prometheus p95) | 20–50% nodes |
+| Cluster Autoscaler + sane min sizes | Pay for what is used |
+| Scale nonprod to 0 at night (node pool size 0, or KEDA cron) | ~60% of nonprod |
+| Preemptible / spot nodes for batch and CI | 50% (OCI preemptible) |
+| Flexible shapes (OCPU/memory ratio that fits) | 10–30% |
+| One ingress + NLB instead of LB per service | LB cost per service |
+| Tag everything (cost-center, app, env) and use FOCUS / cost reports | Visibility |
+| Retention for metrics/logs (e.g. Thanos downsampling) | Storage |
+
+### Check yourself
+Nodes are at 85% **requested** CPU but only 15% **used** CPU. What does that mean and what do you do?
+
+<details><summary>Answer</summary>
+Requests are far too high. The autoscaler adds nodes for "reserved" CPU that nobody uses. Measure real p95 usage per container, lower requests (keep ~20–30% headroom), then the autoscaler removes nodes.
+</details>
+
+##MD
+---
+# Topic 16: Capacity Planning (worked example)
+
+### Scenario
+You must host an e-commerce platform:
+
+| App | Replicas (normal) | Replicas (peak) | Request CPU | Request Mem |
+|---|---|---|---|---|
+| web | 6 | 18 | 250m | 512Mi |
+| api | 6 | 24 | 500m | 1Gi |
+| worker | 4 | 10 | 1000m | 2Gi |
+| redis (StatefulSet) | 3 | 3 | 500m | 4Gi |
+
+Node shape: **VM.Standard.E5.Flex, 4 OCPU / 32 GB**. On OCI, 1 OCPU = 2 vCPU, so the node has **8 vCPU = 8000m**.
+
+### Step 1: allocatable per node
+Not all of the node is for Pods. Reserve for OS, kubelet and DaemonSets.
+- kube/system reserved + eviction: about **500m CPU, 2 GiB**
+- DaemonSets (log agent, node exporter, CNI, CSI): about **300m, 768Mi**
+- **Usable for apps: ~7200m CPU, ~29 GiB**
+
+##MD
+### Step 2: total requests at peak
+
+| App | CPU | Memory |
+|---|---|---|
+| web 18 × 250m / 512Mi | 4500m | 9 GiB |
+| api 24 × 500m / 1Gi | 12000m | 24 GiB |
+| worker 10 × 1000m / 2Gi | 10000m | 20 GiB |
+| redis 3 × 500m / 4Gi | 1500m | 12 GiB |
+| **Total** | **28000m** | **65 GiB** |
+
+### Step 3: nodes needed
+- CPU: 28000 / 7200 = **3.9 → 4 nodes**
+- Memory: 65 / 29 = **2.25 → 3 nodes**
+- CPU is the limit → **4 nodes**.
+
+### Step 4: add safety
+- **Target utilization 70%** of requests (room for bin-packing waste and spikes): 4 / 0.7 = 5.7 → **6 nodes**.
+- **N+1 for node failure**: +1 → **7 nodes**.
+- **Spread over 3 FDs**: round to a multiple of 3 → **9 nodes at peak** (3 per FD) — or accept 7 with topology spread soft on hostname.
+
+### Step 5: normal load
+Normal total ≈ web 1500m + api 3000m + worker 4000m + redis 1500m = 10000m → 10000/7200 = 1.4 → with 70% target and N+1 → **3–4 nodes**.
+
+**Answer:** app node pool autoscaling **min 3 (one per FD), max 9**. Plus a separate **system pool of 3 small nodes**. Check OCI **service limits** for 12+ E5 instances and enough IPs in the pod subnet (VCN-native: every Pod uses a VCN IP → 200 Pods need a /24 at least; plan a /19).
+
+##MD
+### Exercise: you do it
+Recalculate for **VM.Standard.E5.Flex 8 OCPU / 64 GB** nodes (allocatable ~15200m, ~60 GiB). How many nodes at peak with 70% target and N+1?
+
+<details><summary>Answer</summary>
+CPU: 28000/15200 = 1.84 → 2. Memory: 65/60 = 1.08 → 2. With 70%: 2/0.7 = 2.86 → 3. N+1 → 4. For 3 FDs → 6 (or accept 4 with soft spread). Bigger nodes = fewer machines but each failure removes 25% of capacity. With 4 nodes, losing one at peak is risky; this is why many teams prefer 4 OCPU nodes here.
+</details>
+
+##MD
+---
+# Topic 17: Production Readiness Review (PRR) Checklist
+
+Use this before any app or cluster goes live. Copy it into your wiki/Azure DevOps. Every "No" needs an owner and a date.
+
+### A. Cluster platform
+| # | Check | Yes/No |
+|---|---|---|
+| A1 | Control plane HA (3 CP or managed) in separate FDs/zones | |
+| A2 | API endpoint private; access via Bastion/VPN; NSG restricted | |
+| A3 | Kubernetes version supported; upgrade plan for next 6 months | |
+| A4 | Separate system and app node pools; system pool tainted | |
+| A5 | Cluster autoscaler configured with min/max per pool; service limits checked | |
+| A6 | Pod subnet size enough for max Pods (VCN-native IP planning) | |
+| A7 | CNI enforces NetworkPolicy | |
+| A8 | etcd encryption at rest / Secrets encryption (KMS/Vault keys for managed) | |
+| A9 | Audit logs enabled and shipped | |
+| A10 | Infrastructure as Code (Terraform) for cluster, node pools, network | |
+
+### B. Security
+| # | Check | Yes/No |
+|---|---|---|
+| B1 | RBAC least privilege; no `cluster-admin` for humans day to day; groups mapped to IAM | |
+| B2 | Pod Security Admission `restricted` (or `baseline` with exceptions) | |
+| B3 | Images from trusted private registry, scanned, signed; no `:latest` | |
+| B4 | Containers run as non-root, read-only root FS, drop capabilities | |
+| B5 | Secrets from a secret manager (External Secrets → OCI Vault); not in Git | |
+| B6 | Default-deny NetworkPolicy per namespace | |
+| B7 | Workload identity instead of static cloud keys | |
+| B8 | WAF / DDoS protection in front of public endpoints | |
+
+### C. Workload reliability
+| # | Check | Yes/No |
+|---|---|---|
+| C1 | ≥3 replicas for critical services, topology spread across FDs/zones | |
+| C2 | Requests and limits set (memory limit = request for critical apps) | |
+| C3 | Readiness, liveness (and startup) probes correct | |
+| C4 | preStop + terminationGracePeriodSeconds tuned; graceful shutdown tested | |
+| C5 | PDB for every multi-replica service | |
+| C6 | HPA with tested min/max; scale-up time measured | |
+| C7 | Dependencies (DB, cache, external APIs) have timeouts, retries, circuit breakers | |
+
+### D. Observability
+| # | Check | Yes/No |
+|---|---|---|
+| D1 | Metrics scraped (app + kube-state-metrics + node exporter) | |
+| D2 | Dashboards: golden signals (latency, traffic, errors, saturation) | |
+| D3 | Alerts with runbooks; routed to on-call; tested | |
+| D4 | Central logs with retention; searchable by namespace/pod/trace id | |
+| D5 | Certificate expiry, PV usage, node pressure alerts | |
+| D6 | SLOs defined (e.g. 99.9% availability, p95 < 300 ms) | |
+
+### E. Backup and DR
+| # | Check | Yes/No |
+|---|---|---|
+| E1 | RPO/RTO agreed with business per app | |
+| E2 | Cluster objects backed up (Velero/Commvault) to another region | |
+| E3 | Volume and database backups/replication meet RPO | |
+| E4 | DR cluster built from same IaC; manifests via GitOps | |
+| E5 | DR runbook / Full Stack DR plan exists; prechecks pass | |
+| E6 | Restore and failover tested in last 6 months; evidence saved | |
+
+### F. Delivery and operations
+| # | Check | Yes/No |
+|---|---|---|
+| F1 | CI/CD with approvals for prod; GitOps or pipeline is the only way to change prod | |
+| F2 | Rollback tested (helm rollback / Argo CD history) | |
+| F3 | Upgrade, drain and node replacement tested without downtime | |
+| F4 | Capacity plan documented; load test done at 2× expected peak | |
+| F5 | Cost tags; monthly cost review | |
+| F6 | On-call, escalation and incident process documented | |
+
+##MD
+---
+# Interview / Architect Questions
+
+**1. Design an HA OKE platform in `me-jeddah-1` (single AD). What is your failure domain strategy?**
+<details><summary>Answer</summary>
+Managed (enhanced) control plane. Node pools placed across all **3 fault domains**; topology spread on `oci.oraclecloud.com/fault-domain` (hard) and hostname (soft); ≥3 replicas. FDs do not protect against AD/region loss, so DR to `me-riyadh-1` with a standby OKE cluster, replicated data and a Full Stack DR plan (or GitOps + Velero/Commvault). DNS failover in front.
+</details>
+
+**2. Why is 5 etcd members better than 3, and why not 7?**
+<details><summary>Answer</summary>
+5 tolerates 2 failures (can lose one during maintenance and still survive another). 7 tolerates 3 but every write needs 4 acks → higher latency, more network, no real benefit for most clusters.
+</details>
+
+**3. During a node pool upgrade, users report 502 errors. What do you check?**
+<details><summary>Answer</summary>
+PDBs exist and allow drains slowly; readiness probes; preStop hook and grace period; `maxUnavailable: 0` in Deployments; enough spare capacity (surge) so evicted Pods can schedule; ingress controller replicas spread and having PDB; LB health check settings (`externalTrafficPolicy: Local` needs Pods per node).
+</details>
+
+**4. etcd snapshot vs Velero: when do you need each?**
+<details><summary>Answer</summary>
+etcd snapshot: self-managed clusters, full-cluster restore of state (no volume data). Velero/Commvault: namespace/app restore, volume data, restore into a different cluster/region (DR, migrations). Managed K8s: only app-level backup is possible.
+</details>
+
+**5. Soft multi-tenancy: name the minimum set of controls.**
+<details><summary>Answer</summary>
+Namespace, RBAC (edit only in own namespace), ResourceQuota + LimitRange, default-deny NetworkPolicy (with enforcing CNI), Pod Security Admission restricted, no LB/NodePort for tenants unless approved, separate node pools for sensitive tenants.
+</details>
+
+**6. HPA scales but the cluster autoscaler never adds nodes. Why?**
+<details><summary>Answer</summary>
+Pods have no requests (autoscaler cannot compute need), node pool at max, Pods fit nowhere due to affinity/taints/zonal PVC, quota/service limits, autoscaler lacks IAM permissions (on OKE: dynamic group + policy to manage node pools / instances).
+</details>
+
+##MD
+---
+# Practical Assignment: Design and prove a production platform
+
+**Scenario:** A government-linked foundation launches a donations portal. Requirements:
+- Availability 99.9%, RTO 30 min, RPO 5 min for the database, RPO 24 h for uploaded files is NOT ok (needs 1 h).
+- Primary region Jeddah, DR region Riyadh.
+- Peak 1,500 requests/second during campaigns, normal 150.
+- Only admins on VPN may reach the Kubernetes API.
+- 3 internal teams share the cluster (payments, content, reporting).
+
+**Deliverables**
+1. Architecture diagram (ASCII is fine) for both regions: VCN subnets, API endpoint, node pools, LB/ingress, DB, storage, DR flows.
+2. Node pool plan with capacity math (state your assumptions per request).
+3. Tenancy design for the 3 teams (YAML for one team).
+4. DR design: strategy, data replication per store, failover steps, test plan.
+5. Upgrade plan from current v1.30 to v1.32.
+6. Fill the PRR checklist; list the top 5 risks.
+7. **On kind:** prove the zero-downtime rollout (FAIL=0) and a Velero backup/restore of the payments namespace.
+
+**Success criteria:** every requirement maps to a design element; numbers are shown; DR meets RTO/RPO on paper; the two kind demos work.
+
+**Hints:** RPO 5 min → DB replication, not backups. Files RPO 1 h → Object Storage cross-region replication. 1,500 rps → load test to find per-Pod rps first.
+
+<details><summary>Model solution (read after you try)</summary>
+
+**1. Architecture**
+```
+JEDDAH (primary)                                   RIYADH (standby, warm)
+VCN 10.10.0.0/16                                   VCN 10.20.0.0/16
+ pub-lb  10.10.20.0/24 : Public NLB -> ingress      pub-lb : NLB (created, idle)
+ api     10.10.0.0/28  : private K8s API            api    : private K8s API
+ workers 10.10.10.0/24 : system pool(3) app pool(3-9)  workers: system(3) app(2-9)
+ pods    10.10.32.0/19 : VCN-native pod IPs          pods   : /19
+ db      10.10.40.0/24 : MySQL HeatWave (HA)  ==repl==> MySQL replica (read-only)
+ Object Storage bucket uploads ===== replication ===> DR bucket
+ Velero/Commvault -> Object Storage ===============> DR copy
+ Admin VPN -> DRG -> api subnet (NSG: VPN CIDR only)
+ Cloudflare LB (health checks) -> Jeddah NLB, failover -> Riyadh NLB
+```
+**2. Capacity:** load test shows 1 api Pod (500m) = 60 rps → peak 1500/60 = 25 Pods; web 18; worker 10. Use the Topic 16 method → app pool E5.Flex 4 OCPU/32 GB min 3 max 9, system pool 3 × 2 OCPU/16 GB. Pod subnet /19.
+
+**3. Tenancy:** namespaces `payments`, `content`, `reporting`; YAML like the Topic 14 lab, quota per team (payments 8 CPU/16 Gi), PSA restricted, default deny + allow ingress namespace, RoleBinding to IAM group. Payments gets a tainted dedicated pool (PCI-like isolation).
+
+**4. DR:** warm standby. DB async replication (lag < 1 min → RPO met). Files: bucket replication (minutes). Manifests: Argo CD syncs both clusters; Riyadh app replicas min 1. Failover: Full Stack DR plan → promote DB replica → scale Riyadh deployments → switch Cloudflare pool → verify. Test every 6 months, record evidence. Estimated RTO 15–20 min.
+
+**5. Upgrade:** pluto scan → CP 1.31 → add-ons → new node pools 1.31 (blue/green) → CP 1.32 → add-ons → node pools 1.32. Do Riyadh first (less risk), then Jeddah in a maintenance window.
+
+**6. Top risks:** DB replication lag during peaks; pod subnet IP exhaustion; DR drift (config only in primary); single ingress controller class; cert expiry.
+
+**7.** Use labs `zero-downtime.yaml` and the Velero section with namespace `payments`.
+</details>
+
+##MD
+---
+# Cleanup
+
+Delete the HA lab cluster (frees 5–6 GB RAM) and lab files in the `learn` cluster if you created any there.
+
+##CODE
+%%bash
+kind delete cluster --name ha-lab
+kubectl config use-context kind-learn 2>/dev/null && kubectl get nodes || echo "kind-learn not found: recreate it with notebook 00 when needed"
+rm -f labs/14/velero-creds
+
+##MD
+---
+**Next notebook:** [15-Cloud-Kubernetes.ipynb](15-Cloud-Kubernetes.ipynb) — EKS, AKS, GKE and OKE in practice.

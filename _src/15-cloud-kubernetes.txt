@@ -1,0 +1,800 @@
+##MD
+# Phase 15: Cloud Kubernetes (EKS, AKS, GKE and OKE)
+
+**What you will learn**
+- Managed vs self-managed Kubernetes: what you give away and what you keep
+- How **Amazon EKS**, **Azure AKS**, **Google GKE** and **Oracle OKE** work inside
+- Cloud networking integration (VPC/VNet/VCN, pod IPs, CNI)
+- Cloud IAM integration: how Pods get cloud permissions **without static keys**
+- Cloud load balancers and cloud storage from Kubernetes
+- Cluster autoscaling in each cloud
+- How to create a small cluster, deploy, expose and **tear down** in each cloud
+- A comparison table and a production cloud reference architecture
+
+**Time:** 6–10 hours (reading + optional cloud labs)
+
+**Prerequisites:** Notebooks 00–14. For cloud labs: an account in that cloud, its CLI installed and logged in, and **permission to spend money**.
+
+**How to use this notebook**
+1. Read all four providers. Interviews often ask "how is EKS different from AKS".
+2. Start with **OKE** (your daily platform), then do **one** other cloud lab.
+3. Cloud cells are **guarded**. They do nothing unless the cell contains `export CONFIRM_CLOUD=yes` directly under its `# REVIEW BEFORE RUNNING` line (each `%%bash` cell is a new shell, so it must be in that cell). Read every line before you enable them.
+4. Always run the **teardown** cell the same day.
+
+> **Cost warning:** every managed cluster lab creates billable resources (control plane fee, VMs, load balancers, disks, NAT gateways). A small lab usually costs a few USD per day, but a forgotten cluster keeps charging every hour. Use free credits / trial accounts if you have them.
+
+> **Word list**
+> - **Managed Kubernetes:** the cloud runs the control plane (API server, etcd, scheduler) for you.
+> - **CNI:** Container Network Interface — the plugin that gives Pods IP addresses.
+> - **Workload identity:** a way for a Pod to get short-lived cloud credentials based on its Kubernetes ServiceAccount.
+> - **OIDC:** OpenID Connect — a standard for identity tokens. Clusters publish an OIDC issuer so the cloud IAM can trust ServiceAccount tokens.
+> - **CSI driver:** Container Storage Interface plugin that creates cloud disks for PVCs.
+> - **CCM:** Cloud Controller Manager — creates cloud load balancers for `type: LoadBalancer` Services.
+
+##MD
+## Guard helper
+
+Every cloud cell starts with the same guard. This cell shows how it works. It is safe to run.
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: creates billable resources (this demo cell does not)
+if [ "${CONFIRM_CLOUD:-no}" != "yes" ]; then
+  echo "Guard active: cloud commands skipped. To run a cloud cell, insert the line 'export CONFIRM_CLOUD=yes' directly under its '# REVIEW BEFORE RUNNING' line, after reading it."
+  exit 0
+fi
+echo "CONFIRM_CLOUD=yes -> cloud commands would run here"
+
+##MD
+---
+# Topic 1: Managed vs Self-Managed Kubernetes
+
+### What is it?
+- **Self-managed:** you install and run everything (kubeadm, kOps, Rancher RKE2, Kubernetes the hard way). You own etcd, certificates, control plane upgrades.
+- **Managed:** cloud provider runs the control plane. You manage worker nodes (or use serverless nodes) and everything in the cluster.
+
+```
+                 SELF-MANAGED                     MANAGED (EKS/AKS/GKE/OKE)
+            +--------------------+             +--------------------------+
+ You own -> | Apps, Helm, GitOps |    You own->| Apps, Helm, GitOps       |
+            | Add-ons, CNI, CSI  |             | Add-on choices/versions  |
+            | Worker nodes       |             | Worker nodes (or virtual)|
+            | Control plane      |             +--------------------------+
+            | etcd + backups     |   Cloud  -> | Control plane, etcd, HA, |
+            | Certificates       |   owns      | control plane patching,  |
+            | Load balancer      |             | API endpoint             |
+            +--------------------+             +--------------------------+
+```
+
+### Comparison
+
+| Topic | Self-managed | Managed |
+|---|---|---|
+| Control plane HA | You build (Notebook 14) | Built in (multi-zone/FD) |
+| etcd backup | You do | Cloud does (no access for you) |
+| Upgrades | Full manual | Trigger control plane upgrade; nodes semi-automatic |
+| Control plane flags | Full control | Limited |
+| Cost | VMs + your time | Control plane fee (often ~USD 0.10/h; some free tiers) + nodes |
+| Best for | Air-gapped, edge, special needs, learning | Almost all production in cloud |
+
+### Production scenario
+A team ran kubeadm clusters on VMs. Certificates expired after 1 year (kubeadm default). The API stopped working at 2 AM. Moving to a managed service removed this whole class of incidents. They still lost a day later when **node** certificates and a webhook certificate expired — managed does not mean "nothing to manage".
+
+### Check yourself
+Name three things you still own on any managed Kubernetes.
+
+<details><summary>Answer</summary>
+Any three of: worker node OS patching/upgrades (or node image upgrades), Kubernetes version upgrades (you trigger), add-ons, RBAC and IAM mapping, network design and security rules, app manifests, backups of workloads and data, monitoring, cost.
+</details>
+
+##MD
+---
+# Topic 2: The common pattern in every cloud
+
+All four clouds solve the same 6 problems. Learn the pattern once, then map names.
+
+| Problem | EKS (AWS) | AKS (Azure) | GKE (Google) | OKE (Oracle) |
+|---|---|---|---|---|
+| Network | VPC | VNet | VPC | VCN |
+| Pod IPs | VPC CNI (pods get VPC IPs) | Azure CNI (Overlay or VNet IPs), kubenet (legacy) | VPC-native (alias IP ranges) | VCN-native pod networking (OCI VCN IPs) or flannel overlay |
+| Pod cloud identity | IRSA / **EKS Pod Identity** | **Microsoft Entra Workload ID** | **Workload Identity Federation for GKE** | **OKE Workload Identity** (enhanced clusters) |
+| Load balancer | AWS Load Balancer Controller (NLB/ALB) | Azure LB (L4), App Gateway for Containers (L7) | GCP L4/L7 LB, GKE Gateway | OCI LB (L7-capable) / OCI NLB (L4) via CCM |
+| Block storage CSI | EBS CSI | Azure Disk CSI | PD CSI (pd-balanced, hyperdisk) | OCI Block Volume CSI (`oci-bv`) |
+| File storage CSI | EFS CSI | Azure Files CSI | Filestore CSI | OCI File Storage (FSS) CSI |
+| Node autoscaling | Cluster Autoscaler or **Karpenter** (EKS Auto Mode) | Cluster Autoscaler, Node Auto-provisioning (Karpenter-based) | Cluster Autoscaler + Node auto-provisioning, **Autopilot** | Cluster Autoscaler add-on |
+| Serverless nodes | Fargate | Virtual nodes (ACI) | Autopilot | **Virtual nodes** |
+| Control plane price | Paid per cluster/hour | Free tier or Standard/Premium paid | Paid per cluster (free credit for one zonal/Autopilot) | Basic cluster free; **Enhanced** paid per cluster/hour |
+
+> Prices and feature names change. Always check the provider's current pricing and docs before you design.
+
+### How workload identity works (same idea everywhere)
+
+```
+ 1. Pod runs with ServiceAccount "app-sa" in namespace "shop"
+ 2. kubelet mounts a short-lived, signed ServiceAccount token (projected token)
+ 3. Cluster publishes OIDC issuer + public keys
+ 4. Cloud IAM trusts that issuer and has a rule:
+       "token with sub = system:serviceaccount:shop:app-sa  -> may act as role X"
+ 5. Cloud SDK in the Pod exchanges the token for temporary cloud credentials
+ 6. Pod calls Object Storage / S3 / Key Vault with those credentials (expire in ~1h)
+
+ Result: NO static access keys in Secrets. Revoke by changing the IAM rule.
+```
+
+### Check yourself
+Why is workload identity better than putting an access key in a Kubernetes Secret?
+
+<details><summary>Answer</summary>
+Static keys never expire, can be copied and used outside the cluster, are hard to rotate, and anyone who can read the Secret gets them. Workload identity tokens are short-lived, bound to one ServiceAccount, and controlled centrally in IAM.
+</details>
+
+##MD
+---
+# Topic 3: Oracle OKE (start here — your platform)
+
+### Architecture
+
+```
+ OCI Region (e.g. me-jeddah-1, single AD, 3 Fault Domains)
+ +--------------------------------------------------------------------------+
+ | Oracle-managed tenancy: OKE control plane (API server, etcd, scheduler)   |
+ |   HA across FDs, patched by Oracle. Exposed to your VCN via an endpoint.  |
+ +-------------------------------------+------------------------------------+
+                                       | Kubernetes API endpoint VNIC
+ Your VCN 10.0.0.0/16                  v
+ +--------------------------------------------------------------------------+
+ | API endpoint subnet (private)   [ :6443 ]  NSG: admins/VPN/bastion only  |
+ | Worker subnet (private)         [ managed nodes / self-managed nodes ]   |
+ |                                 [ virtual nodes (serverless)        ]   |
+ | Pod subnet (VCN-native)         Pods get real VCN IPs (secondary VNICs) |
+ | LB subnet (public or private)   [ OCI LB / NLB created by CCM ]          |
+ +-----------------+----------------------------+---------------------------+
+                   |                            |
+             NAT Gateway                 Service Gateway  -> OCIR, Object Storage,
+                                                             Vault, Logging
+```
+
+### Basic vs Enhanced clusters
+
+| | Basic | Enhanced |
+|---|---|---|
+| Control plane price | Free | Paid per cluster-hour |
+| Financially backed SLA | No | Yes (API server uptime SLA) |
+| Virtual nodes | No | Yes |
+| Workload identity | No | **Yes** |
+| Add-on lifecycle management | Limited | Yes (managed add-ons: CoreDNS, kube-proxy, cluster autoscaler, etc.) |
+| Max nodes | Lower | Higher |
+| Use for | Dev, learning | Production |
+
+### Pod networking: VCN-native vs flannel
+
+| | VCN-native pod networking | Flannel overlay |
+|---|---|---|
+| Pod IP | Real VCN IP from pod subnet | Private overlay range (not in VCN) |
+| Reach Pod from VCN (DB, LB, other VMs) | Directly | Only via node/Service |
+| NSGs on Pods | Yes (pod subnet NSGs) | No |
+| IP planning | **Critical**: each Pod consumes a VCN IP; max Pods per node depends on shape VNICs | Simple |
+| Network policy | Calico can be added | Calico can be added |
+| Recommended | Production, especially with OCI LB native backends | Simple labs |
+
+### OCI Load Balancer from a Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  annotations:
+    oci.oraclecloud.com/load-balancer-type: "nlb"                          # NLB (L4). Remove for classic LB
+    oci-network-load-balancer.oraclecloud.com/internal: "true"             # private NLB
+    oci-network-load-balancer.oraclecloud.com/subnet: "ocid1.subnet.oc1..lbsubnet"
+    oci.oraclecloud.com/oci-network-security-groups: "ocid1.networksecuritygroup.oc1..lbnsg"
+    oci.oraclecloud.com/security-rule-management-mode: "NSG"               # CCM adds ingress rules to NSGs
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local        # keep client IP
+  selector: {app: web}
+  ports: [{port: 443, targetPort: 8443}]
+```
+Classic L7 LB with TLS: `service.beta.kubernetes.io/oci-load-balancer-ssl-ports: "443"` and `service.beta.kubernetes.io/oci-load-balancer-tls-secret: <secret>`, flexible shape annotations as in Notebook 14.
+
+### Storage
+
+| StorageClass | Backend | Access mode | Notes |
+|---|---|---|---|
+| `oci-bv` | Block Volume via CSI | ReadWriteOnce | Default for databases. Per-AD. Supports expansion, snapshots (VolumeSnapshotClass), performance units (VPUs) param `vpusPerGB` |
+| `oci` (legacy flexvolume) | Block Volume | RWO | Old; prefer `oci-bv` |
+| FSS CSI (`fss.csi.oraclecloud.com`) | File Storage | ReadWriteMany | Shared files; static (existing FS) or dynamic provisioning |
+| Object Storage | via app SDK / rclone / s3 | — | Not a block device; use workload identity |
+
+##MD
+### IAM: policies and workload identity
+
+**Cluster / node policies** (examples, adapt to your compartments):
+```
+# Let OKE manage network resources in the compartment (CCM creating LBs, VNICs)
+Allow any-user to manage load-balancers in compartment app-net where all {request.principal.type = 'cluster'}
+Allow any-user to use network-security-groups in compartment app-net where all {request.principal.type = 'cluster'}
+
+# Cluster Autoscaler running as a workload (workload identity principal)
+Allow any-user to manage cluster-node-pools in compartment k8s where all {request.principal.type='workload', request.principal.namespace='kube-system', request.principal.service_account='cluster-autoscaler', request.principal.cluster_id='ocid1.cluster.oc1..xxx'}
+Allow any-user to manage instance-family in compartment k8s where all {request.principal.type='workload', request.principal.namespace='kube-system', request.principal.service_account='cluster-autoscaler', request.principal.cluster_id='ocid1.cluster.oc1..xxx'}
+```
+
+**Workload identity for an app** (enhanced cluster): a Pod with ServiceAccount `uploader` in namespace `shop` may write to one bucket:
+```
+Allow any-user to manage objects in compartment app-data where all {
+  request.principal.type = 'workload',
+  request.principal.namespace = 'shop',
+  request.principal.service_account = 'uploader',
+  request.principal.cluster_id = 'ocid1.cluster.oc1.me-jeddah-1.xxxx',
+  target.bucket.name = 'shop-uploads'
+}
+```
+In code, use the OCI SDK **OKE workload identity resource principal signer** (for example in Python: `oci.auth.signers.get_oke_workload_identity_resource_principal_signer()`). No API key in the container.
+
+**Human access:** kubeconfig uses `oci ce cluster generate-token` (short-lived token from your IAM user). RBAC subjects can be IAM user or group OCIDs:
+```yaml
+subjects:
+  - kind: Group
+    name: ocid1.group.oc1..aaaa-k8s-admins     # OCI IAM group OCID
+    apiGroup: rbac.authorization.k8s.io
+```
+
+### Autoscaling and virtual nodes
+- **Cluster Autoscaler add-on** (enhanced clusters): configure node pool OCID ranges `min:max:ocid`, it scales managed node pools.
+- **Virtual nodes:** serverless; you pay per Pod resources, no node patching. Limits: no DaemonSets, no privileged Pods, fewer CNI/storage options. Good for bursty stateless apps.
+
+### Production scenario
+After moving to VCN-native pod networking, a team scaled from 40 to 300 Pods during a campaign. New Pods stayed `Pending` with "no available IPs". The pod subnet was a /24 (only ~250 usable IPs) shared by all node pools. **Fix:** a dedicated /19 pod subnet per cluster, and check max-Pods-per-node versus shape VNIC limits before choosing shapes.
+
+##MD
+### OKE lab (guarded): create a small cluster with Terraform
+
+We use the community **terraform-oci-oke** module (`oracle-terraform-modules/oke/oci`). It creates the VCN, subnets, gateways, NSGs, cluster and node pool. Read the file; every important input is commented.
+
+##CODE
+%%bash
+mkdir -p labs/15/oke labs/15/eks labs/15/aks labs/15/gke
+ls labs/15
+
+##CODE
+%%writefile labs/15/oke/main.tf
+# Small OKE lab cluster. Creates billable resources (enhanced cluster fee, VMs, LB, NAT).
+terraform {
+  required_providers {
+    oci = { source = "oracle/oci", version = ">= 5.0" }
+  }
+}
+
+provider "oci" {
+  region              = var.region
+  config_file_profile = var.oci_profile      # profile in ~/.oci/config
+}
+
+variable "region"         { default = "me-jeddah-1" }
+variable "oci_profile"    { default = "DEFAULT" }
+variable "tenancy_id"     {}
+variable "compartment_id" {}                 # use a LAB compartment, never a production one
+variable "ssh_public_key_path" { default = "~/.ssh/id_ed25519.pub" }
+
+module "oke" {
+  source  = "oracle-terraform-modules/oke/oci"
+  version = "~> 5.0"
+
+  tenancy_id     = var.tenancy_id
+  compartment_id = var.compartment_id
+  region         = var.region
+  home_region    = var.region             # change if your tenancy home region is different
+  providers      = { oci.home = oci }
+
+  # --- network ---
+  create_vcn               = true
+  vcn_name                 = "oke-lab"
+  vcn_cidrs                = ["10.50.0.0/16"]
+  cni_type                 = "npn"         # "npn" = VCN-native pod networking, "flannel" = overlay
+
+  # --- cluster ---
+  cluster_name             = "oke-lab"
+  cluster_type             = "enhanced"    # needed for workload identity, virtual nodes, add-ons
+  kubernetes_version       = "v1.31.1"     # pick a version listed by: oci ce cluster-options get --cluster-option-id all
+  control_plane_is_public  = false         # private API endpoint
+  assign_public_ip_to_control_plane = false
+  load_balancers           = "public"      # LB subnet type for Services of type LoadBalancer
+
+  # --- access ---
+  create_bastion           = true          # small bastion VM; or use OCI Bastion service
+  create_operator          = true          # operator VM inside VCN with kubectl + oci cli
+  ssh_public_key_path      = var.ssh_public_key_path
+
+  # --- workers ---
+  worker_pools = {
+    app = {
+      size        = 2                       # 2 small nodes for the lab
+      shape       = "VM.Standard.E5.Flex"
+      ocpus       = 1
+      memory      = 16
+      boot_volume_size = 50
+    }
+  }
+}
+
+output "cluster_id"  { value = module.oke.cluster_id }
+output "operator_ip" { value = module.oke.operator_private_ip }
+output "bastion_ip"  { value = module.oke.bastion_public_ip }
+
+##MD
+> Module input names change between major versions. Before applying, run `terraform init` and compare with the module README for the version you get (`~> 5.0`).
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: creates billable resources (OKE enhanced cluster, 2 VMs, bastion, operator, NAT, LB subnet)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped. Read labs/15/oke/main.tf, then insert 'export CONFIRM_CLOUD=yes' directly under the '# REVIEW BEFORE RUNNING' line."; exit 0; }
+cd labs/15/oke
+cat > terraform.tfvars <<'EOF'
+tenancy_id     = "ocid1.tenancy.oc1..REPLACE"
+compartment_id = "ocid1.compartment.oc1..REPLACE_LAB_COMPARTMENT"
+EOF
+echo "Edit labs/15/oke/terraform.tfvars with real OCIDs, then run:"
+echo "  terraform init && terraform plan -out plan.out && terraform apply plan.out"
+
+##MD
+### Deploy and expose on OKE (run from the operator VM, or via Bastion tunnel)
+
+```bash
+# kubeconfig for a private endpoint (from operator VM inside the VCN)
+oci ce cluster create-kubeconfig --cluster-id <cluster_id> --file ~/.kube/config \
+  --region me-jeddah-1 --token-version 2.0.0 --kube-endpoint PRIVATE_ENDPOINT
+
+kubectl get nodes -o wide        # nodes show FAULT-DOMAIN labels
+kubectl create deployment hello --image=nginx:1.27 --replicas=3
+kubectl expose deployment hello --type=LoadBalancer --port=80
+kubectl annotate svc hello oci.oraclecloud.com/load-balancer-type=nlb --overwrite   # (set at creation in real life)
+kubectl get svc hello -w         # wait for EXTERNAL-IP (OCI NLB public IP)
+curl http://<EXTERNAL-IP>
+
+# PVC on block volume
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data}
+spec:
+  storageClassName: oci-bv
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 50Gi}}     # OCI block volume minimum is 50 GB
+EOF
+```
+
+### Teardown (always)
+**Delete LoadBalancer Services and PVCs first.** Otherwise the cloud LB and block volumes may be left behind, or block `terraform destroy` (the subnet is still in use).
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: destroys the OKE lab cluster
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+echo "1) On the operator VM:  kubectl delete svc --all-namespaces --field-selector spec.type=LoadBalancer ; kubectl delete pvc --all -A"
+echo "2) Then here:"
+cd labs/15/oke && terraform destroy
+
+##MD
+### OKE troubleshooting
+| Symptom | Likely cause |
+|---|---|
+| Service `EXTERNAL-IP` pending | LB subnet full/wrong, missing IAM policy, NSG annotation OCID wrong, service limit for LBs reached. Check `kubectl describe svc` events |
+| Pods Pending "no available IP" | VCN-native pod subnet exhausted or node max-pods reached |
+| Nodes NotReady after creation | Worker subnet has no route to NAT/Service Gateway, or NSG blocks node→API 6443/12250 |
+| `kubectl` timeout | Private endpoint; you are not inside VCN/Bastion tunnel; NSG on endpoint |
+| PVC Pending | Wrong StorageClass, size < 50 Gi, or AD mismatch in multi-AD region |
+| Workload identity 401/404 | Basic cluster, wrong namespace/SA in policy, missing cluster_id condition |
+
+### Check yourself
+Your team wants Pods to be reachable directly from an on-prem system over FastConnect and to apply NSGs per app. Flannel or VCN-native?
+
+<details><summary>Answer</summary>
+VCN-native pod networking: Pods get routable VCN IPs (reachable via DRG/FastConnect) and the pod subnet can use NSGs. Plan the pod subnet size carefully.
+</details>
+
+##MD
+---
+# Topic 4: Amazon EKS
+
+### Architecture
+
+```
+ AWS Region (3+ AZs)
+ +----------------------------------------------------------------------+
+ | AWS-managed EKS control plane (multi-AZ), API endpoint public/private |
+ +------------------------------+---------------------------------------+
+                                | ENIs in your subnets
+ Your VPC 10.0.0.0/16           v
+  private subnets (AZ a/b/c): managed node groups / Karpenter nodes / Fargate
+     Pods get VPC IPs from the AWS VPC CNI (ENI secondary IPs or prefixes)
+  public subnets: NLB/ALB (AWS Load Balancer Controller)
+  NAT Gateway per AZ (production) ; VPC endpoints for ECR, S3, STS
+```
+
+### Key components
+- **VPC CNI:** Pods get VPC IPs. Enable **prefix delegation** to raise Pods per node. IP planning matters (like OKE VCN-native).
+- **Identity:** **EKS Pod Identity** (newer, simpler: an agent add-on + association between SA and IAM role) or **IRSA** (IAM Roles for Service Accounts, uses the cluster OIDC provider). Human access: **access entries** (newer) replace the old `aws-auth` ConfigMap.
+- **Load balancers:** install the **AWS Load Balancer Controller**. `Service type: LoadBalancer` with `service.beta.kubernetes.io/aws-load-balancer-type: external` → NLB. `Ingress` with class `alb` → ALB.
+- **Storage:** EBS CSI driver add-on (`gp3` StorageClass, RWO, per-AZ), EFS CSI for RWX.
+- **Autoscaling:** Cluster Autoscaler (scales Auto Scaling Groups) or **Karpenter** (creates right-sized EC2 directly, fast). **EKS Auto Mode** manages nodes, Karpenter, LB and storage for you.
+- **Serverless:** Fargate profiles (one Pod per micro-VM; no DaemonSets).
+
+### EKS lab (guarded) with eksctl
+
+##CODE
+%%writefile labs/15/eks/cluster.yaml
+# eksctl config: small lab cluster. Billable: EKS control plane fee, 2 EC2, NAT gateway, EBS.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: eks-lab
+  region: me-central-1          # AWS UAE region; pick the region you use
+  version: "1.31"
+iam:
+  withOIDC: true                # OIDC provider for IRSA
+addonsConfig:
+  autoApplyPodIdentityAssociations: true
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent    # enables EKS Pod Identity
+  - name: aws-ebs-csi-driver
+    useDefaultPodIdentityAssociations: true
+managedNodeGroups:
+  - name: app
+    instanceType: t3.large
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    privateNetworking: true      # nodes in private subnets
+vpc:
+  nat:
+    gateway: Single              # lab: one NAT. Production: HighlyAvailable (one per AZ)
+  clusterEndpoints:
+    publicAccess: true           # lab convenience. Production: private + VPN/bastion, or restrict publicAccessCIDRs
+    privateAccess: true
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: creates billable resources (EKS cluster, EC2, NAT gateway, EBS)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped. Read labs/15/eks/cluster.yaml first."; exit 0; }
+eksctl create cluster -f labs/15/eks/cluster.yaml
+kubectl get nodes
+kubectl create deployment hello --image=nginx:1.27 --replicas=3
+kubectl expose deployment hello --type=LoadBalancer --port=80   # in-tree CCM creates a CLB/NLB; install AWS LB Controller for production NLB/ALB
+kubectl get svc hello
+
+##MD
+**IRSA / Pod Identity example (concept):**
+```bash
+# Pod Identity: give ServiceAccount shop/uploader the role that may write to one S3 bucket
+eksctl create podidentityassociation --cluster eks-lab --namespace shop \
+  --service-account-name uploader --role-arn arn:aws:iam::<acct>:role/shop-uploader
+```
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: destroys the EKS lab
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+kubectl delete svc hello --ignore-not-found     # remove the cloud LB first
+eksctl delete cluster -f labs/15/eks/cluster.yaml --wait
+
+##MD
+### Check yourself
+EKS nodes can only run 29 Pods on an m5.large even though CPU is free. Why, and how do you fix it?
+
+<details><summary>Answer</summary>
+VPC CNI gives each Pod a VPC IP from ENI secondary IPs; the instance type limits ENIs × IPs. Enable **prefix delegation** (assigns /28 prefixes per ENI) and set max-pods accordingly, or use bigger instances / custom networking.
+</details>
+
+##MD
+---
+# Topic 5: Azure AKS
+
+### Architecture
+
+```
+ Azure Region (availability zones 1/2/3)
+ +--------------------------------------------------------------------+
+ | Microsoft-managed AKS control plane (Free/Standard/Premium tier)    |
+ | API server: public (authorized IP ranges) or private cluster        |
+ +-------------------------------+------------------------------------+
+ Node resource group (MC_...)    |  VMSS-based node pools
+  System node pool (CriticalAddonsOnly)  User node pools (apps), spot pools
+  VNet: Azure CNI Overlay (pods in overlay CIDR, recommended) or Azure CNI (pods get VNet IPs)
+        Azure CNI powered by Cilium (dataplane + network policy)
+  Azure Load Balancer (Standard) for Service type LoadBalancer
+  Application Gateway for Containers / AGIC / app routing add-on for L7
+```
+
+### Key components
+- **System vs user node pools** is a first-class concept (mode `System` / `User`).
+- **Identity:** cluster uses a **managed identity**. Pods use **Microsoft Entra Workload ID** (federated credential on a user-assigned managed identity trusts the cluster OIDC issuer + SA). Humans: Entra ID integration + **Azure RBAC for Kubernetes** or K8s RBAC with Entra groups.
+- **Storage:** Azure Disk CSI (`managed-csi`, `managed-csi-premium`, RWO, zonal), Azure Files CSI (RWX).
+- **Autoscaling:** cluster autoscaler per node pool; **Node Auto-provisioning** (Karpenter-based); KEDA add-on for event scaling.
+- **Upgrades:** auto-upgrade channels (patch, stable, rapid, node-image), planned maintenance windows.
+
+### AKS lab (guarded) with az CLI
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: creates billable resources (AKS, 2 VMs, Standard LB, public IP, disks)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+RG=aks-lab-rg; LOC=uaenorth; NAME=aks-lab
+az group create -n $RG -l $LOC
+az aks create -g $RG -n $NAME \
+  --tier free \
+  --node-count 2 --node-vm-size Standard_D2s_v5 \
+  --network-plugin azure --network-plugin-mode overlay \
+  --enable-oidc-issuer --enable-workload-identity \
+  --enable-cluster-autoscaler --min-count 2 --max-count 4 \
+  --zones 1 2 3 \
+  --generate-ssh-keys
+az aks get-credentials -g $RG -n $NAME --overwrite-existing
+kubectl get nodes -L topology.kubernetes.io/zone
+kubectl create deployment hello --image=nginx:1.27 --replicas=3
+kubectl expose deployment hello --type=LoadBalancer --port=80
+kubectl get svc hello -w
+
+##MD
+**Workload identity (concept):**
+```bash
+az identity create -g aks-lab-rg -n shop-uploader
+ISSUER=$(az aks show -g aks-lab-rg -n aks-lab --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create --name shop-uploader-fc --identity-name shop-uploader \
+  -g aks-lab-rg --issuer $ISSUER --subject system:serviceaccount:shop:uploader
+# ServiceAccount annotation: azure.workload.identity/client-id: <client-id>
+# Pod label: azure.workload.identity/use: "true"
+```
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: deletes the AKS lab resource group (and everything in it)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+az group delete -n aks-lab-rg --yes --no-wait
+echo "The MC_ node resource group is deleted with the cluster."
+
+##MD
+### Check yourself
+Why does AKS insist on a "System" node pool?
+
+<details><summary>Answer</summary>
+Critical add-ons (CoreDNS, metrics-server, konnectivity) need a protected place to run. A system pool can be tainted `CriticalAddonsOnly=true:NoSchedule` so app Pods cannot starve them. AKS requires at least one system pool.
+</details>
+
+##MD
+---
+# Topic 6: Google GKE
+
+### Architecture
+
+```
+ Google Cloud Region
+ +---------------------------------------------------------------------+
+ | Google-managed control plane: zonal (1 zone) or REGIONAL (3 zones)   |
+ | Private cluster: private endpoint, authorized networks / DNS endpoint |
+ +--------------------------------+------------------------------------+
+  Mode: STANDARD (you manage node pools)  or  AUTOPILOT (Google manages nodes,
+        you pay per Pod resource requests, hardened defaults)
+  VPC-native: Pods/Services use alias IP secondary ranges
+  Dataplane V2 (eBPF/Cilium-based) with built-in NetworkPolicy
+  Load balancing: L4 (Service LB), L7 via GKE Ingress or GKE Gateway controller
+```
+
+### Key components
+- **Autopilot** is the most "hands-off" managed Kubernetes. No node management; some restrictions (no privileged Pods by default).
+- **Identity:** **Workload Identity Federation for GKE** — grant IAM roles directly to a principal like `principal://iam.googleapis.com/projects/<num>/locations/global/workloadIdentityPools/<proj>.svc.id.goog/subject/ns/shop/sa/uploader`, or bind a KSA to a Google service account.
+- **Storage:** PD CSI (`standard-rwo` = pd-balanced, `premium-rwo`), Hyperdisk, Filestore CSI (RWX).
+- **Autoscaling:** cluster autoscaler + **node auto-provisioning** (creates node pools for you).
+- **Release channels:** Rapid / Regular / Stable / Extended; maintenance windows and exclusions.
+
+### GKE lab (guarded): Autopilot
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: creates billable resources (GKE Autopilot cluster, LB)
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+PROJECT=$(gcloud config get-value project); REGION=me-central2
+gcloud services enable container.googleapis.com
+gcloud container clusters create-auto gke-lab --region $REGION --release-channel regular
+gcloud container clusters get-credentials gke-lab --region $REGION
+kubectl create deployment hello --image=nginx:1.27 --replicas=3
+kubectl set resources deployment hello --requests=cpu=250m,memory=256Mi   # Autopilot bills by requests
+kubectl expose deployment hello --type=LoadBalancer --port=80
+kubectl get svc hello -w
+
+##CODE
+%%bash
+# REVIEW BEFORE RUNNING: deletes the GKE lab
+[ "${CONFIRM_CLOUD:-no}" = "yes" ] || { echo "Guard active: skipped."; exit 0; }
+kubectl delete svc hello --ignore-not-found
+gcloud container clusters delete gke-lab --region me-central2 --quiet
+
+##MD
+### Check yourself
+Zonal vs regional GKE control plane: what happens during a zone outage?
+
+<details><summary>Answer</summary>
+Zonal: the control plane lives in one zone — if that zone fails you cannot manage the cluster (workloads in other zones keep running). Regional: control plane replicas in 3 zones; the API stays available. Production = regional.
+</details>
+
+##MD
+---
+# Topic 7: Comparison Table
+
+| Feature | EKS | AKS | GKE | OKE |
+|---|---|---|---|---|
+| Control plane HA | Multi-AZ, built in | Built in; zone-redundant with AZ regions | Regional option (3 zones) | Built in, across FDs/ADs |
+| Free control plane | No | Free tier (no SLA) | One free zonal/Autopilot cluster credit | **Basic** cluster |
+| SLA tier | Standard | Standard / Premium | Standard | **Enhanced** |
+| Pod networking | VPC CNI (VPC IPs) | Azure CNI Overlay / Azure CNI / Cilium | VPC-native alias IPs, Dataplane V2 | VCN-native or flannel |
+| Network policy | VPC CNI network policy / Calico / Cilium | Azure NPM, Calico, Cilium | Dataplane V2 built-in | Calico (add-on) |
+| Pod identity | Pod Identity / IRSA | Entra Workload ID | Workload Identity Federation | OKE Workload Identity |
+| Human auth | IAM + access entries | Entra ID + Azure/K8s RBAC | Google IAM + RBAC | OCI IAM token + RBAC (IAM OCIDs) |
+| L4 LB | NLB | Azure Standard LB | Network LB (passthrough) | OCI NLB |
+| L7 LB | ALB (LB Controller) | App Gateway for Containers | GKE Gateway / Ingress | OCI LB (via annotations) / ingress controller |
+| Block storage | EBS CSI | Azure Disk CSI | PD / Hyperdisk CSI | OCI Block Volume CSI |
+| RWX storage | EFS | Azure Files | Filestore | FSS |
+| Node autoscaling | CA, Karpenter, Auto Mode | CA, Node Auto-provisioning | CA, NAP, Autopilot | CA add-on |
+| Serverless pods | Fargate | Virtual nodes (ACI) | Autopilot | Virtual nodes |
+| Private registry | ECR | ACR | Artifact Registry | OCIR |
+| Secrets backend | Secrets Manager (CSI / ESO) | Key Vault (CSI / ESO) | Secret Manager (CSI / ESO) | OCI Vault (CSI / ESO) |
+
+### Which to choose?
+- Already on one cloud → use its managed Kubernetes. Data gravity and IAM integration matter more than features.
+- Need data in Saudi Arabia → check which providers have a **KSA region** and which services are available there (OCI Jeddah/Riyadh, Google Dammam, others announced) and any regulatory requirements (e.g. NCA, data classification).
+- Want least node ops → GKE Autopilot, EKS Auto Mode, OKE virtual nodes, AKS Node Auto-provisioning.
+
+##MD
+---
+# Topic 8: Production Cloud Reference Architecture
+
+```
+                                 Users
+                                   |
+                     [ DNS + CDN/WAF (Cloudflare / cloud WAF) ]
+                       health-checked failover between regions
+                 +-----------------+------------------+
+                 |                                    |
+      REGION A (primary)                     REGION B (DR, warm)
+ +-------------------------------+     +-------------------------------+
+ | VPC/VNet/VCN                  |     | same layout from same Terraform|
+ |  public: L4 LB (NLB)          |     |                               |
+ |        |                      |     |                               |
+ |  private: ingress controller  |     |                               |
+ |   (3 replicas, spread zones)  |     |                               |
+ |        |                      |     |                               |
+ |  managed K8s control plane    |     |  managed K8s control plane    |
+ |   private endpoint            |     |                               |
+ |  node pools:                  |     |  node pools (smaller min)     |
+ |   system | app (autoscale)    |     |                               |
+ |   | batch(spot)               |     |                               |
+ |  Pods use workload identity ->|     |                               |
+ |   object storage, vault, DB   |     |                               |
+ |  managed DB (HA)  ====== async replication =====> replica DB        |
+ |  object storage   ====== bucket replication =====> DR bucket        |
+ |  backups (Velero/Commvault) -> other region                          |
+ +---------------+---------------+     +---------------+---------------+
+                 |                                     |
+   Admin VPN/Bastion -> private API      CI/CD agents in private subnet
+                 |
+   GitOps (Argo CD) ---- Git (IaC + manifests + per-region values) ----+
+   Observability: Prometheus per cluster -> Thanos/managed Prometheus -> Grafana, alerts -> on-call
+   Security: image scanning + signing, policy engine, PSA restricted, audit logs -> SIEM
+```
+
+### Production questions for this design
+| Question | Answer |
+|---|---|
+| Production-suitable? | Yes, if each box is implemented and tested |
+| Security risks | Over-wide IAM policies; public API; secrets in Git; unscanned images |
+| Node failure | Autoscaler replaces; spread + PDB keep service up |
+| Zone failure | Pods spread across zones/FDs; managed CP is multi-zone |
+| Region failure | DNS failover to DR, promote DB, scale up DR pools |
+| Scaling | HPA + cluster autoscaler/Karpenter; check quotas/service limits |
+| Monitoring | Golden signals per service, cluster health, cost |
+| Backup | Velero/Commvault + DB native backups + object replication |
+| Cost | Control plane fee × clusters × regions + nodes + LBs + NAT + egress; warm DR costs money — agree with business |
+
+##MD
+---
+# Interview / Architect Questions
+
+**1. Explain IRSA vs EKS Pod Identity.**
+<details><summary>Answer</summary>
+Both give Pods temporary AWS credentials for an IAM role. IRSA: IAM trusts the cluster's OIDC provider; SA annotated with role ARN; trust policy per cluster. Pod Identity: an agent DaemonSet on nodes + an "association" (namespace/SA → role) managed by the EKS API; role trust uses `pods.eks.amazonaws.com`; easier reuse across clusters, no OIDC provider per cluster.
+</details>
+
+**2. You must expose 20 microservices on OKE. Design the load balancing.**
+<details><summary>Answer</summary>
+One public OCI NLB → ingress controller (or Gateway API) with 3+ replicas on an edge/system pool → ClusterIP Services. WAF/Cloudflare in front. Internal services use a second, private ingress class. Avoid 20 LBs (cost and attack surface). NSGs managed via annotations.
+</details>
+
+**3. What breaks when pod IPs come from the VPC/VCN, and how do you plan for it?**
+<details><summary>Answer</summary>
+IP exhaustion in subnets, max Pods per node limited by NICs/IPs, overlapping CIDRs with on-prem/peered networks. Plan: big dedicated pod subnets (/19 or larger), check per-shape limits, use prefix delegation (EKS) or overlay modes (AKS CNI Overlay), document CIDR plan across regions for DR peering.
+</details>
+
+**4. Basic vs Enhanced OKE: which for production and why?**
+<details><summary>Answer</summary>
+Enhanced: financially backed SLA, workload identity (no static keys), virtual nodes, managed add-ons (including cluster autoscaler), larger scale. The per-cluster fee is small compared with risk. Basic is fine for dev/learning.
+</details>
+
+**5. How do you avoid vendor lock-in across clouds?**
+<details><summary>Answer</summary>
+You cannot avoid it fully. Keep portable layers portable: standard Kubernetes APIs, Helm/Kustomize, GitOps, Gateway API, CSI StorageClass names abstracted per environment, External Secrets Operator, OpenTelemetry. Accept cloud-specific parts (IAM, LB annotations, storage classes) in per-cloud values files. Use Terraform modules per cloud behind the same interface.
+</details>
+
+##MD
+---
+# Practical Assignment
+
+**Scenario:** Your company wants a second platform in another cloud for a new product, but primary stays on OKE. Pick **EKS, AKS or GKE**.
+
+**Tasks**
+1. Write a one-page design: network CIDRs (no overlap with your OCI VCNs), node pools, identity, LB, storage, autoscaling, private access.
+2. Write a mapping table: each OKE concept you use today → the equivalent in the chosen cloud.
+3. Deploy the same app (nginx + a PVC + a LoadBalancer Service) on **OKE** and on the **chosen cloud** using one Helm chart with two values files (`values-oke.yaml`, `values-<cloud>.yaml`). Only StorageClass and Service annotations should differ.
+4. Give one Pod access to object storage via workload identity on both clouds (one bucket each). Prove with an upload.
+5. Tear everything down and show an empty billing resource list.
+
+**Success criteria:** same chart, only values differ; no static cloud keys in the cluster; teardown verified.
+
+**Hints:** OKE: `storageClassName: oci-bv`, NLB annotation, workload identity needs Enhanced. EKS: `gp3`, LB Controller annotations, Pod Identity association. AKS: `managed-csi`, Workload ID annotations/labels. GKE: `standard-rwo`, Workload Identity Federation principal.
+
+<details><summary>Model solution (excerpt)</summary>
+
+`values-oke.yaml`
+```yaml
+storageClass: oci-bv
+pvcSize: 50Gi
+serviceAccount:
+  name: uploader
+  annotations: {}
+service:
+  type: LoadBalancer
+  annotations:
+    oci.oraclecloud.com/load-balancer-type: "nlb"
+```
+`values-eks.yaml`
+```yaml
+storageClass: gp3
+pvcSize: 20Gi
+serviceAccount:
+  name: uploader
+  annotations: {}          # Pod Identity association is created outside the chart
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+```
+Template uses `{{ .Values.storageClass }}`, `{{ toYaml .Values.service.annotations }}`.
+Identity: OKE policy with `request.principal.type='workload'` + bucket condition; EKS `eksctl create podidentityassociation` with an S3 policy limited to one bucket. Upload test: `oci os object put` using resource principal auth (`--auth oke_workload_identity` in recent OCI CLI) / `aws s3 cp` inside the Pod.
+</details>
+
+##MD
+---
+# Cleanup
+
+Local: nothing was created on kind in this notebook. Cloud: run every **teardown** cell you enabled, then check the console for leftover:
+- Load balancers / NLBs
+- Block volumes / disks (from PVCs with `Retain`)
+- Public IPs, NAT gateways
+- Node resource groups (AKS `MC_*`)
+
+##CODE
+%%bash
+echo "Local check:"; kubectl config get-contexts
+echo
+echo "Remove lab credentials/files you created:"
+rm -f labs/15/oke/terraform.tfvars
+ls -R labs/15
+
+##MD
+---
+**Next notebook:** [16-Capstone-Projects.ipynb](16-Capstone-Projects.ipynb) — build the 13 projects that prove your skills.

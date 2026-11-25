@@ -1,0 +1,1959 @@
+##MD
+# Phase 13 — Troubleshooting and Production Incidents
+
+**What you will learn**
+- A **systematic method** to debug any Kubernetes problem: describe → events → logs → exec → node.
+- How to read pod status, events, exit codes and conditions.
+- 16 realistic incident labs. In each one you get a **ticket**, we apply a **deliberately broken** manifest, **you investigate**, and then you compare with the root cause and fix:
+  CrashLoopBackOff · ImagePullBackOff · Pending pods (resources, PVC, taints) · OOMKilled · Failed scheduling · DNS failures · Service connectivity · Ingress problems · Certificate expiration · Persistent storage failures · Node NotReady · High CPU and memory · etcd problems · Control plane failures · Network outages · Application downtime during rollouts and drains.
+- How to write an incident report / **RCA** (root cause analysis).
+
+**Time:** 6–8 hours. Do it in several sessions. Each incident is independent.
+
+**Prerequisites**
+- Notebooks 00–12. The `learn` kind cluster is running (1 control plane + 2 workers).
+- Notebook 04 (networking + ingress) and notebook 07 (resources) are important here.
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift+Enter**.
+- **Rule:** when you see an incident ticket, **do not open the solution**. Run the investigation commands, write your own guess of the root cause, then open **Root cause and fix**.
+- Some labs break the cluster on purpose (node, scheduler). Every one has a **restore** cell. Always run it.
+- This notebook breaks things. **Never** run it against a real cluster — the guard cells protect you.
+
+##MD
+## 0. Setup
+
+##CODE
+%%bash
+# GUARD: stop if we are not on the local lab cluster.
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx', not 'kind-learn'."
+  echo "Fix:  kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using kind-learn"
+kubectl get nodes
+
+##MD
+**Expected:** 3 nodes, all `Ready`: `learn-control-plane`, `learn-worker`, `learn-worker2`.
+
+Create the lab folder, namespace `lab-13`, and a **client pod** with `curl` and `nslookup` for testing from inside the cluster.
+
+##CODE
+%%bash
+mkdir -p labs/13
+kubectl create namespace lab-13 --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n lab-13 run client --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep infinity
+kubectl -n lab-13 wait --for=condition=Ready pod/client --timeout=120s
+
+##MD
+metrics-server is needed for `kubectl top` (incident 12). Install it only if missing (kind needs `--kubelet-insecure-tls`, lab only).
+
+##CODE
+%%bash
+if kubectl -n kube-system get deploy metrics-server >/dev/null 2>&1; then
+  echo "metrics-server already installed"
+else
+  helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ >/dev/null 2>&1
+  helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system \
+    --set 'args={--kubelet-insecure-tls}' --wait --timeout 3m
+fi
+
+##MD
+---
+## 1. The systematic debugging method
+
+### Why a method?
+In an incident you are under pressure. People jump to random guesses ("restart it!"). A fixed method is faster, and you do not miss evidence. Restarting first often **destroys** the evidence (the crashed container and its logs).
+
+### The flow
+
+```
+ Ticket: "X is broken"
+    │
+    ▼
+ 0. SCOPE      What is affected? One pod, one app, one node, whole cluster? Since when? Any change (deploy, CR, patch)?
+    │
+    ▼
+ 1. GET        kubectl get pods -o wide        → STATUS, RESTARTS, NODE, AGE
+    │
+    ▼
+ 2. DESCRIBE   kubectl describe pod <p>        → State, Last State, Reason, Exit Code, Conditions, EVENTS (bottom)
+    │
+    ▼
+ 3. EVENTS     kubectl get events --sort-by=.lastTimestamp   → scheduling, pulling, probes, OOM, evictions
+    │
+    ▼
+ 4. LOGS       kubectl logs <p> [--previous] [-c container]  → what the app says
+    │
+    ▼
+ 5. EXEC       kubectl exec -it <p> -- sh  /  kubectl debug   → test DNS, ports, files, env from inside
+    │
+    ▼
+ 6. NETWORK    Service → EndpointSlices → Pod. Ingress → Service. NetworkPolicy.
+    │
+    ▼
+ 7. NODE       kubectl describe node, kubectl top, node conditions, kubelet / containerd logs
+    │
+    ▼
+ 8. CONTROL PLANE  API server, scheduler, controller-manager, etcd (self-managed only)
+```
+
+Work **from the pod outward**. Most incidents are found in steps 1–4.
+
+### Pod status → where to look
+
+| What you see | Meaning | Look at |
+|---|---|---|
+| `Pending` | Not scheduled yet, or volumes not ready | `describe pod` events: `FailedScheduling`, PVC |
+| `ContainerCreating` (long) | Image pull, volume mount, CNI/network setup | events: `FailedMount`, `FailedCreatePodSandBox` |
+| `ImagePullBackOff` / `ErrImagePull` | Cannot pull the image | events: exact pull error |
+| `CrashLoopBackOff` | Container starts, exits, restarts with growing wait | `logs --previous`, exit code |
+| `Running` but `0/1 READY` | Readiness probe failing | events: `Readiness probe failed` |
+| `OOMKilled` (Last State) | Memory limit exceeded | limits vs usage |
+| `Evicted` | Node pressure (disk/memory) | node conditions, `describe node` |
+| `Terminating` (stuck) | Finalizer, or node unreachable | finalizers, node status |
+
+### Container exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Exited normally (bad for long-running containers → CrashLoop with exit 0 = the process finished) |
+| 1 | Application error (generic) |
+| 126 / 127 | Command not executable / command not found (wrong `command:`) |
+| 137 | Killed by SIGKILL (128+9). Usually **OOMKilled** or failed liveness probe |
+| 139 | Segmentation fault (128+11) |
+| 143 | SIGTERM (128+15). Normal stop during shutdown |
+
+### Toolbox
+
+```
+kubectl get pods -n NS -o wide
+kubectl describe pod POD -n NS
+kubectl get events -n NS --sort-by=.lastTimestamp | tail -20
+kubectl logs POD -n NS --previous
+kubectl get pod POD -n NS -o jsonpath='{.status.containerStatuses[*].lastState}'
+kubectl exec -it POD -n NS -- sh
+kubectl debug -it POD -n NS --image=busybox:1.36 --target=CONTAINER   # ephemeral debug container
+kubectl debug node/NODE -it --image=busybox:1.36                      # shell on a node (host fs at /host)
+kubectl get endpointslices -n NS -l kubernetes.io/service-name=SVC
+kubectl top pod -n NS ; kubectl top node
+kubectl describe node NODE
+```
+
+### Check yourself
+1. Why should you not restart a crashing pod first?
+2. Where in `kubectl describe pod` output are the most useful clues?
+3. What does exit code 137 usually mean?
+
+<details><summary>Answer</summary>
+
+1. The restart can destroy evidence (previous logs, state) and hides the cause. Collect evidence first, then act.
+2. `State` / `Last State` (reason, exit code) and the **Events** list at the bottom.
+3. SIGKILL — usually OOMKilled (memory limit) or killed after failed liveness probes.
+</details>
+
+##MD
+---
+## Incident 1 — CrashLoopBackOff
+
+### What is it?
+The container starts, then **exits**. The kubelet restarts it. Each time it waits longer before the next restart (10 s, 20 s, 40 s … up to 5 minutes). This waiting state is **CrashLoopBackOff**.
+
+### Why it happens
+App error at startup (missing config, cannot connect to DB, bad argument), wrong command, process exits with 0 because it is not a long-running process, failing liveness probe.
+
+### How it works internally
+kubelet → container exits → `restartPolicy: Always` → restart with exponential back-off. The `RESTARTS` counter grows. The **previous** container's logs are kept until the next restart.
+
+### 🎫 Ticket
+> **RT#5101 — P2** — Pods for `payment-api` are `CrashLoopBackOff` since 10:05, right after the new release. Checkout is failing.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i01-crashloop.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-config
+  namespace: lab-13
+data:
+  DATABASE_HOST: payments-db.lab-13.svc   # Note the key name
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-api
+  namespace: lab-13
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: payment-api}}
+  template:
+    metadata: {labels: {app: payment-api}}
+    spec:
+      containers:
+        - name: api
+          image: busybox:1.36
+          envFrom:
+            - configMapRef: {name: payment-config}   # Loads all keys as env vars
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "payment-api starting, version 2.4.0"
+              if [ -z "$DB_HOST" ]; then
+                echo "FATAL: environment variable DB_HOST is not set" >&2
+                exit 1
+              fi
+              echo "connected to $DB_HOST"; sleep 3600
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i01-crashloop.yaml
+sleep 30
+kubectl -n lab-13 get pods -l app=payment-api
+
+##MD
+### Investigate (your turn)
+Run these. Write down: what the status is, the exit code, and what the log says.
+
+##CODE
+%%bash
+p=$(kubectl -n lab-13 get pod -l app=payment-api -o jsonpath='{.items[0].metadata.name}')
+echo "### describe (state + events)"; kubectl -n lab-13 describe pod $p | sed -n '/State:/,/Ready:/p;/Events:/,$p'
+echo "### previous container log"; kubectl -n lab-13 logs $p --previous
+echo "### env vars the container gets"; kubectl -n lab-13 get cm payment-config -o yaml | sed -n '/^data:/,/^kind/p'
+
+##MD
+**Hints:** Compare the variable name the app wants with the key in the ConfigMap.
+
+<details><summary>Root cause and fix</summary>
+
+- `Last State: Terminated, Reason: Error, Exit Code: 1`. Log: `FATAL: environment variable DB_HOST is not set`.
+- The release renamed the ConfigMap key to `DATABASE_HOST`, but the app reads `DB_HOST`.
+- **Fix (fast):** add the expected key, then restart pods so they read the new env (env vars are read only at container start):
+```
+kubectl -n lab-13 patch cm payment-config -p '{"data":{"DB_HOST":"payments-db.lab-13.svc"}}'
+kubectl -n lab-13 rollout restart deploy/payment-api
+```
+- **Fix (proper):** align app and config in Git; add a startup check in CI that renders config and validates required keys.
+</details>
+
+##CODE
+%%bash
+# Apply the fix and verify
+kubectl -n lab-13 patch cm payment-config -p '{"data":{"DB_HOST":"payments-db.lab-13.svc"}}'
+kubectl -n lab-13 rollout restart deploy/payment-api
+kubectl -n lab-13 rollout status deploy/payment-api --timeout=90s
+kubectl -n lab-13 logs deploy/payment-api
+
+##MD
+### Troubleshooting table
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Exit 1, app error in `--previous` logs | Config / dependency missing | Fix config, secret, dependency |
+| Exit 127 | `command` not found in image | Fix `command`/image |
+| Exit 0, CrashLoop | Process finishes (e.g. script without loop) | Run a long-running process; use a Job for one-off tasks |
+| Exit 137 + liveness failures in events | Liveness probe too strict (app slow to start) | Add `startupProbe`, relax liveness |
+
+### Lab vs production
+| Lab | Production |
+|---|---|
+| Patch ConfigMap by hand | Fix in Git; roll back release first if impact is high (`rollout undo`) |
+| 2 replicas both broken | Rolling update with readiness probe would have stopped at the first bad pod (see incident 16) |
+
+### Check yourself
+1. Why did changing the ConfigMap need a `rollout restart`?
+2. Which command shows the log of the crashed container?
+3. A container exits with code 0 and CrashLoops. What is likely wrong?
+
+<details><summary>Answer</summary>
+
+1. Env vars from a ConfigMap are copied at container start. They do not update in running containers. (Mounted files do update, after a delay.)
+2. `kubectl logs POD --previous`.
+3. The main process finished normally — it is not a long-running server (or it ran in the background and the shell exited).
+</details>
+
+##MD
+---
+## Incident 2 — ImagePullBackOff
+
+### What is it?
+The kubelet cannot pull the container image. After a failure (`ErrImagePull`) it waits and retries with back-off (`ImagePullBackOff`).
+
+### Why it happens
+Wrong image name or tag (typo), tag deleted, private registry without credentials (`imagePullSecrets`), registry unreachable (network, DNS, proxy), rate limits (Docker Hub), wrong CPU architecture (no `arm64` image).
+
+### How it works internally
+kubelet → CRI (containerd) → registry: resolve tag → download manifest → layers. The exact error text is in the **pod events**.
+
+### 🎫 Ticket
+> **RT#5102 — P3** — New `catalog` release is stuck. Pods never start. Release pipeline timed out.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i02-imagepull.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: lab-13
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: catalog}}
+  template:
+    metadata: {labels: {app: catalog}}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpne        # <- check this carefully
+          ports: [{containerPort: 80}]
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i02-imagepull.yaml
+sleep 20
+kubectl -n lab-13 get pods -l app=catalog
+p=$(kubectl -n lab-13 get pod -l app=catalog -o jsonpath='{.items[0].metadata.name}')
+kubectl -n lab-13 describe pod $p | sed -n '/Events:/,$p'
+
+##MD
+**Hints:** Read the `Failed to pull image` event. Is it "not found", "unauthorized", or "timeout"? Each means something different.
+
+<details><summary>Root cause and fix</summary>
+
+- Event: `failed to resolve reference "docker.io/library/nginx:1.27-alpne": ... not found`. The tag has a typo (`alpne`).
+- Fix: `kubectl -n lab-13 set image deploy/catalog web=nginx:1.27-alpine`
+- Error meanings:
+  - `not found` / `manifest unknown` → wrong name/tag.
+  - `unauthorized` / `pull access denied` → private image; add `imagePullSecrets` (for OCIR: a docker-registry secret with an auth token).
+  - `i/o timeout` / `no such host` → network/DNS/proxy from the node to the registry (e.g. missing NAT/Service Gateway route on OKE worker subnet).
+  - `toomanyrequests` → Docker Hub rate limit; use a mirror/your own registry.
+  - `no matching manifest for linux/arm64` → image not built for that CPU.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 set image deploy/catalog web=nginx:1.27-alpine
+kubectl -n lab-13 rollout status deploy/catalog --timeout=120s
+
+##MD
+### Lab vs production
+| Lab | Production |
+|---|---|
+| Public Docker Hub | Private registry (OCIR/ACR/Harbor) close to the cluster, pull-through cache, image digests (`@sha256:...`) |
+| Typo fixed by hand | CI checks that the image exists before deploying; deploy by digest |
+
+### Check yourself
+1. What is the difference between `ErrImagePull` and `ImagePullBackOff`?
+2. Event says `unauthorized`. What do you check?
+3. Why deploy by digest in production?
+
+<details><summary>Answer</summary>
+
+1. `ErrImagePull` = the pull just failed. `ImagePullBackOff` = kubelet is waiting before retrying.
+2. `imagePullSecrets` on the pod (or its ServiceAccount), that the secret is in the same namespace, and that the token is valid.
+3. A digest is immutable. A tag can be moved or overwritten.
+</details>
+
+##MD
+---
+## Incident 3 — Pending pods (three causes)
+
+### What is it?
+`Pending` = the pod is accepted by the API server but **not running yet**. Usually the **scheduler** cannot find a node. The reason is in a `FailedScheduling` event, like: `0/3 nodes are available: 1 node(s) had untolerated taint..., 2 Insufficient cpu.`
+
+### How it works internally
+The scheduler **filters** nodes (enough requested CPU/memory? taints tolerated? node selector/affinity match? volumes can attach?) then **scores** the rest. If no node passes the filter, the pod stays Pending and the scheduler retries.
+
+Important: scheduling uses **requests**, not real usage. A node at 10% real CPU can still be "full" if requests add up to its allocatable CPU.
+
+### 🎫 Ticket
+> **RT#5103 — P3** — Three new workloads in `lab-13` are all `Pending`: `report-generator`, `invoice-db`, `gpu-trainer`.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##MD
+We add a **taint** to `learn-worker2` for the third case. A taint says "do not schedule here unless the pod tolerates me". The cleanup removes it.
+
+##CODE
+%%bash
+kubectl taint nodes learn-worker2 dedicated=gpu:NoSchedule --overwrite
+
+##CODE
+%%writefile labs/13/i03-pending.yaml
+# (a) asks for more CPU than any node has
+apiVersion: v1
+kind: Pod
+metadata: {name: report-generator, namespace: lab-13}
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: "64", memory: 64Mi}    # 64 cores requested
+---
+# (b) PVC that can never be bound
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: invoice-data, namespace: lab-13}
+spec:
+  storageClassName: fast-ssd                    # does this class exist?
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: invoice-db, namespace: lab-13}
+spec:
+  containers:
+    - name: db
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+    - name: data
+      persistentVolumeClaim: {claimName: invoice-data}
+---
+# (c) must run on learn-worker2, but does not tolerate its taint
+apiVersion: v1
+kind: Pod
+metadata: {name: gpu-trainer, namespace: lab-13}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: learn-worker2
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i03-pending.yaml
+sleep 10
+kubectl -n lab-13 get pods report-generator invoice-db gpu-trainer
+kubectl -n lab-13 get pvc invoice-data
+
+##MD
+### Investigate
+##CODE
+%%bash
+for p in report-generator invoice-db gpu-trainer; do
+  echo "=== $p"; kubectl -n lab-13 describe pod $p | sed -n '/Events:/,$p' | tail -3
+done
+echo "=== PVC events"; kubectl -n lab-13 describe pvc invoice-data | sed -n '/Events:/,$p'
+echo "=== storage classes"; kubectl get storageclass
+echo "=== node allocatable CPU"; kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,TAINTS:.spec.taints[*].key
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- **report-generator:** `Insufficient cpu` — it requests 64 cores; nodes have far fewer. Fix: set a realistic request (e.g. `cpu: 500m`). In the cloud, the Cluster Autoscaler/Karpenter can add nodes only if a node shape is big enough.
+- **invoice-db:** `pod has unbound immediate PersistentVolumeClaims`; PVC event `storageclass.storage.k8s.io "fast-ssd" not found`. Fix: use an existing class (`standard` on kind; on OKE e.g. `oci-bv`). PVC `storageClassName` is immutable → delete and recreate the PVC.
+- **gpu-trainer:** `node(s) had untolerated taint {dedicated: gpu}` (and the other nodes don't match the nodeSelector). Fix: add a toleration:
+```yaml
+tolerations:
+  - {key: dedicated, operator: Equal, value: gpu, effect: NoSchedule}
+```
+</details>
+
+##CODE
+%%bash
+# Fix (c) as an example: recreate gpu-trainer with a toleration
+kubectl -n lab-13 delete pod gpu-trainer --now
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: gpu-trainer, namespace: lab-13}
+spec:
+  nodeSelector: {kubernetes.io/hostname: learn-worker2}
+  tolerations:
+    - {key: dedicated, operator: Equal, value: gpu, effect: NoSchedule}
+  containers:
+    - {name: app, image: busybox:1.36, command: ["sleep", "3600"]}
+EOF
+kubectl -n lab-13 wait --for=condition=Ready pod/gpu-trainer --timeout=60s
+# Clean (a) and (b), and remove the taint
+kubectl -n lab-13 delete pod report-generator invoice-db gpu-trainer --now
+kubectl -n lab-13 delete pvc invoice-data
+kubectl taint nodes learn-worker2 dedicated=gpu:NoSchedule-
+
+##MD
+### Check yourself
+1. A node shows 15% real CPU usage but pods are `Insufficient cpu`. How?
+2. Can you change `storageClassName` on an existing PVC?
+3. Toleration vs nodeSelector — which one **attracts** pods to a node?
+
+<details><summary>Answer</summary>
+
+1. The scheduler uses **requests**. If the sum of requests on the node equals allocatable, it is full, even if real usage is low (over-requesting).
+2. No, it is immutable. Delete and recreate (after backing up data if any).
+3. nodeSelector/affinity attracts. A toleration only **allows** a pod on a tainted node; it does not attract it.
+</details>
+
+##MD
+---
+## Incident 4 — OOMKilled
+
+### What is it?
+The container used more memory than its **memory limit**. The Linux kernel (cgroup OOM killer) kills it with SIGKILL. Kubernetes shows `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`, and restarts it.
+
+### How it works internally
+`resources.limits.memory` becomes the cgroup memory limit. The kernel counts the container's **working set** (RSS + active page cache). Over the limit → kill. CPU over the limit is different: CPU is **throttled**, never killed.
+
+If the **node** runs out of memory (not the container limit), the kubelet **evicts** pods by QoS class (BestEffort first, then Burstable, Guaranteed last).
+
+### 🎫 Ticket
+> **RT#5104 — P2** — `report-exporter` restarts every minute when users export large reports. Restarts count is 14 and rising.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i04-oom.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: report-exporter
+  namespace: lab-13
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: report-exporter}}
+  template:
+    metadata: {labels: {app: report-exporter}}
+    spec:
+      containers:
+        - name: exporter
+          image: python:3.12-alpine
+          # Simulates building a big report in memory (~250 MB), then waiting
+          command: ["python", "-c"]
+          args:
+            - |
+              import time
+              print("building report...", flush=True)
+              data = "x" * (250 * 1024 * 1024)   # really touches 250 MB of memory
+              print("report built", flush=True)
+              time.sleep(3600)
+          resources:
+            requests: {memory: 64Mi, cpu: 50m}
+            limits: {memory: 128Mi}              # limit is smaller than what the app needs
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i04-oom.yaml
+sleep 45
+kubectl -n lab-13 get pods -l app=report-exporter
+
+##MD
+### Investigate
+##CODE
+%%bash
+p=$(kubectl -n lab-13 get pod -l app=report-exporter -o jsonpath='{.items[0].metadata.name}')
+kubectl -n lab-13 get pod $p -o jsonpath='{.status.containerStatuses[0].lastState}{"\n"}'
+kubectl -n lab-13 describe pod $p | grep -E -A6 'Last State|Limits'
+kubectl -n lab-13 logs $p --previous
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- `lastState.terminated.reason: OOMKilled`, `exitCode: 137`. The log stops at `building report...` — it never printed `report built`.
+- The app needs ~260 MB; the limit is 128 Mi.
+- **Fix:** measure real peak usage (Prometheus `container_memory_working_set_bytes`, max over a week), set limit above peak with margin, and request close to normal usage. Or fix the app (stream the report instead of building it in memory).
+```
+kubectl -n lab-13 set resources deploy/report-exporter --limits=memory=384Mi --requests=memory=300Mi
+```
+- Don't just remove the limit: one leaking pod can then eat the whole node's memory and cause evictions of other pods.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 set resources deploy/report-exporter --limits=memory=384Mi --requests=memory=300Mi
+kubectl -n lab-13 rollout status deploy/report-exporter --timeout=120s
+sleep 10; kubectl -n lab-13 logs deploy/report-exporter
+
+##MD
+### Lab vs production
+| Lab | Production |
+|---|---|
+| Guess a new limit | Size from metrics (p99/max of working set), VPA recommendations |
+| One pod | Alert: `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}` and restart rate |
+| — | JVM/Node apps: set heap size below the limit (e.g. `-XX:MaxRAMPercentage=75`) |
+
+### Check yourself
+1. What happens when a container exceeds its CPU limit? Its memory limit?
+2. Exit code 137 — always OOM?
+3. What is the difference between OOMKilled and Evicted?
+
+<details><summary>Answer</summary>
+
+1. CPU: throttled (slower). Memory: killed (OOMKilled).
+2. No. 137 = SIGKILL. Also from a failed liveness probe or a forced stop. Check `reason`.
+3. OOMKilled = the container hit **its own** limit. Evicted = the **node** was under pressure and the kubelet removed the pod.
+</details>
+
+##MD
+---
+## Incident 5 — Failed scheduling (affinity rules)
+
+### What is it?
+Some replicas are scheduled, others stay Pending forever, because a **scheduling rule** cannot be satisfied — for example "never two replicas on the same node" with more replicas than nodes.
+
+### 🎫 Ticket
+> **RT#5105 — P3** — We scaled `search` to 4 replicas for the sale event. Only 2 are running. The other 2 are Pending for 30 minutes. Cluster has free CPU.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i05-affinity.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search
+  namespace: lab-13
+spec:
+  replicas: 4
+  selector: {matchLabels: {app: search}}
+  template:
+    metadata: {labels: {app: search}}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:   # HARD rule
+            - labelSelector: {matchLabels: {app: search}}
+              topologyKey: kubernetes.io/hostname           # "one search pod per node"
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources: {requests: {cpu: 10m, memory: 16Mi}}
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i05-affinity.yaml
+sleep 15
+kubectl -n lab-13 get pods -l app=search -o wide
+p=$(kubectl -n lab-13 get pods -l app=search --field-selector=status.phase=Pending -o jsonpath='{.items[0].metadata.name}')
+kubectl -n lab-13 describe pod $p | sed -n '/Events:/,$p'
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- Event: `0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 node(s) didn't match pod anti-affinity rules.`
+- There are only 2 schedulable worker nodes, and the **required** anti-affinity allows one `search` pod per node. Replica 3 and 4 can never fit.
+- Fix options:
+  1. Use **preferred** anti-affinity (soft rule) or `topologySpreadConstraints` with `whenUnsatisfiable: ScheduleAnyway`.
+  2. Add nodes (more nodes than replicas).
+  3. Spread by **zone** (`topology.kubernetes.io/zone`) instead of host, if HA by zone is the real goal.
+</details>
+
+##CODE
+%%bash
+# Fix: switch to a soft rule (preferred)
+kubectl -n lab-13 patch deploy search --type=json -p='[
+ {"op":"replace","path":"/spec/template/spec/affinity","value":
+   {"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[
+     {"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app":"search"}},"topologyKey":"kubernetes.io/hostname"}}]}}}]'
+kubectl -n lab-13 rollout status deploy/search --timeout=120s
+kubectl -n lab-13 get pods -l app=search -o wide
+
+##MD
+### Check yourself
+1. What does "IgnoredDuringExecution" mean?
+2. Required vs preferred anti-affinity — which can leave pods Pending?
+
+<details><summary>Answer</summary>
+
+1. The rule is checked only at scheduling time. If labels change later, running pods are not moved.
+2. Required (hard). Preferred only affects scoring.
+</details>
+
+##MD
+---
+## Incident 6 — DNS failures
+
+### What is it?
+Pods find Services by name through **CoreDNS** (Service `kube-dns` in `kube-system`). If a name does not resolve, the app shows errors like `no such host`, `NXDOMAIN`, `Name or service not known`, `getaddrinfo ENOTFOUND`.
+
+### How it works internally
+Each pod's `/etc/resolv.conf` points to the kube-dns Service IP and has **search domains**:
+```
+nameserver 10.96.0.10
+search lab-13.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+A short name like `orders` is tried as `orders.lab-13.svc.cluster.local` — **only in the pod's own namespace**. A Service in another namespace needs `orders.<namespace>` (or the full FQDN).
+
+### 🎫 Ticket
+> **RT#5106 — P2** — `checkout-worker` logs show `cannot reach orders` since the orders team moved their service to its own namespace `lab-13-orders` this morning.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i06-dns.yaml
+apiVersion: v1
+kind: Namespace
+metadata: {name: lab-13-orders}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: orders, namespace: lab-13-orders}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: orders}}
+  template:
+    metadata: {labels: {app: orders}}
+    spec:
+      containers:
+        - {name: web, image: hashicorp/http-echo:1.0, args: ["-listen=:5678", "-text=orders OK"], ports: [{containerPort: 5678}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: orders, namespace: lab-13-orders}
+spec:
+  selector: {app: orders}
+  ports: [{port: 80, targetPort: 5678}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: checkout-worker, namespace: lab-13}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: checkout-worker}}
+  template:
+    metadata: {labels: {app: checkout-worker}}
+    spec:
+      containers:
+        - name: worker
+          image: curlimages/curl:8.10.1
+          env:
+            - {name: ORDERS_URL, value: "http://orders"}   # short name
+          command: ["sh", "-c"]
+          args:
+            - |
+              while true; do
+                if out=$(curl -s -m 2 "$ORDERS_URL"); then echo "ok: $out"; else echo "ERROR: cannot reach orders at $ORDERS_URL"; fi
+                sleep 5
+              done
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i06-dns.yaml
+kubectl -n lab-13 rollout status deploy/checkout-worker --timeout=90s
+kubectl -n lab-13-orders rollout status deploy/orders --timeout=90s
+sleep 10
+kubectl -n lab-13 logs deploy/checkout-worker --tail=3
+
+##MD
+### Investigate
+Test DNS from **inside** the cluster with the client pod. `nslookup` asks DNS directly.
+
+##CODE
+%%bash
+echo "### resolv.conf of a pod in lab-13"; kubectl -n lab-13 exec client -- cat /etc/resolv.conf
+echo "### short name"; kubectl -n lab-13 exec client -- nslookup orders || true
+echo "### with namespace"; kubectl -n lab-13 exec client -- nslookup orders.lab-13-orders || true
+echo "### CoreDNS health"; kubectl -n kube-system get pods -l k8s-app=kube-dns
+kubectl -n kube-system logs -l k8s-app=kube-dns --tail=5
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- `nslookup orders` → `NXDOMAIN` (searched `orders.lab-13.svc.cluster.local`). `nslookup orders.lab-13-orders` → works.
+- CoreDNS is healthy. The problem is the **name**: the Service moved to another namespace, but the app still uses the short name.
+- Fix: `ORDERS_URL=http://orders.lab-13-orders.svc.cluster.local` (FQDN is clearest).
+```
+kubectl -n lab-13 set env deploy/checkout-worker ORDERS_URL=http://orders.lab-13-orders.svc.cluster.local
+```
+- Other DNS causes to check in real incidents: CoreDNS pods down/CrashLoop, CoreDNS overloaded (scale it / NodeLocal DNSCache), NetworkPolicy blocking UDP/TCP 53 (incident 15), wrong upstream forwarders for external names, `ndots:5` causing slow external lookups.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 set env deploy/checkout-worker ORDERS_URL=http://orders.lab-13-orders.svc.cluster.local
+kubectl -n lab-13 rollout status deploy/checkout-worker --timeout=90s
+sleep 8; kubectl -n lab-13 logs deploy/checkout-worker --tail=2
+
+##MD
+### Check yourself
+1. Why does a short Service name only work in the same namespace?
+2. What is the full DNS name of Service `orders` in namespace `shop`?
+3. All DNS fails in all pods. Where do you look first?
+
+<details><summary>Answer</summary>
+
+1. The pod's search list starts with its own namespace (`<ns>.svc.cluster.local`).
+2. `orders.shop.svc.cluster.local`
+3. CoreDNS pods and logs in `kube-system`, the `kube-dns` Service endpoints, and NetworkPolicies blocking port 53.
+</details>
+
+##MD
+---
+## Incident 7 — Service connectivity
+
+### What is it?
+A Service gives a stable IP and DNS name to a set of pods chosen by a **selector**. Traffic flows: **Service → EndpointSlices → Pod IP:targetPort**. If any link is wrong, clients get timeouts or `connection refused`.
+
+```
+client ──▶ Service web (port 80) ──selector──▶ EndpointSlice ──▶ pod IP : targetPort
+                 │                                  │                     │
+           wrong port?                    EMPTY? (selector or        app listening
+                                           readiness problem)         on that port?
+```
+
+### 🎫 Ticket
+> **RT#5107 — P2** — Two internal services are unreachable after a refactor: `web-a` times out / refuses, `web-b` says "connection refused". Pods are all Running.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i07-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: frontend, namespace: lab-13}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: frontend}}
+  template:
+    metadata: {labels: {app: frontend}}
+    spec:
+      containers: [{name: nginx, image: "nginx:1.27-alpine", ports: [{containerPort: 80}]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web-a, namespace: lab-13}
+spec:
+  selector: {app: web-frontend}       # selector
+  ports: [{port: 80, targetPort: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web-b, namespace: lab-13}
+spec:
+  selector: {app: frontend}
+  ports: [{port: 80, targetPort: 8080}]   # targetPort
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i07-service.yaml
+kubectl -n lab-13 rollout status deploy/frontend --timeout=90s
+for s in web-a web-b; do
+  echo "== $s"; kubectl -n lab-13 exec client -- curl -s -m 3 -o /dev/null -w "%{http_code}\n" http://$s || echo "FAILED"
+done
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl -n lab-13 get svc web-a web-b -o wide
+echo "### EndpointSlices"
+kubectl -n lab-13 get endpointslices -l 'kubernetes.io/service-name in (web-a,web-b)'
+echo "### pod labels"
+kubectl -n lab-13 get pods -l app=frontend --show-labels -o wide
+echo "### what port does nginx listen on? (test pod IP directly)"
+ip=$(kubectl -n lab-13 get pod -l app=frontend -o jsonpath='{.items[0].status.podIP}')
+kubectl -n lab-13 exec client -- curl -s -m 3 -o /dev/null -w "pod:80 -> %{http_code}\n" http://$ip:80
+kubectl -n lab-13 exec client -- curl -s -m 3 http://$ip:8080 || echo "pod:8080 -> refused"
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- **web-a:** EndpointSlice has **no endpoints**. Selector `app: web-frontend` matches no pods (pods have `app: frontend`). Fix the selector.
+- **web-b:** endpoints exist, but `targetPort: 8080` — nginx listens on **80** → `connection refused`. Fix `targetPort: 80` (better: use a **named port** like `targetPort: http` so the Service follows the container).
+- Rule: **empty endpoints = selector or readiness problem. Endpoints present but refused = port problem.**
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 patch svc web-a -p '{"spec":{"selector":{"app":"frontend"}}}'
+kubectl -n lab-13 patch svc web-b --type=json -p='[{"op":"replace","path":"/spec/ports/0/targetPort","value":80}]'
+for s in web-a web-b; do kubectl -n lab-13 exec client -- curl -s -m 3 -o /dev/null -w "$s %{http_code}\n" http://$s; done
+
+##MD
+### Check yourself
+1. Endpoints are empty, but pods have the right labels. What else can cause this?
+2. Why are named target ports better?
+
+<details><summary>Answer</summary>
+
+1. Pods are not **Ready** (readiness probe failing) — not-ready pods are not used as endpoints (they appear as `ready: false`). Or pods are in another namespace.
+2. If the container port changes, the Service still finds it by name; fewer mismatches.
+</details>
+
+##MD
+---
+## Incident 8 — Ingress problems
+
+### What is it?
+An **Ingress** is a set of HTTP routing rules (host, path → Service). An **Ingress controller** (here ingress-nginx) reads them and configures its proxy. Two common breaks:
+- The Ingress is not picked up by any controller (wrong or missing `ingressClassName`) → no ADDRESS, controller returns **404**.
+- The rule points to a Service name/port that does not exist or has no endpoints → **503**.
+
+```
+curl Host: shop.lab13.local ─▶ ingress-nginx ─(match host+path in Ingress with class nginx)─▶ Service ─▶ pods
+```
+
+First make sure ingress-nginx (notebook 04) is installed:
+
+##CODE
+%%bash
+if kubectl get ns ingress-nginx >/dev/null 2>&1; then echo "ingress-nginx present"; else
+  kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml; fi
+kubectl -n ingress-nginx wait --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=180s
+kubectl get ingressclass
+
+##MD
+### 🎫 Ticket
+> **RT#5108 — P1** — After moving to the new ingress setup, `shop.lab13.local` returns 404 and `admin.lab13.local` returns 503.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i08-ingress.yaml
+apiVersion: v1
+kind: Service
+metadata: {name: shop-front, namespace: lab-13}
+spec:
+  selector: {app: frontend}            # reuses the frontend pods from incident 7
+  ports: [{name: http, port: 80, targetPort: 80}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: shop, namespace: lab-13}
+spec:
+  ingressClassName: nginx-internal     # class
+  rules:
+    - host: shop.lab13.local
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: shop-front, port: {number: 80}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: admin, namespace: lab-13}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: admin.lab13.local
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: shop-frontend, port: {number: 80}}}}   # service name
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i08-ingress.yaml
+sleep 10
+for h in shop.lab13.local admin.lab13.local; do
+  curl -s -o /dev/null -w "$h -> %{http_code}\n" -H "Host: $h" http://localhost/
+done
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl -n lab-13 get ingress
+kubectl get ingressclass
+kubectl -n lab-13 describe ingress admin | sed -n '/Rules:/,/Events/p'
+echo "### controller log lines about lab-13"
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=200 | grep -i 'lab-13' | tail -5
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- **shop (404):** `ingressClassName: nginx-internal` — no IngressClass with that name exists, so no controller serves this Ingress (no ADDRESS). The controller's default backend answers 404. Fix: `ingressClassName: nginx`.
+- **admin (503):** backend Service `shop-frontend` does not exist (`describe` shows `<error: services "shop-frontend" not found>`). Fix: `shop-front`.
+- Checklist for ingress: class → host header → path/pathType → Service exists → Service has endpoints → TLS secret valid → controller logs.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 patch ingress shop --type=json -p='[{"op":"replace","path":"/spec/ingressClassName","value":"nginx"}]'
+kubectl -n lab-13 patch ingress admin --type=json -p='[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/name","value":"shop-front"}]'
+sleep 8
+for h in shop.lab13.local admin.lab13.local; do curl -s -o /dev/null -w "$h -> %{http_code}\n" -H "Host: $h" http://localhost/; done
+
+##MD
+Note: community ingress-nginx was retired in 2026. The same debugging logic applies to any controller and to Gateway API (`GatewayClass` → `Gateway` → `HTTPRoute` status conditions show `Accepted` / `ResolvedRefs`).
+
+### Check yourself
+1. 404 vs 503 from the ingress controller — what does each usually mean?
+2. How do you check which controller handles an Ingress?
+
+<details><summary>Answer</summary>
+
+1. 404: no rule matched (wrong host/path, or the Ingress is not served by this controller). 503: rule matched but backend Service is missing or has no ready endpoints.
+2. Look at `spec.ingressClassName` and `kubectl get ingressclass` (controller field); the ADDRESS column is set by the controller that owns it.
+</details>
+
+##MD
+---
+## Incident 9 — Certificate expiration
+
+### What is it?
+TLS certificates have an end date (`notAfter`). After it, clients refuse the connection (`certificate has expired`). Kubernetes has many certificates: **ingress/app certs** (often from cert-manager), and on self-managed clusters the **control plane certs** (API server, kubelet, etcd — kubeadm makes them valid for 1 year).
+
+### Real production scenario
+An internal API's certificate was made by hand a year ago. Nobody tracked it. At 00:00 on its expiry day all mobile apps fail. Fix takes 3 hours because nobody knows where the key is. Lesson: automate (cert-manager) and **monitor days-to-expiry**.
+
+### 🎫 Ticket
+> **RT#5109 — P3 (proactive)** — Security scan says `shop.lab13.local` certificate "expires soon". Confirm the expiry date and check the cluster's own certificates.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##MD
+Create a certificate valid for only **1 day**, store it in a TLS Secret, and serve it through the `shop` Ingress.
+
+##CODE
+%%bash
+cd labs/13
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout shop.key -out shop.crt -subj "/CN=shop.lab13.local" 2>/dev/null
+kubectl -n lab-13 create secret tls shop-tls --cert=shop.crt --key=shop.key --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n lab-13 patch ingress shop --type=merge -p '{"spec":{"tls":[{"hosts":["shop.lab13.local"],"secretName":"shop-tls"}]}}'
+sleep 8; echo "TLS configured"
+
+##MD
+### Investigate — three places to check a certificate
+
+##CODE
+%%bash
+echo "### 1. Certificate served on the wire (what clients see)"
+echo | openssl s_client -connect localhost:443 -servername shop.lab13.local 2>/dev/null | openssl x509 -noout -subject -enddate
+echo "### 2. Certificate stored in the Kubernetes Secret"
+kubectl -n lab-13 get secret shop-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -enddate
+echo "### 3. Will it expire in the next 30 days? (-checkend seconds)"
+kubectl -n lab-13 get secret shop-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -checkend $((30*24*3600)) || true
+
+##MD
+Now the **cluster's own** certificates. kind uses kubeadm, so we can ask kubeadm on the control-plane node.
+
+##CODE
+%%bash
+docker exec learn-control-plane kubeadm certs check-expiration 2>/dev/null | head -20
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- `notAfter` is tomorrow; `-checkend` prints `Certificate will expire`.
+- If on the wire you see a **different** cert (e.g. "Kubernetes Ingress Controller Fake Certificate"), the controller could not load your Secret (wrong name, wrong namespace, bad format, host mismatch).
+- Fix: renew and replace the Secret. Proper fix: **cert-manager** with an Issuer (Let's Encrypt or internal CA) renews automatically ~30 days before expiry; add an alert:
+  - with cert-manager: `certmanager_certificate_expiration_timestamp_seconds - time() < 14*24*3600`
+  - generic: blackbox exporter `probe_ssl_earliest_cert_expiry - time()`.
+- Control plane (self-managed kubeadm): `kubeadm certs renew all` then restart control plane static pods. Managed clusters (OKE/EKS/AKS) rotate control-plane certs for you; kubelet client certs rotate automatically.
+</details>
+
+##MD
+### Check yourself
+1. Name two ways to read a certificate's expiry date in Kubernetes.
+2. The browser shows "Kubernetes Ingress Controller Fake Certificate". Why?
+
+<details><summary>Answer</summary>
+
+1. `openssl s_client ... | openssl x509 -noout -enddate` (on the wire) and decoding `tls.crt` from the Secret; also cert-manager `kubectl get certificate`.
+2. The controller could not use your TLS Secret (missing, wrong namespace, invalid, or host not in `tls.hosts`), so it serves its default self-signed cert.
+</details>
+
+##MD
+---
+## Incident 10 — Persistent storage failures
+
+### What is it?
+A pod waits for its volume. Common causes: the StorageClass cannot provide the requested **access mode**, the provisioner fails, the volume is in another zone/node than the pod, a block volume is still attached to an old node (`Multi-Attach error`), or the disk is full.
+
+### How it works internally
+PVC → StorageClass → **provisioner** (CSI driver) creates a PV → PV binds to PVC → kubelet **attaches** and **mounts** the volume. With `volumeBindingMode: WaitForFirstConsumer` (kind's `standard`, also OKE's block volume class), provisioning waits until a pod is scheduled — so errors appear only after you create the pod.
+
+### 🎫 Ticket
+> **RT#5110 — P2** — New `shared-uploads` app is stuck in Pending. It needs a volume shared by 2 replicas.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i10-storage.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: uploads, namespace: lab-13}
+spec:
+  storageClassName: standard          # kind default (local-path provisioner)
+  accessModes: [ReadWriteMany]        # access mode
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: shared-uploads, namespace: lab-13}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: shared-uploads}}
+  template:
+    metadata: {labels: {app: shared-uploads}}
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "date >> /uploads/log.txt; sleep 3600"]
+          volumeMounts: [{name: uploads, mountPath: /uploads}]
+      volumes:
+        - name: uploads
+          persistentVolumeClaim: {claimName: uploads}
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i10-storage.yaml
+sleep 20
+kubectl -n lab-13 get pvc uploads
+kubectl -n lab-13 get pods -l app=shared-uploads
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl -n lab-13 describe pvc uploads | sed -n '/Events:/,$p'
+kubectl get storageclass standard -o yaml | grep -E 'provisioner|volumeBindingMode'
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- PVC event: `failed to provision volume ... NodePath only supports ReadWriteOnce and ReadWriteOncePod access modes`. The local-path provisioner (node-local disk) cannot share one volume between nodes.
+- Same in the cloud: OCI Block Volume / EBS / Azure Disk are **ReadWriteOnce** (one node). For shared files use a file service: **OCI File Storage (FSS)** CSI, EFS, Azure Files — or object storage in the app.
+- Lab fix: use `ReadWriteOnce` and 1 replica (or a StatefulSet with one PVC per pod). `accessModes` is immutable → delete and recreate the PVC.
+- Other storage incidents: `Multi-Attach error for volume` (RWO volume still attached to old node — wait for detach or fix the stuck node); `volume node affinity conflict` (PV in another zone); `No space left on device` (expand PVC if `allowVolumeExpansion: true`).
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 delete deploy shared-uploads; kubectl -n lab-13 delete pvc uploads
+sed -e 's/ReadWriteMany/ReadWriteOnce/' -e 's/replicas: 2/replicas: 1/' labs/13/i10-storage.yaml | kubectl apply -f -
+kubectl -n lab-13 rollout status deploy/shared-uploads --timeout=120s
+kubectl -n lab-13 get pvc uploads
+
+##MD
+### Check yourself
+1. Why did the PVC show no error until the pod was created?
+2. Your app needs one shared folder for 3 replicas on OKE. Which storage?
+3. What is a Multi-Attach error?
+
+<details><summary>Answer</summary>
+
+1. `WaitForFirstConsumer`: provisioning starts only when a pod using the PVC is scheduled.
+2. A ReadWriteMany file system: OCI File Storage via its CSI driver (or redesign to use object storage).
+3. A ReadWriteOnce volume is still attached to another node, so it cannot attach to the new node.
+</details>
+
+##MD
+---
+## Incident 11 — Node NotReady
+
+### What is it?
+The kubelet on each node sends **heartbeats** (Lease objects + node status). If the control plane gets no heartbeat for the grace period (about 40–50 s), the node becomes **NotReady**. After about **5 minutes** (default toleration `node.kubernetes.io/unreachable` with `tolerationSeconds: 300`), pods on it are marked for eviction and Deployments recreate them elsewhere.
+
+Common causes: kubelet stopped/crashed, container runtime down, node out of disk/memory/PIDs, network loss to the API server, VM stopped.
+
+```
+ kubelet ──heartbeat every 10s──▶ API server (Lease)
+   ✗ stopped
+ node-lifecycle-controller: no heartbeat 40-50s → Ready=Unknown (NotReady)
+                            → taint node.kubernetes.io/unreachable
+                            → after 300s: evict pods → recreated on other nodes
+```
+
+### 🎫 Ticket
+> **RT#5111 — P1** — Monitoring shows node `learn-worker2` NotReady. Some pods show `Terminating` and others are stuck.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##MD
+We **simulate** the failure: stop the kubelet inside the kind node container. (A harder version: `docker stop learn-worker2` = the whole VM is gone.) Then watch for ~70 seconds.
+
+##CODE
+%%bash
+kubectl -n lab-13 create deployment node-test --image=nginx:1.27-alpine --replicas=4
+kubectl -n lab-13 rollout status deploy/node-test --timeout=90s
+kubectl -n lab-13 get pods -l app=node-test -o wide
+echo ">>> stopping kubelet on learn-worker2"
+docker exec learn-worker2 systemctl stop kubelet
+for i in $(seq 1 7); do sleep 10; echo "t=$((i*10))s: $(kubectl get node learn-worker2 --no-headers | awk '{print $2}')"; done
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl get nodes
+kubectl describe node learn-worker2 | sed -n '/Conditions:/,/Addresses:/p'
+kubectl describe node learn-worker2 | grep -A3 Taints
+kubectl -n lab-13 get pods -l app=node-test -o wide
+echo "### on the node itself (like SSH to the VM):"
+docker exec learn-worker2 systemctl is-active kubelet || true
+docker exec learn-worker2 sh -c 'journalctl -u kubelet --no-pager | tail -5'
+
+##MD
+**What you see:** conditions `Unknown` with message `Kubelet stopped posting node status`; taints `node.kubernetes.io/unreachable`; pods on that node still show `Running` (the API server cannot know their real state). `systemctl is-active kubelet` → `inactive`.
+
+<details><summary>Root cause and fix</summary>
+
+- kubelet is stopped on the node → no heartbeats → NotReady.
+- Real-world steps: SSH/console to the node → `systemctl status kubelet containerd`, `journalctl -u kubelet`, `df -h` (disk full is very common), `free -m`, check network to the API endpoint.
+- Fix here: start kubelet. In the cloud, if a node is broken, **cordon + drain** and replace it (node pools / autoscaler do this).
+- If you wait more than 5 minutes, the 4 pods on the dead node become `Terminating` and replacements start on `learn-worker` — that's the automatic recovery for Deployments. StatefulSet pods are **not** replaced automatically while the node is unknown (to avoid two copies writing the same data) — you must confirm the node is dead (delete the Node object or the pod with care).
+</details>
+
+##CODE
+%%bash
+echo ">>> RESTORE: start kubelet again"
+docker exec learn-worker2 systemctl start kubelet
+kubectl wait --for=condition=Ready node/learn-worker2 --timeout=120s
+kubectl get nodes
+kubectl -n lab-13 delete deploy node-test
+
+##MD
+### Lab vs production
+| Lab | Production |
+|---|---|
+| `systemctl start kubelet` | Find cause (disk, memory, network), fix or replace node; cordon/drain first |
+| Wait and watch | Alerts: `KubeNodeNotReady`, `KubeNodeUnreachable`; node auto-repair in managed node pools |
+| — | Enough spare capacity and PDBs so losing one node does not cause an outage |
+
+### Check yourself
+1. How long until pods are evicted from a NotReady node by default?
+2. Why do pods on the dead node still say `Running`?
+3. Name 3 common causes of NotReady.
+
+<details><summary>Answer</summary>
+
+1. About 5 minutes (300 s toleration for `unreachable`/`not-ready`), after the node becomes NotReady.
+2. Status is reported by the kubelet. The kubelet is down, so nobody updates it.
+3. kubelet/containerd stopped, disk full / memory pressure, network loss to the API server (also VM stopped, expired kubelet cert).
+</details>
+
+##MD
+---
+## Incident 12 — High CPU and memory
+
+### What is it?
+- **High CPU in a pod with a CPU limit** → **throttling**: the app gets slow (latency up), but it is not killed.
+- **High memory** → near the limit → OOMKilled (incident 4). Node-level memory pressure → evictions.
+
+### 🎫 Ticket
+> **RT#5112 — P3** — `pricing-engine` responses are very slow. No errors, no restarts.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i12-cpu.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pricing-engine, namespace: lab-13}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: pricing-engine}}
+  template:
+    metadata: {labels: {app: pricing-engine}}
+    spec:
+      containers:
+        - name: engine
+          image: python:3.12-alpine
+          command: ["python", "-c", "while True: pass"]   # busy loop = wants 100% of a core
+          resources:
+            requests: {cpu: 100m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 64Mi}            # allowed only 0.2 core
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i12-cpu.yaml
+kubectl -n lab-13 rollout status deploy/pricing-engine --timeout=90s
+sleep 60     # metrics-server needs time for a sample
+
+##MD
+### Investigate
+##CODE
+%%bash
+echo "### pod usage vs limit"; kubectl -n lab-13 top pod -l app=pricing-engine
+echo "### nodes"; kubectl top nodes
+echo "### top 5 CPU pods in cluster"; kubectl top pods -A --sort-by=cpu | head -6
+p=$(kubectl -n lab-13 get pod -l app=pricing-engine -o jsonpath='{.items[0].metadata.name}')
+echo "### cgroup throttling counters inside the container (cgroup v2)"
+kubectl -n lab-13 exec $p -- cat /sys/fs/cgroup/cpu.stat 2>/dev/null | grep -E 'nr_periods|nr_throttled|throttled_usec'
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- `kubectl top` shows CPU stuck at ~**200m** = exactly the limit. `cpu.stat` shows `nr_throttled` growing → the container is **throttled**.
+- In Prometheus (notebook 12): `rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])` high.
+- Fix: raise the CPU limit (or remove CPU limits and keep good requests — many teams do this for latency-sensitive apps), scale out with HPA, or optimise the code. Here the code is a bug (busy loop).
+- For memory: compare `kubectl top` with the limit; check node `MemoryPressure` condition; find the biggest consumers with `kubectl top pods -A --sort-by=memory`.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 delete deploy pricing-engine
+
+##MD
+### Check yourself
+1. `kubectl top` shows a pod at exactly its CPU limit. What happens to the app?
+2. Where does `kubectl top` get its data?
+3. Why is "remove CPU limits" sometimes recommended?
+
+<details><summary>Answer</summary>
+
+1. It is throttled: it gets no more CPU time in each period, so requests get slower.
+2. From metrics-server (kubelet resource metrics). No metrics-server → `kubectl top` fails.
+3. Limits can throttle even when the node has idle CPU, hurting latency. With good requests, pods still get a fair share. (Memory limits should stay.)
+</details>
+
+##MD
+---
+## Incident 13 — etcd problems
+
+### What is it?
+**etcd** is the key-value database that stores **all** cluster state. If etcd is slow, out of space, or loses quorum, the API server fails: `kubectl` hangs, `etcdserver: request timed out`, `mvcc: database space exceeded`.
+
+Common causes: slow disk (etcd needs low-latency fsync), too much data (many events/large objects), no defragmentation, lost quorum (2 of 3 members down), expired certs.
+
+On **managed clusters (OKE/EKS/AKS)** you cannot access etcd — the provider runs it. On self-managed clusters (kubeadm) you must monitor and **back it up**.
+
+```
+3 members: quorum = 2. Lose 1 → OK. Lose 2 → no writes, cluster frozen.
+kube-apiserver ──gRPC/TLS──▶ etcd (leader) ⇄ followers (Raft)
+```
+
+### Lab: check etcd health and take a backup (kind = kubeadm-style, single member)
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##MD
+`etcdctl` is inside the etcd static pod. It needs TLS certificates — the same ones the API server uses.
+
+##CODE
+%%bash
+E="kubectl -n kube-system exec etcd-learn-control-plane -- etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key"
+echo "### health";  $E endpoint health
+echo "### status (DB size, leader, raft index)"; $E endpoint status -w table
+echo "### members"; $E member list -w table
+echo "### alarms (NOSPACE = database full)"; $E alarm list
+echo "### how many keys per resource type (top 5)"
+$E get /registry --prefix --keys-only | grep -v '^$' | cut -d/ -f3 | sort | uniq -c | sort -rn | head -5
+
+##MD
+**Backup:** take a snapshot (into `/var/lib/etcd`, a host path on the node) and copy it to your Mac. This is the most important etcd task for self-managed clusters.
+
+##CODE
+%%bash
+E="kubectl -n kube-system exec etcd-learn-control-plane -- etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key"
+$E snapshot save /var/lib/etcd/lab13-snapshot.db
+docker cp learn-control-plane:/var/lib/etcd/lab13-snapshot.db labs/13/etcd-snapshot.db
+ls -lh labs/13/etcd-snapshot.db
+kubectl -n kube-system exec etcd-learn-control-plane -- etcdutl snapshot status /var/lib/etcd/lab13-snapshot.db -w table 2>/dev/null \
+  || echo "(etcdutl not in this image; snapshot saved OK)"
+docker exec learn-control-plane rm -f /var/lib/etcd/lab13-snapshot.db
+
+##MD
+Restore (read; do **not** run on your lab unless you want to practise a full rebuild): stop the API server and etcd static pods, `etcdutl snapshot restore snapshot.db --data-dir /var/lib/etcd-restored`, point the etcd manifest `hostPath` to the new dir, start again. All objects created after the snapshot are lost.
+
+### Troubleshooting table
+| Symptom | Cause | Fix |
+|---|---|---|
+| `mvcc: database space exceeded`, alarm NOSPACE | DB hit quota (default 2 GB, often set to 8 GB) | Compact + defrag, then `alarm disarm`; find what fills it (events, big CRDs) |
+| API slow, `etcdserver: request timed out` | Slow disk (high fsync latency) | Fast SSD/NVMe; metric `etcd_disk_wal_fsync_duration_seconds` p99 < 10 ms |
+| Frequent leader changes | Network or disk latency, overloaded | Dedicated nodes/disks, check `etcd_server_leader_changes_seen_total` |
+| No writes at all | Lost quorum | Restore failed members, or restore from snapshot |
+
+### Check yourself
+1. With 3 etcd members, how many can fail without losing writes?
+2. Why is a regular etcd snapshot critical on self-managed clusters?
+3. Can you take etcd snapshots on OKE?
+
+<details><summary>Answer</summary>
+
+1. One (quorum 2 of 3). For 2 failures you need 5 members.
+2. etcd holds all cluster state. Without a snapshot, losing etcd means rebuilding every object (or relying only on GitOps + data backups).
+3. No, the control plane is managed by Oracle. You back up **your** resources and volumes instead (Velero, Commvault Kubernetes backup, GitOps repos).
+</details>
+
+##MD
+---
+## Incident 14 — Control plane failure (scheduler down)
+
+### What is it?
+On kubeadm clusters the control plane components (`kube-apiserver`, `kube-scheduler`, `kube-controller-manager`, `etcd`) are **static pods**: the kubelet on the control-plane node runs every YAML file in `/etc/kubernetes/manifests/`. Remove the file → the component stops. A bad edit there → the component crash-loops.
+
+Each component failing looks different:
+
+| Component down | What you notice |
+|---|---|
+| kube-apiserver | `kubectl` fails: `connection refused` / timeouts. Running pods keep running. |
+| kube-scheduler | New pods stay **Pending with NO events** (nobody even tries) |
+| kube-controller-manager | Deployments don't create ReplicaSets/pods, no node lifecycle, no GC |
+| etcd | API errors / timeouts (incident 13) |
+
+### 🎫 Ticket
+> **RT#5114 — P1** — Since a "small config change" on the control plane, no new pods start anywhere. Scaling up does nothing. Existing apps still work.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##MD
+**Break it:** move the scheduler's static pod manifest out of the manifests folder (like a bad change would).
+
+##CODE
+%%bash
+docker exec learn-control-plane mv /etc/kubernetes/manifests/kube-scheduler.yaml /root/kube-scheduler.yaml.bak
+sleep 20
+kubectl -n lab-13 create deployment cp-test --image=nginx:1.27-alpine --replicas=2
+sleep 15
+kubectl -n lab-13 get pods -l app=cp-test
+
+##MD
+### Investigate
+##CODE
+%%bash
+p=$(kubectl -n lab-13 get pods -l app=cp-test -o jsonpath='{.items[0].metadata.name}')
+echo "### pod events (notice: no FailedScheduling at all)"; kubectl -n lab-13 describe pod $p | sed -n '/Events:/,$p'
+echo "### pod nodeName (empty = never scheduled)"; kubectl -n lab-13 get pod $p -o jsonpath='{.spec.nodeName}{"\n"}'
+echo "### control plane pods"; kubectl -n kube-system get pods -l tier=control-plane
+echo "### static pod manifests on the node"; docker exec learn-control-plane ls /etc/kubernetes/manifests/
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- Pods are Pending with **no events** and no `nodeName` → no scheduler is running. `kube-scheduler-learn-control-plane` is missing; `kube-scheduler.yaml` is not in `/etc/kubernetes/manifests/`.
+- Fix: put the manifest back; the kubelet starts the scheduler within seconds, and it schedules the Pending pods.
+- Real life: keep control-plane config in Git/Ansible, change one node at a time, keep a backup of `/etc/kubernetes/`, and read kubelet logs (`journalctl -u kubelet`) and container logs (`crictl ps -a`, `crictl logs`) on the control-plane node when a static pod crash-loops.
+</details>
+
+##CODE
+%%bash
+echo ">>> RESTORE the scheduler"
+docker exec learn-control-plane mv /root/kube-scheduler.yaml.bak /etc/kubernetes/manifests/kube-scheduler.yaml
+# The mirror pod appears after a few seconds; wait for it to exist, then to be Ready
+for i in $(seq 1 30); do kubectl -n kube-system get pod kube-scheduler-learn-control-plane >/dev/null 2>&1 && break; sleep 2; done
+kubectl -n kube-system wait --for=condition=Ready pod/kube-scheduler-learn-control-plane --timeout=120s
+kubectl -n lab-13 rollout status deploy/cp-test --timeout=90s
+kubectl -n lab-13 get pods -l app=cp-test -o wide
+kubectl -n lab-13 delete deploy cp-test
+
+##MD
+### Check yourself
+1. Pods Pending with a `FailedScheduling` event vs Pending with no events — what is the difference?
+2. Where are static pod manifests on a kubeadm node?
+3. On OKE, who fixes a scheduler failure?
+
+<details><summary>Answer</summary>
+
+1. With FailedScheduling, the scheduler ran but found no node. With no events, the scheduler is probably not running at all.
+2. `/etc/kubernetes/manifests/` (the kubelet `staticPodPath`).
+3. Oracle (managed control plane). You open a support ticket; you can still debug your side (quotas, webhooks, node health).
+</details>
+
+##MD
+---
+## Incident 15 — Network outage caused by a NetworkPolicy
+
+### What is it?
+A **NetworkPolicy** limits pod traffic. As soon as **any** policy selects a pod for a direction (Ingress or Egress), **all** traffic in that direction is denied except what is explicitly allowed. A classic outage: a team adds "default deny egress" for security and **forgets DNS**. Every app in the namespace fails to resolve names.
+
+Note: NetworkPolicy needs a CNI that enforces it (Calico, Cilium, OCI VCN-native with Calico, and kindnet in kind v0.24+). If a policy "does nothing", check the CNI.
+
+### 🎫 Ticket
+> **RT#5115 — P1** — After the security hardening CR in namespace `lab-13`, every app shows `could not resolve host`. Nothing else changed.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%bash
+echo "before the CR:"
+kubectl -n lab-13 exec client -- curl -s -m 3 -o /dev/null -w "web-a -> %{http_code}\n" http://web-a || echo "web-a FAILED"
+
+##CODE
+%%writefile labs/13/i15-netpol.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: lab-13
+spec:
+  podSelector: {}               # ALL pods in lab-13
+  policyTypes: [Egress]         # control outgoing traffic
+  egress:
+    - to:
+        - podSelector: {}       # allow traffic to pods in the same namespace only
+      ports:
+        - {protocol: TCP, port: 80}
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i15-netpol.yaml
+sleep 5
+echo "after the CR:"
+kubectl -n lab-13 exec client -- curl -s -m 5 -o /dev/null -w "web-a -> %{http_code}\n" http://web-a || echo "web-a FAILED"
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl -n lab-13 get networkpolicy
+echo "### DNS test"; kubectl -n lab-13 exec client -- nslookup web-a 2>&1 | tail -3
+echo "### direct to Service IP (no DNS)"
+ip=$(kubectl -n lab-13 get svc web-a -o jsonpath='{.spec.clusterIP}')
+kubectl -n lab-13 exec client -- curl -s -m 3 -o /dev/null -w "web-a by IP -> %{http_code}\n" http://$ip || echo "by IP FAILED"
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- By IP → **200**; by name → DNS timeout. So the network to pods is fine; **DNS is blocked**.
+- The policy allows egress only to pods in `lab-13` on TCP 80. DNS goes to CoreDNS pods in `kube-system` on **UDP and TCP 53** → denied.
+- Fix: always add a DNS rule to egress policies:
+```yaml
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+```
+- Process fix: test NetworkPolicy changes in staging, roll out with a quick rollback plan, and keep a "connectivity smoke test" job.
+</details>
+
+##CODE
+%%bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns-egress, namespace: lab-13}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+EOF
+sleep 5
+kubectl -n lab-13 exec client -- curl -s -m 5 -o /dev/null -w "web-a -> %{http_code}\n" http://web-a
+# Remove both policies so later incidents are not affected
+kubectl -n lab-13 delete networkpolicy default-deny-egress allow-dns-egress
+
+##MD
+If the "after the CR" test still returned 200, your kind version does not enforce NetworkPolicy. Read the lesson anyway — on OKE with Calico or Cilium this exact outage happens.
+
+### Check yourself
+1. Why did access by IP work while access by name failed?
+2. Policies are additive. If two policies select a pod, what is allowed?
+3. Which ports and protocols does DNS need?
+
+<details><summary>Answer</summary>
+
+1. The policy allowed TCP 80 to pods in the namespace, but blocked traffic to CoreDNS on port 53.
+2. The **union** of all their allow rules. There are no "deny" rules in standard NetworkPolicy; deny comes from being selected.
+3. UDP 53 and TCP 53 (TCP for large responses).
+</details>
+
+##MD
+---
+## Incident 16 — Application downtime during rollouts and node drains
+
+### What is it?
+Users see errors **during a normal deploy** or **during node maintenance**, even though the new version is fine. Typical causes:
+- **No readiness probe:** the pod is marked Ready as soon as the container starts, before the app listens. Traffic goes to it → errors. Old pods are already removed.
+- **No PodDisruptionBudget (PDB):** a node drain (patching, node pool upgrade) evicts **all** replicas on that node at once.
+- Also: no graceful shutdown (`preStop` sleep + SIGTERM handling), `maxUnavailable` too high, all replicas on one node.
+
+### 🎫 Ticket
+> **RT#5116 — P2** — Every deployment of `catalog-api` causes ~15 seconds of errors (connection refused). Also during last night's node patching the service was fully down for 2 minutes.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null); [ "$ctx" = "kind-learn" ] || { echo "STOP: context '$ctx'"; exit 1; }; echo "OK: kind-learn"
+
+##CODE
+%%writefile labs/13/i16-downtime.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: catalog-api, namespace: lab-13}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: catalog-api}}
+  template:
+    metadata: {labels: {app: catalog-api}}
+    spec:
+      containers:
+        - name: api
+          image: busybox:1.36
+          # The app needs 15 seconds to "warm up" before it listens on 8080
+          command: ["sh", "-c", "echo warming up; sleep 15; echo ok > /tmp/index.html; httpd -f -p 8080 -h /tmp"]
+          ports: [{containerPort: 8080}]
+          # NOTE: no readinessProbe
+---
+apiVersion: v1
+kind: Service
+metadata: {name: catalog-api, namespace: lab-13}
+spec:
+  selector: {app: catalog-api}
+  ports: [{port: 80, targetPort: 8080}]
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i16-downtime.yaml
+kubectl -n lab-13 rollout status deploy/catalog-api --timeout=120s
+sleep 16   # let the first pods warm up
+
+##MD
+Now we simulate a deploy (`rollout restart`) while a client sends 2 requests per second for 40 seconds and counts failures.
+
+##CODE
+%%bash
+probe() {
+  kubectl -n lab-13 exec client -- sh -c 'ok=0; fail=0; for i in $(seq 1 80); do
+    if curl -s -m 1 -o /dev/null http://catalog-api; then ok=$((ok+1)); else fail=$((fail+1)); fi; sleep 0.5; done
+    echo "ok=$ok fail=$fail"'
+}
+probe > labs/13/probe-before.txt &
+sleep 3
+kubectl -n lab-13 rollout restart deploy/catalog-api
+wait
+echo "Result WITHOUT readiness probe: $(cat labs/13/probe-before.txt)"
+
+##MD
+### Investigate
+##CODE
+%%bash
+kubectl -n lab-13 get deploy catalog-api -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}{"\n"}' ; echo "(empty = no readiness probe)"
+kubectl -n lab-13 get deploy catalog-api -o jsonpath='{.spec.strategy}{"\n"}'
+kubectl get pdb -n lab-13
+
+##MD
+<details><summary>Root cause and fix</summary>
+
+- No readiness probe: new pods became "Ready" immediately (container running), got traffic during their 15 s warm-up → `connection refused`. The rolling update also removed old pods because the new ones looked ready.
+- No PDB: a drain could evict all replicas on a node at once.
+- **Fix 1:** readiness probe (and a startup probe for slow starters). The rollout waits until each new pod really serves traffic.
+- **Fix 2:** PDB (e.g. `maxUnavailable: 1`) + spread replicas across nodes (topology spread / anti-affinity).
+- **Fix 3 (graceful shutdown):** `preStop: sleep 5` and handle SIGTERM, so in-flight requests finish while endpoints are removed.
+</details>
+
+##CODE
+%%bash
+# Fix 1: add a readiness probe
+kubectl -n lab-13 patch deploy catalog-api --type=json -p='[
+ {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe",
+  "value":{"httpGet":{"path":"/","port":8080},"periodSeconds":2,"failureThreshold":1}}]'
+kubectl -n lab-13 rollout status deploy/catalog-api --timeout=180s
+probe() {
+  kubectl -n lab-13 exec client -- sh -c 'ok=0; fail=0; for i in $(seq 1 80); do
+    if curl -s -m 1 -o /dev/null http://catalog-api; then ok=$((ok+1)); else fail=$((fail+1)); fi; sleep 0.5; done
+    echo "ok=$ok fail=$fail"'
+}
+probe > labs/13/probe-after.txt &
+sleep 3
+kubectl -n lab-13 rollout restart deploy/catalog-api
+wait
+echo "WITHOUT probe: $(cat labs/13/probe-before.txt)"
+echo "WITH probe:    $(cat labs/13/probe-after.txt)"
+
+##MD
+**Expected:** before: `fail` > 0 (often 10–30). After: `fail=0` (or very close).
+
+### PDB and node drain
+A **PodDisruptionBudget** limits **voluntary** disruptions (drain, node upgrade, cluster autoscaler scale-down). `kubectl drain` uses the **Eviction API**, which respects PDBs. It does not protect against crashes or node failures (involuntary).
+
+##CODE
+%%writefile labs/13/i16-pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: catalog-api, namespace: lab-13}
+spec:
+  maxUnavailable: 1               # at most 1 catalog-api pod may be evicted at a time
+  selector:
+    matchLabels: {app: catalog-api}
+
+##MD
+Now drain `learn-worker` (like the patching window). A real drain evicts **all** pods on the node. To keep the rest of the lab safe we add `--pod-selector=app=catalog-api`, so only catalog-api pods are evicted (the node is still cordoned). The drain respects the PDB: it evicts catalog-api pods one at a time, waiting until a replacement is Ready. Then we **uncordon** the node.
+
+##CODE
+%%bash
+kubectl apply -f labs/13/i16-pdb.yaml
+kubectl -n lab-13 get pdb catalog-api
+kubectl -n lab-13 get pods -l app=catalog-api -o wide
+kubectl drain learn-worker --pod-selector=app=catalog-api --ignore-daemonsets --delete-emptydir-data --timeout=180s 2>&1 | grep -E 'evicting pod lab-13|Cannot evict|drained|error' | head -20
+kubectl -n lab-13 get pods -l app=catalog-api -o wide
+echo ">>> RESTORE: uncordon"
+kubectl uncordon learn-worker
+
+##MD
+If you see `Cannot evict pod as it would violate the pod's disruption budget`, the drain is **waiting** for a replacement to become Ready — that is the PDB protecting you. A PDB that **never** allows eviction (e.g. `minAvailable: 3` with 3 replicas) blocks node maintenance forever — a common real problem for platform teams.
+
+### Check yourself
+1. Why did requests fail during the rollout without a readiness probe?
+2. Does a PDB protect against a node crash?
+3. What is wrong with `minAvailable: 100%`?
+
+<details><summary>Answer</summary>
+
+1. New pods were Ready before the app listened, so they got traffic too early, and old pods were removed.
+2. No. PDBs only limit voluntary evictions (drain, upgrades, autoscaler). Node crashes are involuntary.
+3. No pod can ever be evicted, so drains and node upgrades block.
+</details>
+
+##MD
+---
+## Incident report / RCA template
+
+After every real incident, write a short report. No blame — focus on systems and processes. Copy this cell into your notes and fill it for one of the labs above (for example Incident 16).
+
+```markdown
+# Incident report — RT#____  <short title>
+
+**Severity:** P1 / P2 / P3        **Status:** Resolved
+**Date:** ____   **Duration:** start __:__ → detected __:__ → mitigated __:__ → resolved __:__
+**Incident commander:** ____      **Responders:** ____
+
+## Summary (2–3 sentences)
+What broke, who was affected, how long, how it was fixed.
+
+## Impact
+- Users / services affected:
+- Error rate / downtime:
+- Data loss: yes / no
+
+## Timeline (KSA time)
+| Time | Event |
+|---|---|
+| __:__ | Change deployed (CR#____) |
+| __:__ | Alert fired / ticket raised |
+| __:__ | Investigation: ... |
+| __:__ | Mitigation: ... |
+| __:__ | Confirmed recovered |
+
+## Root cause
+The technical cause (what) and why it was possible (why the safeguards did not stop it).
+Use "5 whys":
+1. Why did users see errors? ...
+2. Why ...? ...
+
+## Detection
+How was it detected? Could we have detected it earlier? Which alert/dashboard helped or was missing?
+
+## Resolution and recovery
+Exact steps and commands used.
+
+## What went well / what went badly / where we got lucky
+
+## Action items
+| Action | Type (prevent / detect / mitigate) | Owner | Due | Ticket |
+|---|---|---|---|---|
+| Add readiness probes to all services | prevent | ____ | ____ | ____ |
+| Add PDB check to CI policy | prevent | ____ | ____ | ____ |
+| Alert on error rate during deploys | detect | ____ | ____ | ____ |
+```
+
+##MD
+---
+## Interview and real-world questions
+
+1. A pod is `Running` but users get 503 through the Ingress. Walk through your steps.
+2. How do you debug a container that has no shell (distroless image)?
+3. `kubectl` is very slow and sometimes times out on a self-managed cluster. What could it be?
+4. After a node pool upgrade some pods are stuck `Terminating` for hours. Why, and what do you do?
+5. What is the difference between liveness, readiness and startup probes, and how can a wrong liveness probe cause an outage?
+6. Describe the worst incident you handled and what you changed afterwards. (Prepare a real story — e.g. a disk-full or high-memory incident — using the RCA template.)
+
+<details><summary>Answer</summary>
+
+1. Ingress: host/path/class correct? (`describe ingress`) → Service exists and has **ready** endpoints? (`get endpointslices`) → pods Ready? readiness probe failing? → app port matches `targetPort`? → controller logs. 503 usually = no ready endpoints.
+2. `kubectl debug -it POD --image=busybox:1.36 --target=<container>` (ephemeral container sharing the process namespace), or `kubectl debug POD --copy-to=dbg --image=...`, or `kubectl debug node/...`.
+3. etcd slow disk or near quota, API server overloaded (too many LIST calls from a controller), admission webhooks timing out, network to the API endpoint, expired certs causing retries. Check API server metrics/logs, etcd metrics, webhook configs.
+4. The node was removed while pods had finalizers, or the kubelet that must confirm deletion is gone. Check `metadata.finalizers` and the node. If the node is truly gone: `kubectl delete pod --grace-period=0 --force` (carefully, especially for StatefulSets), or fix/remove the finalizer's controller.
+5. Startup: "has the app finished starting?" (blocks the other probes until OK). Readiness: "can it take traffic now?" (removes from endpoints, no restart). Liveness: "is it stuck?" (restarts the container). A liveness probe that checks a dependency (DB) or is too strict restarts **all** pods when the DB is slow → total outage. Liveness should check only the process itself.
+6. Use the RCA template: impact, timeline, root cause, what you changed (alerts, automation, runbooks).
+</details>
+
+##MD
+---
+## Practical assignment — the multi-fault incident
+
+**Scenario:** At 09:00 the `storefront` team reports "the site is down". Apply the manifest below. It has **three** independent problems. Find and fix all three so that `curl -H "Host: store.lab13.local" http://localhost/` returns **200**, using the method from section 1. Write a short RCA for it.
+
+##CODE
+%%writefile labs/13/assignment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: storefront, namespace: lab-13}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: storefront}}
+  template:
+    metadata: {labels: {app: storefront, tier: web}}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports: [{name: http, containerPort: 80}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata: {name: storefront, namespace: lab-13}
+spec:
+  selector: {app: storefront, tier: frontend}
+  ports: [{port: 80, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: storefront, namespace: lab-13}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: store.lab13.local
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: storefront, port: {number: 8080}}}}
+
+##CODE
+%%bash
+kubectl apply -f labs/13/assignment.yaml
+sleep 30
+kubectl -n lab-13 get pods -l app=storefront
+curl -s -o /dev/null -w "store -> %{http_code}\n" -H "Host: store.lab13.local" http://localhost/
+
+##MD
+**Success criteria:** both pods Running and `1/1` Ready, Service has 2 endpoints, Ingress returns 200.
+
+**Hints:** look at the pod READY column and events; compare Service selector with pod labels; compare Ingress backend port with Service port.
+
+<details><summary>Solution</summary>
+
+1. **Readiness probe path `/healthz`** — nginx has no such page and returns 404, so pods are `Running` but `0/1 READY` (events: `Readiness probe failed: HTTP probe failed with statuscode: 404`). Not-ready pods are never endpoints. Fix: path `/`.
+2. **Service selector** `tier: frontend` but pods have `tier: web` → no endpoints → 503. Fix selector to `tier: web` (or only `app: storefront`).
+3. **Ingress backend port 8080** but the Service port is 80 → 503. Fix to `number: 80` (or `name: http` if the Service port is named).
+```
+kubectl -n lab-13 patch deploy storefront --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/"}]'
+kubectl -n lab-13 patch svc storefront -p '{"spec":{"selector":{"app":"storefront","tier":"web"}}}'
+kubectl -n lab-13 patch ingress storefront --type=json -p='[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":80}]'
+curl -s -o /dev/null -w "%{http_code}\n" -H "Host: store.lab13.local" http://localhost/
+```
+Order matters for the RCA: you only see problems 2 and 3 after fixing 1 — real incidents often have several layers.
+</details>
+
+##MD
+---
+## Break it challenge (no hints in the ticket)
+
+> **RT#5199 — P2** — `inventory-sync` job "never finishes". It ran fine in staging.
+
+Apply, investigate with the method, then open the solution.
+
+##CODE
+%%writefile labs/13/break-it.yaml
+apiVersion: batch/v1
+kind: Job
+metadata: {name: inventory-sync, namespace: lab-13}
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: inventory-sync
+      containers:
+        - name: sync
+          image: busybox:1.36
+          command: ["sh", "-c", "echo syncing; sleep 5; echo done"]
+
+##CODE
+%%bash
+kubectl apply -f labs/13/break-it.yaml
+sleep 20
+kubectl -n lab-13 get job inventory-sync
+kubectl -n lab-13 get pods -l job-name=inventory-sync
+
+##MD
+<details><summary>Solution</summary>
+
+- `kubectl get pods` shows **no pods at all**. `kubectl -n lab-13 describe job inventory-sync` events: `Error creating: pods "inventory-sync-..." is forbidden: error looking up service account lab-13/inventory-sync: serviceaccount "inventory-sync" not found`.
+- Lesson: when there are **no pods**, the problem is **before** the pod exists — look at the **controller's** events (Job/ReplicaSet/StatefulSet): missing ServiceAccount, ResourceQuota exceeded, LimitRange violation, admission webhook / Pod Security rejection.
+- Fix: `kubectl -n lab-13 create serviceaccount inventory-sync` — the Job controller retries and the pod runs.
+</details>
+
+##CODE
+%%bash
+kubectl -n lab-13 create serviceaccount inventory-sync
+sleep 15
+kubectl -n lab-13 get job inventory-sync
+
+##MD
+---
+## Cleanup
+
+Deletes the lab namespaces and makes sure nothing broken is left: removes the taint, uncordons nodes, checks kubelet and scheduler.
+
+##CODE
+%%bash
+kubectl taint nodes learn-worker2 dedicated=gpu:NoSchedule- 2>/dev/null || true
+kubectl uncordon learn-worker learn-worker2 >/dev/null 2>&1 || true
+docker exec learn-worker2 systemctl start kubelet 2>/dev/null || true
+if ! docker exec learn-control-plane test -f /etc/kubernetes/manifests/kube-scheduler.yaml; then
+  docker exec learn-control-plane mv /root/kube-scheduler.yaml.bak /etc/kubernetes/manifests/kube-scheduler.yaml && echo "scheduler manifest restored"
+fi
+kubectl delete namespace lab-13 lab-13-orders --ignore-not-found
+rm -f labs/13/shop.key labs/13/etcd-snapshot.db
+kubectl get nodes
+kubectl -n kube-system get pods -l tier=control-plane
+echo "Cleanup done."
+
+##MD
+**Expected:** all 3 nodes `Ready`, and the 4 control-plane pods (`etcd`, `kube-apiserver`, `kube-controller-manager`, `kube-scheduler`) `Running`.
+
+**Next notebook:** [14-Production-Architecture.ipynb](14-Production-Architecture.ipynb) — designing highly available, secure, production Kubernetes platforms.

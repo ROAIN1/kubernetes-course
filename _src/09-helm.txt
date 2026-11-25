@@ -1,0 +1,1355 @@
+##MD
+# Phase 9 — Helm and Package Management
+
+**What you will learn**
+- Helm architecture (Helm 3) and where releases are stored
+- Charts and chart structure
+- `values.yaml` and how values flow into templates
+- Templates: helpers, `if`, `range`, `with`, `toYaml`, `nindent`
+- Install, upgrade, rollback, history, uninstall
+- Chart repositories and OCI registries
+- Dependencies (sub-charts)
+- Build a reusable, production-style chart from scratch, with dev and prod values
+- `helm lint`, `helm template`, `--dry-run`, `helm diff`
+- Helm best practices
+
+**Time:** about 3–4 hours.
+
+**Prerequisites:** Notebooks 00–08 (Deployments, Services, ConfigMaps, probes, resources, securityContext). kind cluster `learn` running. Helm installed (notebook 00).
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift + Enter**.
+- `%%writefile` cells create chart files under `labs/09/`.
+- `%%bash` cells run commands.
+- Quiz answers are hidden under **Answer**.
+
+##MD
+## Lab setup
+Check we are on the lab cluster, create the namespace, and check the Helm version.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx'. Run: kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+command -v helm >/dev/null || { echo "Helm missing. Run: brew install helm"; exit 1; }
+helm version --short
+mkdir -p labs/09
+kubectl create namespace lab-09 --dry-run=client -o yaml | kubectl apply -f -
+
+##MD
+---
+# Topic 1 — What is Helm and how does it work?
+
+### What is it?
+**Helm** is the package manager for Kubernetes. Like `apt` or `yum`, but for Kubernetes apps.
+- A **chart** is a package: a folder of YAML templates + default values.
+- A **release** is one installed copy of a chart in a cluster, with a name (e.g. `orders-api`).
+- A **revision** is a version of a release. Every install/upgrade/rollback makes a new revision.
+
+### Why do we need it?
+A real app has 5–15 YAML files: Deployment, Service, Ingress, ConfigMap, HPA, PDB, ServiceAccount, NetworkPolicy...
+Without Helm you copy these files for dev, test and prod and edit values by hand. Copies drift apart and mistakes happen.
+Helm gives you:
+- **One template**, many environments (different values files).
+- **Versioned releases** with one-command **rollback**.
+- **Sharing**: install Prometheus, cert-manager, ingress-nginx with one command.
+
+### How does it work internally? (Helm 3)
+```
+ values.yaml + -f prod.yaml + --set x=y      (values are merged, last wins)
+                    |
+ templates/*.yaml --+--> Go template engine (on YOUR machine) --> plain Kubernetes YAML
+                                                                     |
+                                                       Helm client calls the API server
+                                                                     |
+                                                     objects created/updated in the cluster
+                                                                     |
+                 release record saved as a Secret in the release namespace:
+                 sh.helm.release.v1.<release>.v<revision>   (type helm.sh/release.v1)
+```
+- Helm 3 has **no server component** (Helm 2 had "Tiller"; removed for security).
+- Helm uses **your kubeconfig and your RBAC permissions**.
+- Upgrades use a **three-way merge**: old chart manifest, new chart manifest, and live state.
+
+##MD
+### Real production scenario
+A team runs the same API in dev, UAT and prod on OKE. Before Helm they had three folders of YAML. A prod hotfix was applied only to the prod folder, and the next UAT deploy overwrote nothing — but the next prod deploy from the dev folder removed the fix.
+With one chart and `values-dev.yaml`, `values-uat.yaml`, `values-prod.yaml`, there is only one source. Differences are visible in small values files.
+
+##MD
+### Hands-on lab: install a chart from a repository
+We use the small **podinfo** demo app chart.
+- `helm repo add` registers a chart repository (an HTTP index of charts).
+- `helm repo update` downloads the latest index.
+- `helm search repo` searches the index.
+
+##CODE
+%%bash
+helm repo add podinfo https://stefanprodan.github.io/podinfo
+helm repo update podinfo
+helm search repo podinfo --versions | head -5
+
+##MD
+**Expected output**
+```
+"podinfo" has been added to your repositories
+...Successfully got an update from the "podinfo" chart repository
+NAME           	CHART VERSION	APP VERSION	DESCRIPTION
+podinfo/podinfo	6.x.x        	6.x.x      	Podinfo Helm chart for Kubernetes
+...
+```
+**CHART VERSION** = version of the package. **APP VERSION** = version of the app inside it. They are different numbers.
+
+##MD
+Before installing, look at the values you can change. `helm show values` prints the chart's default `values.yaml`.
+
+##CODE
+%%bash
+helm show values podinfo/podinfo | head -40
+
+##MD
+Install with two overrides. `--set` changes a value on the command line. `--wait` waits until Pods are ready.
+
+##CODE
+%%bash
+helm install demo podinfo/podinfo -n lab-09 \
+  --set replicaCount=2 \
+  --set ui.message="Hello from Helm" \
+  --wait --timeout 3m
+helm list -n lab-09
+kubectl get deploy,svc,pods -n lab-09
+
+##MD
+**Expected output**
+```
+NAME: demo
+NAMESPACE: lab-09
+STATUS: deployed
+REVISION: 1
+...
+NAME	NAMESPACE	REVISION	STATUS  	CHART        	APP VERSION
+demo	lab-09   	1       	deployed	podinfo-6.x.x	6.x.x
+deployment.apps/demo-podinfo   2/2 ...
+service/demo-podinfo           ClusterIP ...
+```
+
+##MD
+### Where is the release stored?
+Helm keeps release history as Secrets in the release namespace. Let's look and decode one.
+The data is: base64 (Kubernetes) → base64 (Helm) → gzip → JSON.
+
+##CODE
+%%bash
+kubectl get secrets -n lab-09 -l owner=helm
+echo "--- decoded release record (first keys) ---"
+kubectl get secret -n lab-09 sh.helm.release.v1.demo.v1 -o jsonpath='{.data.release}' \
+  | base64 -d | base64 -d | gunzip | python3 -c "import json,sys; r=json.load(sys.stdin); print('name:', r['name'], '| version:', r['version'], '| status:', r['info']['status']); print('config (your values):', r['config'])"
+
+##MD
+**Expected output**
+```
+NAME                         TYPE                 DATA   AGE
+sh.helm.release.v1.demo.v1   helm.sh/release.v1   1      30s
+--- decoded release record (first keys) ---
+name: demo | version: 1 | status: deployed
+config (your values): {'replicaCount': 2, 'ui': {'message': 'Hello from Helm'}}
+```
+This is why deleting these Secrets by hand breaks `helm upgrade` and `helm rollback`. Never delete them manually.
+
+##MD
+### Check yourself
+1. What is the difference between a chart, a release and a revision?
+2. Where does Helm 3 store release information?
+3. Does Helm 3 run anything inside the cluster?
+4. What is the difference between chart version and app version?
+
+<details><summary>Answer</summary>
+
+1. Chart = package. Release = one installed copy with a name. Revision = one version of that release (each install/upgrade/rollback).
+2. As Secrets (`sh.helm.release.v1.<name>.v<N>`) in the release namespace.
+3. No. Rendering happens on the client; it uses your kubeconfig and RBAC.
+4. Chart version = version of the packaging/templates. App version = version of the application image.
+</details>
+
+##MD
+---
+# Topic 2 — Upgrade, history, rollback, uninstall
+
+### What is it?
+- `helm upgrade` — apply a new chart version or new values to a release. Creates a new revision.
+- `helm history` — list revisions.
+- `helm rollback <release> <revision>` — go back to an old revision. This also creates a **new** revision (with the old content).
+- `helm uninstall` — delete the release and its objects.
+
+### How does it work internally?
+```
+rev1 (deployed) --upgrade--> rev2 (deployed), rev1 (superseded) --rollback 1--> rev3 (= copy of rev1)
+```
+Useful flags:
+- `--atomic` — if the upgrade fails, roll back automatically.
+- `--wait` — wait for resources to be ready before marking success.
+- `--reuse-values` / `--reset-then-reuse-values` — keep previous values. (Careful: hides changes in the chart's defaults.)
+- `--install` with upgrade (`helm upgrade --install`) — install if missing. Standard in CI pipelines.
+
+##MD
+### Real production scenario
+A new image tag is deployed with `helm upgrade --install --atomic --wait --timeout 5m`. The new Pods fail readiness checks. After 5 minutes Helm rolls back by itself. The pipeline goes red, but users never saw the broken version.
+
+##MD
+### Hands-on lab: upgrade, break, roll back
+
+##CODE
+%%bash
+echo "=== upgrade: change message (revision 2) ==="
+helm upgrade demo podinfo/podinfo -n lab-09 --reuse-values --set ui.message="Version two" --wait
+echo "=== upgrade with a bad image tag (revision 3) ==="
+helm upgrade demo podinfo/podinfo -n lab-09 --reuse-values --set image.tag=does-not-exist --wait --timeout 45s 2>&1 | tail -2 || true
+helm history demo -n lab-09
+
+##MD
+**Expected output**
+```
+=== upgrade with a bad image tag (revision 3) ===
+Error: UPGRADE FAILED: context deadline exceeded       (or: resource Deployment/lab-09/demo-podinfo not ready)
+REVISION	UPDATED	STATUS    	CHART        	APP VERSION	DESCRIPTION
+1       	...    	superseded	podinfo-6.x.x	6.x.x      	Install complete
+2       	...    	superseded	podinfo-6.x.x	6.x.x      	Upgrade complete
+3       	...    	failed    	podinfo-6.x.x	6.x.x      	Upgrade "demo" failed: ...
+```
+Because of the rolling update, the old Pods keep running. The new Pods are in `ImagePullBackOff`.
+
+##CODE
+%%bash
+kubectl get pods -n lab-09
+echo "=== rollback to revision 2 ==="
+helm rollback demo 2 -n lab-09 --wait
+helm history demo -n lab-09 | tail -2
+kubectl get pods -n lab-09
+
+##MD
+**Expected output**
+```
+demo-podinfo-xxxx   0/1   ImagePullBackOff ...
+Rollback was a success! Happy Helming!
+3  ... failed     ... Upgrade "demo" failed
+4  ... deployed   ... Rollback to 2
+(all Pods Running again)
+```
+Now try `--atomic`: the same bad upgrade rolls back automatically.
+
+##CODE
+%%bash
+helm upgrade demo podinfo/podinfo -n lab-09 --reuse-values --set image.tag=does-not-exist --atomic --timeout 45s 2>&1 | tail -2 || true
+helm history demo -n lab-09 | tail -3
+
+##MD
+**Expected output**
+```
+Error: UPGRADE FAILED: release demo failed, and has been rolled back due to atomic being set: ...
+5  ... superseded  ... Upgrade "demo" failed ...
+6  ... deployed    ... Rollback to 4
+```
+
+##MD
+### Troubleshooting upgrades
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress` | A previous run was killed; release stuck in `pending-*` | `helm history` → `helm rollback <rel> <last-good-rev>` |
+| `cannot patch ... field is immutable` | Changed an immutable field (e.g. Deployment `selector`) | Do not change selectors; if you must, uninstall/reinstall or use a new release name |
+| `rendered manifests contain a resource that already exists` | Object created outside Helm | Delete it, or adopt it: add labels/annotations `app.kubernetes.io/managed-by=Helm`, `meta.helm.sh/release-name`, `meta.helm.sh/release-namespace` |
+| Change in chart defaults not applied | Used `--reuse-values` | Pass values files explicitly every time |
+| Upgrade "succeeds" but app broken | No `--wait`, no probes | Use `--wait` and real readiness probes |
+
+##MD
+### Check yourself
+1. What does a rollback create in the history?
+2. What does `--atomic` do?
+3. Why is `helm upgrade --install` common in CI?
+4. Why can `--reuse-values` be dangerous?
+
+<details><summary>Answer</summary>
+
+1. A new revision whose content is a copy of the target revision.
+2. If the upgrade fails (or times out with `--wait`), Helm rolls back automatically.
+3. It works the same on the first deploy and every later deploy (idempotent).
+4. It keeps old values and can hide new defaults or removed values in the new chart version.
+</details>
+
+##MD
+---
+# Topic 3 — Chart structure
+
+### What is it?
+A chart is a folder with a fixed layout. `helm create` makes a starter chart. Let's create one and look at it.
+
+##CODE
+%%bash
+cd labs/09 && rm -rf starter && helm create starter >/dev/null && find starter -type f | sort
+
+##MD
+**Expected output**
+```
+starter/.helmignore
+starter/Chart.yaml
+starter/charts/                      (folder for dependencies)
+starter/templates/NOTES.txt
+starter/templates/_helpers.tpl
+starter/templates/deployment.yaml
+starter/templates/hpa.yaml
+starter/templates/ingress.yaml
+starter/templates/service.yaml
+starter/templates/serviceaccount.yaml
+starter/templates/tests/test-connection.yaml
+starter/values.yaml
+```
+
+| File | Purpose |
+|---|---|
+| `Chart.yaml` | Chart metadata: name, chart `version`, `appVersion`, dependencies |
+| `values.yaml` | Default values. Users override them |
+| `values.schema.json` (optional) | JSON schema to validate values; Helm fails early on bad input |
+| `templates/` | Go templates that render into Kubernetes YAML |
+| `templates/_helpers.tpl` | Reusable named templates (files starting with `_` are not rendered as objects) |
+| `templates/NOTES.txt` | Text shown after install (how to reach the app) |
+| `templates/tests/` | Test Pods run by `helm test` |
+| `charts/` | Downloaded dependency charts |
+| `.helmignore` | Files to leave out of the package |
+
+The starter chart is a good reference, but it has many features at once. Next we build our own chart step by step, so you understand every line.
+
+##MD
+---
+# Topic 4 — Values and templates
+
+### What is it?
+Templates use the **Go template** language plus **Sprig** functions. Text inside `{{ }}` is evaluated.
+
+Built-in objects:
+
+| Object | Example | Meaning |
+|---|---|---|
+| `.Values` | `.Values.replicaCount` | Merged values |
+| `.Release` | `.Release.Name`, `.Release.Namespace` | Release info |
+| `.Chart` | `.Chart.Name`, `.Chart.AppVersion` | From Chart.yaml |
+| `.Capabilities` | `.Capabilities.KubeVersion` | Cluster info |
+| `.Template` | `.Template.BasePath` | Current template path |
+
+Most used functions and actions:
+
+| Syntax | What it does |
+|---|---|
+| `{{ .Values.x \| default "a" }}` | Use "a" if x is empty |
+| `{{ .Values.x \| quote }}` | Wrap in quotes (always quote strings in env values) |
+| `{{- ... -}}` | Trim whitespace/newlines before/after |
+| `{{ include "name" . }}` | Render a named template (from `_helpers.tpl`) |
+| `{{ toYaml .Values.resources \| nindent 12 }}` | Turn a map into YAML, newline + indent 12 spaces |
+| `{{ if .Values.x }} ... {{ end }}` | Condition |
+| `{{ range .Values.list }} ... {{ end }}` | Loop (inside, `.` is the current item) |
+| `{{ with .Values.x }} ... {{ end }}` | Run block only if x is set; inside, `.` is x |
+| `{{ required "msg" .Values.x }}` | Fail rendering with a message if x is missing |
+| `$` | The root context; use it inside `range`/`with` (e.g. `$.Release.Name`) |
+
+### How values are merged
+```
+chart values.yaml  <  parent chart values  <  -f values-prod.yaml  <  -f second.yaml  <  --set key=val
+(lowest priority)                                                                     (highest priority)
+```
+
+##MD
+### Hands-on lab: practise templates without a cluster
+`helm template` renders locally and prints YAML. Nothing is sent to the cluster. Perfect for learning.
+
+We make a tiny chart `tpl-demo` with one ConfigMap template that uses `if`, `range`, `with`, `default`, `quote`, `toYaml`.
+
+##CODE
+%%writefile labs/09/tpl-demo/Chart.yaml
+apiVersion: v2                 # v2 = Helm 3 chart
+name: tpl-demo
+version: 0.1.0                 # chart version (SemVer)
+appVersion: "1.0.0"
+
+##CODE
+%%writefile labs/09/tpl-demo/values.yaml
+environment: dev
+debug: false
+features:                      # a list -> used with range
+  - search
+  - checkout
+limits:                        # a map -> used with toYaml
+  maxUsers: 100
+  timeoutSeconds: 30
+owner: {}                      # empty map -> 'with' block will be skipped
+
+##CODE
+%%writefile labs/09/tpl-demo/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-settings          # release name from 'helm template <name>'
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+data:
+  environment: {{ .Values.environment | quote }}
+  region: {{ .Values.region | default "me-riyadh-1" | quote }}   # not in values -> default used
+  {{- if .Values.debug }}
+  logLevel: "debug"
+  {{- else }}
+  logLevel: "info"
+  {{- end }}
+  features: |
+    {{- range .Values.features }}
+    - {{ . }}
+    {{- end }}
+  limits.yaml: |
+    {{- toYaml .Values.limits | nindent 4 }}
+  {{- with .Values.owner }}
+  owner: {{ .team | quote }}                   # inside 'with', '.' is .Values.owner
+  {{- end }}
+
+##CODE
+%%bash
+cd labs/09
+echo "=== default values ==="
+helm template shop ./tpl-demo
+echo "=== override values ==="
+helm template shop ./tpl-demo --set debug=true --set owner.team=payments --set environment=prod
+
+##MD
+**Expected output (first run)**
+```yaml
+# Source: tpl-demo/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-settings
+  ...
+data:
+  environment: "dev"
+  region: "me-riyadh-1"
+  logLevel: "info"
+  features: |
+    - search
+    - checkout
+  limits.yaml: |
+    maxUsers: 100
+    timeoutSeconds: 30
+```
+Second run: `logLevel: "debug"`, `environment: "prod"` and a new line `owner: "payments"`.
+
+**Try yourself:** remove the `-` from `{{- range` and run again. You will see empty lines. This is what the dash trims.
+
+##MD
+### Troubleshooting templates
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error converting YAML to JSON: yaml: line N: did not find expected key` | Wrong indentation | Use `nindent` with the right number; run `helm template --debug` to see the broken output |
+| `nil pointer evaluating interface {}.tag` | Parent key missing (e.g. `.Values.image` not set) | Use `with`, `default`, or `dig`; define the key in values.yaml |
+| Number shows as `1e+06` | Large number treated as float | Quote it in values, or `int` / `quote` in the template |
+| `true`/`yes` becomes boolean in env | YAML type rules | Always `quote` env values |
+| Variable not found inside `range` | `.` changed inside the loop | Use `$` for root: `$.Release.Name` |
+
+##MD
+### Check yourself
+1. What does `nindent 8` do?
+2. Inside `{{ range .Values.features }}`, what is `.`?
+3. How do you access the release name inside a `with` block?
+4. Which has higher priority: `-f values-prod.yaml` or `--set`?
+
+<details><summary>Answer</summary>
+
+1. Adds a newline, then indents every line by 8 spaces.
+2. The current list item.
+3. `$.Release.Name` (`$` is the root context).
+4. `--set`.
+</details>
+
+##MD
+---
+# Topic 5 — Build a reusable, production-style chart from scratch
+
+### Goal
+A chart `webapp` that any team can use for a stateless web app. Features:
+- Deployment with readiness/liveness probes, resources, hardened securityContext
+- ConfigMap with app content; Pods restart automatically when it changes (checksum annotation)
+- Service
+- Optional HPA (`autoscaling.enabled`)
+- Optional PodDisruptionBudget
+- Standard labels via helpers
+- `values-dev.yaml` and `values-prod.yaml`
+- `values.schema.json` to validate inputs
+- `NOTES.txt` and a `helm test`
+
+Image: `nginxinc/nginx-unprivileged` (runs as UID 101 on port 8080 — passes Pod Security `restricted`).
+
+```
+labs/09/webapp/
+├── Chart.yaml
+├── values.yaml
+├── values-dev.yaml
+├── values-prod.yaml
+├── values.schema.json
+└── templates/
+    ├── _helpers.tpl
+    ├── configmap.yaml
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── hpa.yaml
+    ├── pdb.yaml
+    ├── NOTES.txt
+    └── tests/test-connection.yaml
+```
+
+##CODE
+%%writefile labs/09/webapp/Chart.yaml
+apiVersion: v2
+name: webapp
+description: Reusable chart for a stateless web application
+type: application              # 'library' charts only contain helpers
+version: 0.1.0                 # bump on every chart change (SemVer)
+appVersion: "1.27-alpine"      # default image tag if image.tag is empty
+maintainers:
+  - name: platform-team
+
+##CODE
+%%writefile labs/09/webapp/values.yaml
+# -- Number of Pods when autoscaling is disabled
+replicaCount: 1
+
+image:
+  repository: nginxinc/nginx-unprivileged
+  tag: ""                      # empty -> Chart.appVersion is used
+  pullPolicy: IfNotPresent
+
+containerPort: 8080
+
+# -- Text shown on the home page (stored in a ConfigMap)
+message: "Hello from webapp"
+
+# -- Extra environment variables (map: NAME: value)
+env: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 64Mi               # memory limit protects the node; no CPU limit to avoid throttling
+
+probes:
+  path: /
+  initialDelaySeconds: 3
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 101
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  enabled: false
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+##MD
+### Helpers
+Named templates keep names and labels identical in every file. We use the standard Kubernetes labels (`app.kubernetes.io/*`).
+**Important:** `selectorLabels` must never change after the first install, because a Deployment's selector is immutable.
+
+##CODE
+%%writefile labs/09/webapp/templates/_helpers.tpl
+{{/* Full name: release name, plus chart name if different. Max 63 chars (DNS limit). */}}
+{{- define "webapp.fullname" -}}
+{{- if contains .Chart.Name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Selector labels: used in matchLabels. NEVER change these after first install. */}}
+{{- define "webapp.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/* Common labels: added to every object. */}}
+{{- define "webapp.labels" -}}
+{{ include "webapp.selectorLabels" . }}
+app.kubernetes.io/version: {{ (.Values.image.tag | default .Chart.AppVersion) | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+{{- end -}}
+
+##CODE
+%%writefile labs/09/webapp/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+data:
+  index.html: |
+    <h1>{{ .Values.message }}</h1>
+    <p>release={{ .Release.Name }} namespace={{ .Release.Namespace }} revision={{ .Release.Revision }}</p>
+
+##CODE
+%%writefile labs/09/webapp/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}          # omitted when HPA manages replicas
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "webapp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "webapp.selectorLabels" . | nindent 8 }}
+      annotations:
+        # hash of the rendered ConfigMap: when content changes, the Pod template changes -> rolling restart
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+          {{- with .Values.env }}
+          env:
+            {{- range $name, $value := . }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          readinessProbe:                        # gets traffic only when ready
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: 5
+          livenessProbe:                         # restarted if it stops answering
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html   # serve the ConfigMap's index.html
+            - name: tmp
+              mountPath: /tmp                    # nginx-unprivileged writes pid/cache here
+      volumes:
+        - name: content
+          configMap:
+            name: {{ include "webapp.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+##CODE
+%%writefile labs/09/webapp/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "webapp.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}     # port clients use
+      targetPort: http                      # named container port (8080)
+
+##CODE
+%%writefile labs/09/webapp/templates/hpa.yaml
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "webapp.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+
+##CODE
+%%writefile labs/09/webapp/templates/pdb.yaml
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}   # keep at least this many Pods during node drains
+  selector:
+    matchLabels:
+      {{- include "webapp.selectorLabels" . | nindent 6 }}
+{{- end }}
+
+##CODE
+%%writefile labs/09/webapp/templates/NOTES.txt
+{{ include "webapp.fullname" . }} is installed in namespace {{ .Release.Namespace }}.
+
+Test it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "webapp.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080
+{{- if .Values.autoscaling.enabled }}
+
+Autoscaling is ON: {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas.
+(HPA needs metrics-server to read CPU.)
+{{- end }}
+
+##CODE
+%%writefile labs/09/webapp/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "webapp.fullname" . }}-test
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test                              # only runs with 'helm test'
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: curl
+      image: busybox:1.36
+      command: ["wget", "-qO-", "http://{{ include "webapp.fullname" . }}:{{ .Values.service.port }}"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+##MD
+### Validate values with a JSON schema
+`values.schema.json` makes Helm reject wrong input **before** anything is sent to the cluster, e.g. `replicaCount: "two"`.
+
+##CODE
+%%writefile labs/09/webapp/values.schema.json
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "replicaCount", "service"],
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 20 },
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "not": { "const": "latest" } },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer" }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
+
+##MD
+### Per-environment values files
+Only the **differences** go in these files. Everything else comes from `values.yaml`.
+
+##CODE
+%%writefile labs/09/webapp/values-dev.yaml
+replicaCount: 1
+message: "DEV environment"
+env:
+  LOG_LEVEL: debug
+
+##CODE
+%%writefile labs/09/webapp/values-prod.yaml
+message: "PRODUCTION"
+image:
+  tag: "1.27-alpine"           # pin the tag explicitly in prod (better: a digest)
+env:
+  LOG_LEVEL: info
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+pdb:
+  enabled: true
+  minAvailable: 1
+affinity:
+  podAntiAffinity:             # prefer Pods on different nodes (survive one node failure)
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: webapp
+
+##MD
+---
+# Topic 6 — lint, template, dry-run, diff
+
+Always check a chart before installing. Four tools, from cheapest to most realistic:
+
+| Command | What it checks | Needs cluster? |
+|---|---|---|
+| `helm lint` | Chart structure, template syntax, schema | No |
+| `helm template` | Renders YAML locally so you can read it | No |
+| `helm install/upgrade --dry-run=server` | Renders and sends to API server for validation (admission, schema) — nothing saved | Yes |
+| `helm diff upgrade` (plugin) | Shows what will change in the cluster, like `git diff` | Yes |
+
+##CODE
+%%bash
+cd labs/09
+echo "=== lint (dev) ==="
+helm lint ./webapp -f webapp/values-dev.yaml
+echo "=== lint (prod) ==="
+helm lint ./webapp -f webapp/values-prod.yaml
+echo "=== schema check: bad input should FAIL ==="
+helm lint ./webapp --set replicaCount=two 2>&1 | grep -iE "error|replicaCount" | head -3
+
+##MD
+**Expected output**
+```
+=== lint (dev) ===
+==> Linting ./webapp
+[INFO] Chart.yaml: icon is recommended
+1 chart(s) linted, 0 chart(s) failed
+...
+=== schema check: bad input should FAIL ===
+[ERROR] values.yaml: - replicaCount: Invalid type. Expected: integer, given: string
+```
+
+##MD
+Render the prod version and look at only the kinds and the HPA. Compare with dev: dev has no HPA and no PDB.
+
+##CODE
+%%bash
+cd labs/09
+echo "=== DEV objects ==="
+helm template web ./webapp -f webapp/values-dev.yaml | grep -E "^kind:"
+echo "=== PROD objects ==="
+helm template web ./webapp -f webapp/values-prod.yaml | grep -E "^kind:"
+echo "=== PROD deployment has no 'replicas' (HPA owns it) ==="
+helm template web ./webapp -f webapp/values-prod.yaml -s templates/deployment.yaml | grep -c "replicas:" || true
+
+##MD
+**Expected output**
+```
+=== DEV objects ===
+kind: ConfigMap
+kind: Service
+kind: Deployment
+kind: Pod              <- the test Pod (only created by 'helm test')
+=== PROD objects ===        (Helm sorts by its install order; exact order may differ)
+kind: PodDisruptionBudget
+kind: ConfigMap
+kind: Service
+kind: Deployment
+kind: HorizontalPodAutoscaler
+kind: Pod
+=== PROD deployment has no 'replicas' (HPA owns it) ===
+0
+```
+
+##MD
+### Install dev, test it, then upgrade to prod values
+Server-side dry run first. Then install, then `helm test`.
+
+##CODE
+%%bash
+cd labs/09
+helm upgrade --install web ./webapp -n lab-09 -f webapp/values-dev.yaml --dry-run=server >/dev/null && echo "server dry-run OK"
+helm upgrade --install web ./webapp -n lab-09 -f webapp/values-dev.yaml --wait --timeout 2m
+helm test web -n lab-09
+
+##MD
+**Expected output**
+```
+server dry-run OK
+Release "web" does not exist. Installing it now.
+...
+NOTES:
+web-webapp is installed in namespace lab-09.
+...
+TEST SUITE:     web-webapp-test
+Phase:          Succeeded
+```
+
+##CODE
+%%bash
+kubectl -n lab-09 port-forward svc/web-webapp 18080:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
+curl -s http://localhost:18080
+kill $PF
+
+##MD
+**Expected output**
+```html
+<h1>DEV environment</h1>
+<p>release=web namespace=lab-09 revision=1</p>
+```
+
+##MD
+### helm diff — see changes before you apply
+The `helm-diff` plugin shows a colored diff of the live release vs. the new render. Install once.
+
+##CODE
+%%bash
+helm plugin list | grep -q diff || helm plugin install https://github.com/databus23/helm-diff >/dev/null
+cd labs/09
+helm diff upgrade web ./webapp -n lab-09 -f webapp/values-prod.yaml --no-color | head -60
+
+##MD
+**Expected output (shape)**
+```
+lab-09, web-webapp, ConfigMap (v1) has changed:
+-     <h1>DEV environment</h1>
++     <h1>PRODUCTION</h1>
+lab-09, web-webapp, Deployment (apps) has changed:
+-   replicas: 1
+-             value: "debug"
++             value: "info"
++ lab-09, web-webapp, HorizontalPodAutoscaler (autoscaling) has been added:
++ lab-09, web-webapp, PodDisruptionBudget (policy) has been added:
+```
+In a CI pipeline, post this diff in the pull request so reviewers see the real cluster change.
+
+##CODE
+%%bash
+cd labs/09
+helm upgrade web ./webapp -n lab-09 -f webapp/values-prod.yaml --wait --timeout 3m
+kubectl get deploy,hpa,pdb -n lab-09 -l app.kubernetes.io/instance=web
+kubectl get pods -n lab-09 -l app.kubernetes.io/instance=web -o wide
+
+##MD
+**Expected output**
+```
+deployment.apps/web-webapp   2/2 ...
+horizontalpodautoscaler.autoscaling/web-webapp   Deployment/web-webapp   cpu: <unknown>/70%   2   6   2
+poddisruptionbudget.policy/web-webapp   1   N/A   1
+(2 Pods, usually on different worker nodes because of anti-affinity)
+```
+`<unknown>` CPU: kind has no metrics-server by default (notebook 07 shows how to add it).
+Notice the Pods restarted: the ConfigMap changed, so the checksum annotation changed.
+
+##MD
+### Troubleshooting your own chart
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `helm lint` OK, install fails `Invalid value` | API validation (field types, names > 63 chars) | `--dry-run=server` catches it before install |
+| Pods do not restart after ConfigMap change | No checksum annotation | Add `checksum/config` with `sha256sum` |
+| HPA and Helm fight over replicas | `replicas` set while HPA enabled | Omit `replicas` when autoscaling is on |
+| Upgrade fails: selector immutable | Changed selector labels | Keep `selectorLabels` fixed forever |
+| Test Pod blocked by PSA | Test Pod not hardened | Add securityContext to the test Pod too |
+
+##MD
+### Check yourself
+1. Why does the Deployment have a `checksum/config` annotation?
+2. Why is `replicas` left out when autoscaling is enabled?
+3. What does `values.schema.json` give you?
+4. Which command shows cluster changes before an upgrade?
+
+<details><summary>Answer</summary>
+
+1. When the ConfigMap content changes, the hash changes, the Pod template changes, and Pods roll out with the new config.
+2. Otherwise every `helm upgrade` resets replicas and fights the HPA.
+3. Early, clear validation of user input (types, allowed values) before rendering/applying.
+4. `helm diff upgrade` (helm-diff plugin).
+</details>
+
+##MD
+---
+# Topic 7 — Dependencies and repositories
+
+### What is it?
+A chart can depend on other charts (**sub-charts**). Example: an app chart that also installs Redis, or an "umbrella" chart that installs a whole platform.
+Dependencies are declared in `Chart.yaml` and downloaded into `charts/` with `helm dependency update`.
+
+Repository types:
+- **HTTP repo**: a web server with `index.yaml` (e.g. `https://stefanprodan.github.io/podinfo`).
+- **OCI registry**: charts stored like container images (`oci://...`). Modern standard. Works with OCIR, ECR, ACR, GHCR, Harbor.
+
+### How values reach sub-charts
+In the parent's values, use the sub-chart name (or alias) as a key:
+```yaml
+backend:            # alias of the podinfo dependency
+  replicaCount: 2   # goes to the sub-chart's .Values.replicaCount
+```
+`global:` values are shared with all sub-charts.
+
+##CODE
+%%writefile labs/09/platform/Chart.yaml
+apiVersion: v2
+name: platform
+description: Umbrella chart = our webapp + podinfo as a backend
+version: 0.1.0
+dependencies:
+  - name: webapp
+    version: 0.1.0
+    repository: "file://../webapp"          # local chart (path relative to this chart)
+    alias: frontend                          # values key and name prefix
+  - name: podinfo
+    version: ">=6.0.0"                       # SemVer range
+    repository: https://stefanprodan.github.io/podinfo
+    alias: backend
+    condition: backend.enabled               # install only if true
+
+##CODE
+%%writefile labs/09/platform/values.yaml
+frontend:
+  message: "Frontend in umbrella chart"
+backend:
+  enabled: true
+  replicaCount: 1
+  ui:
+    message: "Backend (podinfo)"
+
+##CODE
+%%bash
+cd labs/09/platform
+helm dependency update          # downloads into charts/ and writes Chart.lock
+ls charts/
+echo "=== objects rendered ==="
+helm template plat . | grep -E "^kind:|^  name:" | paste - - | head -12
+echo "=== backend disabled ==="
+helm template plat . --set backend.enabled=false | grep -E "^kind:" | sort | uniq -c
+
+##MD
+**Expected output**
+```
+Saving 2 charts
+Deleting outdated charts
+podinfo-6.x.x.tgz  webapp-0.1.0.tgz
+=== objects rendered ===
+kind: ConfigMap   name: plat-frontend
+kind: Service     name: plat-backend
+kind: Service     name: plat-frontend
+kind: Deployment  name: plat-backend
+kind: Deployment  name: plat-frontend
+...
+=== backend disabled ===
+   1 kind: ConfigMap
+   1 kind: Deployment
+   1 kind: Pod
+   1 kind: Service
+```
+`Chart.lock` pins the exact versions. Commit it to Git so every build uses the same dependencies.
+
+##MD
+### Package and push to an OCI registry (concept)
+```bash
+helm package labs/09/webapp                    # -> webapp-0.1.0.tgz
+helm registry login <region>.ocir.io -u '<tenancy-namespace>/<user>'   # OCIR example; uses an auth token
+helm push webapp-0.1.0.tgz oci://<region>.ocir.io/<tenancy-namespace>/helm-charts
+helm install web oci://<region>.ocir.io/<tenancy-namespace>/helm-charts/webapp --version 0.1.0
+```
+We do not run this (it needs a real registry and credentials).
+
+##MD
+### Check yourself
+1. Where are dependencies downloaded to?
+2. What file pins dependency versions?
+3. How do you pass a value to a sub-chart with alias `backend`?
+4. Why are OCI registries preferred for charts today?
+
+<details><summary>Answer</summary>
+
+1. The parent chart's `charts/` folder.
+2. `Chart.lock`.
+3. Under the `backend:` key in the parent values.
+4. Same registry, auth and access control as container images; no separate index server; supports signing.
+</details>
+
+##MD
+---
+# Topic 8 — Helm best practices (production)
+
+| Practice | Why |
+|---|---|
+| Bump chart `version` on every change; pin `appVersion`/image tag | Reproducible deploys and clear history |
+| Pin image by tag + digest in prod values | Nobody can swap the image behind a tag |
+| One chart, small per-env values files in Git | One source of truth |
+| `helm upgrade --install --atomic --wait --timeout` in CI | Safe, idempotent deploys with auto-rollback |
+| `helm lint` + `helm template \| kubeconform` + `--dry-run=server` + `helm diff` in CI | Catch errors before prod |
+| `values.schema.json` | Fail fast on bad input |
+| Never store secrets in values files in Git | Use External Secrets / sealed secrets / OCI Vault; reference Secret names in values |
+| Keep `selectorLabels` stable; use standard labels | Avoid immutable-field upgrade failures |
+| Set securityContext, resources, probes, PDB by default | Charts are production-ready by default |
+| Set `--history-max` (default 10) | Avoid many old release Secrets |
+| Prefer GitOps (Argo CD / Flux) to run Helm in production | Drift detection and audit trail (notebook 11) |
+| Do not `kubectl edit` Helm-managed objects | The next upgrade overwrites manual changes |
+
+### Lab vs Production
+
+| Area | Lab | Production |
+|---|---|---|
+| Chart source | Local folder | Versioned chart in OCI registry, signed |
+| Deploy | Manual `helm upgrade` | CI pipeline or Argo CD/Flux |
+| Values | `--set` sometimes | Only files in Git, reviewed in PRs |
+| Secrets | none | External secret store; never in values |
+| Rollback | `helm rollback` | `--atomic` in CI, or Git revert with GitOps |
+
+##MD
+---
+# Interview and real-world questions
+
+1. What changed between Helm 2 and Helm 3?
+2. A `helm upgrade` fails with "another operation is in progress". What happened and how do you fix it?
+3. How do you make Pods restart when only a ConfigMap changed?
+4. Someone ran `kubectl scale` on a Helm-managed Deployment. What happens on the next upgrade?
+5. How do you handle secrets with Helm?
+6. Why should a chart not set `replicas` when HPA is enabled?
+7. How would you deploy the same chart to 20 OKE clusters?
+
+<details><summary>Answer</summary>
+
+1. Tiller (the in-cluster server) was removed; Helm uses the user's kubeconfig/RBAC. Releases are stored as Secrets per namespace. Three-way merge upgrades. Chart `apiVersion: v2`, OCI registry support.
+2. A previous operation was interrupted and the release is in `pending-upgrade`/`pending-install`. Check `helm history`, then `helm rollback` to the last deployed revision (or carefully fix the status).
+3. Add a `checksum/config` annotation with the sha256 of the rendered ConfigMap to the Pod template.
+4. Helm's three-way merge sees that the chart's desired replicas differ from live, and sets replicas back to the chart value (if `replicas` is in the template).
+5. Do not put secret values in values files. Use External Secrets Operator (OCI Vault), Sealed Secrets, or SOPS (helm-secrets); the chart only references Secret names.
+6. Each upgrade would reset the replica count and fight the HPA.
+7. GitOps: Argo CD ApplicationSet or Flux with per-cluster values, chart from an OCI registry; or a CI matrix that runs `helm upgrade --install` per kube-context.
+</details>
+
+##MD
+---
+# Practical Assignment — add an Ingress to the chart
+
+**Scenario:** Teams want to expose `webapp` with an Ingress. Add an **optional** Ingress template.
+
+**Requirements**
+1. `ingress.enabled` (default `false`).
+2. `ingress.className` (e.g. `nginx`), `ingress.hosts` (list of hosts), `ingress.tls.secretName` (optional).
+3. Each host routes `/` to the Service port.
+4. Add the new values to `values.yaml` and to `values.schema.json`.
+5. Bump chart version to `0.2.0`.
+
+**Success criteria**
+- `helm template t ./webapp` → no Ingress.
+- `helm template t ./webapp --set ingress.enabled=true --set ingress.className=nginx --set ingress.hosts[0]=web.lab.local` → one Ingress with one rule.
+- With `--set ingress.tls.secretName=web-tls` the Ingress has a `tls:` block.
+- `helm lint` passes.
+
+**Hints**
+- Use `range` over hosts; use `$` to reach root values inside the loop.
+- Use `with .Values.ingress.tls.secretName`.
+
+<details><summary>Full solution</summary>
+
+`values.yaml` additions:
+```yaml
+ingress:
+  enabled: false
+  className: ""
+  hosts: []          # e.g. ["web.example.com"]
+  tls:
+    secretName: ""
+```
+`templates/ingress.yaml`:
+```yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls.secretName }}
+  tls:
+    - secretName: {{ . }}
+      hosts:
+        {{- toYaml $.Values.ingress.hosts | nindent 8 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "webapp.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+    {{- end }}
+{{- end }}
+```
+Schema addition (inside `properties`):
+```json
+"ingress": {
+  "type": "object",
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "className": { "type": "string" },
+    "hosts": { "type": "array", "items": { "type": "string" } },
+    "tls": { "type": "object", "properties": { "secretName": { "type": "string" } } }
+  }
+}
+```
+`Chart.yaml`: `version: 0.2.0`. Note `include "webapp.fullname" $` — inside `range`, `.` is the host string, so we pass `$` (root).
+</details>
+
+##MD
+---
+# "Break it" challenge
+
+The cell below installs a broken chart. It fails. Find **two** bugs using only `helm lint`, `helm template --debug` and the error messages. Fix them in `labs/09/broken/`, then install again.
+
+##CODE
+%%bash
+mkdir -p labs/09/broken/templates
+cat > labs/09/broken/Chart.yaml <<'EOF'
+apiVersion: v2
+name: broken
+version: 0.1.0
+EOF
+cat > labs/09/broken/values.yaml <<'EOF'
+replicas: 2
+labels:
+  team: orders
+EOF
+cat > labs/09/broken/templates/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+  {{- toYaml .Values.labels | nindent 2 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+EOF
+cd labs/09
+helm lint ./broken
+helm install broken ./broken -n lab-09 2>&1 | tail -3 || true
+
+##MD
+<details><summary>Solution</summary>
+
+**Bug 1 — wrong indentation (this one makes the install fail).** `labels:` is at 2 spaces, and `nindent 2` puts `team: orders` also at 2 spaces — the same level as `labels`. So `team` becomes a field of `metadata` (`metadata.team`) and `labels` is empty. Helm validates against the Kubernetes schema and reports something like `unknown field "team"` in `metadata`. Fix: `{{- toYaml .Values.labels | nindent 4 }}`.
+
+**Bug 2 — wrong value name (silent!).** Values have `replicas`, the template uses `.Values.replicaCount`. It renders `replicas: ` (empty = null), so Kubernetes uses the default: **1 replica instead of 2**. No error at all. `helm template --debug` shows `replicas:` with nothing after it. Fix: use `{{ .Values.replicas }}` — and add a `values.schema.json` or `required` so this is caught: `{{ required "replicas is required" .Values.replicas }}`.
+
+Lesson: `helm lint` passes on many logic bugs. Always read `helm template` output and use `--dry-run=server` and a values schema.
+</details>
+
+##MD
+---
+## Cleanup
+
+##CODE
+%%bash
+helm uninstall demo web broken -n lab-09 --ignore-not-found 2>/dev/null || true
+kubectl delete namespace lab-09 --ignore-not-found --wait=false
+echo "Cleanup started. Chart files stay in labs/09/ for reuse."
+
+##MD
+---
+**Next notebook:** [10-Advanced-Kubernetes.ipynb](10-Advanced-Kubernetes.ipynb) — CRDs, controllers, operators, finalizers and API internals.

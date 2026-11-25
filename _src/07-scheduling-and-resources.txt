@@ -1,0 +1,1885 @@
+##MD
+# Phase 7 — Scheduling and Resource Management
+
+**What you will learn**
+- Requests and limits; what really happens on the node (cgroups): **CPU throttling** vs **memory OOMKill**
+- ResourceQuota and LimitRange (namespace guardrails)
+- Quality of Service (QoS) classes and eviction order
+- nodeSelector, node affinity and anti-affinity
+- Pod affinity and anti-affinity
+- Taints and tolerations
+- Topology spread constraints
+- PriorityClasses and preemption
+- PodDisruptionBudgets (with a real `kubectl drain`)
+- Autoscaling: HPA (runs locally), VPA, Cluster Autoscaler, Karpenter (concepts + OKE equivalents)
+
+**Time:** about 4–5 hours.
+
+**Prerequisites**
+- Notebook 00: kind cluster `learn` (1 control plane + 2 workers: `learn-worker`, `learn-worker2`).
+- Notebooks 02–03 (architecture, workloads).
+
+**How to use this notebook**
+- Run cells top to bottom with **Shift+Enter**.
+- `%%writefile` cells create YAML in `labs/07/`; read the inline comments.
+- Some labs **label, taint or drain** your kind nodes. Each lab undoes its changes, and the final cleanup cell resets everything.
+- Answers are hidden under **Answer**.
+
+##MD
+## Setup: safety check and namespace
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx', not 'kind-learn'."
+  echo "Fix:  kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+
+##CODE
+%%bash
+mkdir -p labs/07
+kubectl create namespace lab-07 --dry-run=client -o yaml | kubectl apply -f -
+kubectl config set-context --current --namespace=lab-07
+kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,TAINTS:.spec.taints[*].key
+
+##MD
+**Expected output** (numbers depend on your Mac and Docker Desktop settings):
+```
+NAME                  CPU   MEMORY     TAINTS
+learn-control-plane   10    8025424Ki  node-role.kubernetes.io/control-plane
+learn-worker          10    8025424Ki  <none>
+learn-worker2         10    8025424Ki  <none>
+```
+kind nodes share the Mac's CPU and RAM, so every node reports the same numbers. **Allocatable** = what the scheduler may give to Pods. The control plane has a **taint**, so normal Pods do not run there.
+
+##MD
+---
+# Topic 1 — Requests and limits (CPU throttling vs OOMKill)
+
+### What is it?
+For each container you can set:
+- **requests**: the amount the container is **guaranteed**. The **scheduler** uses requests to choose a node.
+- **limits**: the **maximum** the container may use. The **kernel** (cgroups) enforces limits.
+
+Units:
+- CPU: `1` = 1 vCPU/core, `500m` = 0.5 core (m = millicores). On OCI, 1 OCPU = 2 vCPUs, so a node with 4 OCPUs shows `8` CPUs.
+- Memory: `Mi`, `Gi` (powers of 2). `M` = powers of 10 (avoid confusion: use `Mi`).
+
+### Why do we need it?
+- Without requests, the scheduler packs Pods onto a node blindly → nodes overload.
+- Without memory limits, one leaking Pod can eat the node's RAM → the kernel kills random processes, kubelet evicts others.
+
+### How it works internally — CPU and memory are enforced DIFFERENTLY
+```
+ Scheduler:  sum(requests of pods on node) + new pod requests <= node allocatable ?   (limits are ignored here)
+
+ kubelet -> container runtime -> Linux cgroup v2 for each container:
+   requests.cpu  -> cpu.weight   (share of CPU when the node is BUSY)
+   limits.cpu    -> cpu.max      e.g. "20000 100000" = 20 ms every 100 ms = 200m
+                    over the limit?  -> THROTTLED (paused until next 100 ms period). Never killed.
+   limits.memory -> memory.max
+                    over the limit?  -> kernel OOM killer kills the process -> "OOMKilled", exit code 137
+```
+**CPU is compressible** (you can slow a process down). **Memory is not** (you cannot take memory back without killing).
+
+### Real production scenario
+A Java API on OKE has `limits.cpu: 500m`. Under load, response time jumps from 50 ms to 2 s, but CPU graphs in Grafana show only "500m used". The app is **throttled**: it wants more CPU but cgroups pause it every 100 ms period. Prometheus metric `container_cpu_cfs_throttled_periods_total` proves it. Many teams remove CPU limits (keep requests) for latency-sensitive apps, but always keep **memory** limits.
+
+##MD
+### Hands-on lab 1.1 — see CPU throttling inside the cgroup
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/07/cpu-throttle.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-burner
+  namespace: lab-07
+spec:
+  containers:
+    - name: burner
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do :; done"]   # infinite loop: wants 100% of one core
+      resources:
+        requests:
+          cpu: 100m           # scheduler reserves 0.1 core
+          memory: 32Mi
+        limits:
+          cpu: 200m           # cgroup cpu.max = 20ms per 100ms period
+          memory: 64Mi
+
+##CODE
+%%bash
+kubectl apply -f labs/07/cpu-throttle.yaml
+kubectl wait --for=condition=Ready pod/cpu-burner --timeout=90s
+sleep 15
+echo "--- cpu.max (quota period) inside the container's cgroup:"
+kubectl exec cpu-burner -- cat /sys/fs/cgroup/cpu.max
+echo "--- cpu.stat (look at nr_throttled and throttled_usec):"
+kubectl exec cpu-burner -- cat /sys/fs/cgroup/cpu.stat
+
+##MD
+**Expected output**
+```
+--- cpu.max (quota period) inside the container's cgroup:
+20000 100000
+--- cpu.stat (look at nr_throttled and throttled_usec):
+usage_usec 3012345
+...
+nr_periods 160
+nr_throttled 158          <- throttled in almost every period
+throttled_usec 12600000
+```
+The loop wants a full core, but gets only 20 ms per 100 ms. The Pod is **not killed** — just slowed.
+
+### Hands-on lab 1.2 — exceed the memory limit (OOMKilled)
+This container allocates about 300 MiB, but its limit is 128 MiB.
+
+##CODE
+%%writefile labs/07/oom.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-hog
+  namespace: lab-07
+spec:
+  restartPolicy: Never        # do not restart, so we can read the final status
+  containers:
+    - name: hog
+      image: python:3.12-alpine
+      command: ["python", "-c", "a = b'x' * (300 * 1024 * 1024); import time; time.sleep(60)"]
+      resources:
+        requests:
+          memory: 64Mi
+          cpu: 50m
+        limits:
+          memory: 128Mi       # cgroup memory.max = 128 MiB -> kernel kills the process above this
+
+##CODE
+%%bash
+kubectl apply -f labs/07/oom.yaml
+sleep 20
+kubectl get pod memory-hog
+kubectl get pod memory-hog -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}{"  exitCode="}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
+
+##MD
+**Expected output** (the image download may take a moment the first time):
+```
+NAME         READY   STATUS      RESTARTS   AGE
+memory-hog   0/1     OOMKilled   0          20s
+OOMKilled  exitCode=137
+```
+Exit code **137** = 128 + 9 (killed by signal 9, SIGKILL). With a Deployment, this becomes `CrashLoopBackOff` with reason `OOMKilled`.
+
+##CODE
+%%bash
+kubectl delete pod cpu-burner memory-hog --wait=false
+
+##MD
+### Troubleshooting requests and limits
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pod `Pending`: `Insufficient cpu` / `Insufficient memory` | Requests too big for any node's free allocatable | Lower requests, add nodes, check `kubectl describe node` (Allocated resources) |
+| `OOMKilled`, exit code 137 | Memory over the **limit** | Raise limit, fix the leak, tune heap (`-XX:MaxRAMPercentage`) |
+| Slow app, CPU graph flat at the limit | **CPU throttling** | Raise/remove CPU limit; check `container_cpu_cfs_throttled_periods_total` |
+| Node `MemoryPressure`, Pods `Evicted` | Pods use more than requested; node runs low | Set realistic requests; set limits; see QoS (Topic 3) |
+| Cluster "full" but nodes idle | Requests much bigger than real usage | Right-size with metrics / VPA recommendations |
+
+Commands:
+```
+kubectl describe node learn-worker | sed -n '/Allocated resources/,/Events/p'
+kubectl top pod   # needs metrics-server (Topic 10)
+```
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Tiny made-up numbers | Requests from real usage (p95 from Prometheus), reviewed regularly |
+| CPU limit set to see throttling | Many teams: CPU **requests** only for latency-sensitive apps; memory request = limit for critical apps |
+| No defaults | LimitRange gives defaults; ResourceQuota caps each team (Topic 2) |
+
+### Check yourself
+1. Which value does the scheduler use: requests or limits?
+<details><summary>Answer</summary>Requests. Limits are enforced on the node by cgroups.</details>
+
+2. A container hits its CPU limit. What happens? Its memory limit?
+<details><summary>Answer</summary>CPU: it is throttled (paused in each period), not killed. Memory: the kernel OOM-kills it (exit 137, OOMKilled).</details>
+
+3. What does `250m` mean?
+<details><summary>Answer</summary>250 millicores = a quarter of one CPU core.</details>
+
+4. An OKE node has 2 OCPUs. How many CPUs does Kubernetes see?
+<details><summary>Answer</summary>4 (1 OCPU = 2 vCPUs on x86/Ampere shapes as seen by the OS), minus system reservations for allocatable.</details>
+
+##MD
+---
+# Topic 2 — ResourceQuota and LimitRange
+
+### What is it?
+- **ResourceQuota**: a **total budget** for a namespace. Example: "team-a may use at most 4 CPU of requests, 8Gi memory, 20 Pods, 5 PVCs".
+- **LimitRange**: **per-container (or per-Pod/PVC) rules** in a namespace: default requests/limits if missing, and min/max allowed values.
+
+### Why do we need it?
+In a shared cluster (multi-tenant), one team can create 200 replicas by mistake and starve everyone. Quotas stop that. LimitRange makes sure every container has requests/limits even if developers forget.
+
+### How it works internally
+Both are enforced by **admission controllers** in the API server, at create time:
+```
+ kubectl apply Pod
+   -> LimitRanger admission:   fills missing requests/limits with defaults; rejects if outside min/max
+   -> ResourceQuota admission: adds this Pod's requests to the namespace "used"; rejects if over "hard"
+   -> stored in etcd
+```
+Important: if a quota limits `requests.cpu`, **every** new Pod must have a CPU request — otherwise it is rejected. LimitRange defaults solve this.
+
+### Real production scenario
+You run one OKE cluster for UAT with namespaces per project (`events-uat`, `hub-uat`, `jira-uat`). A load test in `events-uat` scales to 50 Pods and the other teams' Pods go Pending. You add a ResourceQuota per namespace and a LimitRange with sensible defaults.
+
+##MD
+### Hands-on lab 2 — guardrails for a "team" namespace
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl create namespace lab-07-team --dry-run=client -o yaml | kubectl apply -f -
+
+##CODE
+%%writefile labs/07/guardrails.yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: lab-07-team
+spec:
+  limits:
+    - type: Container
+      defaultRequest:         # used when a container has NO requests
+        cpu: 100m
+        memory: 64Mi
+      default:                # used when a container has NO limits
+        cpu: 500m
+        memory: 256Mi
+      min:                    # smaller requests are rejected
+        cpu: 50m
+        memory: 32Mi
+      max:                    # bigger limits are rejected
+        cpu: "1"
+        memory: 512Mi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-budget
+  namespace: lab-07-team
+spec:
+  hard:
+    pods: "4"                 # max 4 Pods in the namespace
+    requests.cpu: "1"         # sum of all CPU requests <= 1 core
+    requests.memory: 512Mi
+    limits.memory: 1Gi
+    persistentvolumeclaims: "2"
+    services.loadbalancers: "0"   # no cloud load balancers (cost control)
+
+##CODE
+%%bash
+kubectl apply -f labs/07/guardrails.yaml
+echo "--- Pod WITHOUT resources: LimitRange fills defaults"
+kubectl -n lab-07-team run no-resources --image=busybox:1.36 -- sleep 3600
+sleep 2
+kubectl -n lab-07-team get pod no-resources -o jsonpath='{.spec.containers[0].resources}'; echo
+echo "--- Pod asking for too much memory: rejected by LimitRange"
+kubectl -n lab-07-team run too-big --image=busybox:1.36 --overrides='{"spec":{"containers":[{"name":"too-big","image":"busybox:1.36","command":["sleep","3600"],"resources":{"limits":{"memory":"2Gi"}}}]}}' 2>&1 | tail -1
+
+##MD
+**Expected output**
+```
+--- Pod WITHOUT resources: LimitRange fills defaults
+{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}
+--- Pod asking for too much memory: rejected by LimitRange
+Error from server (Forbidden): pods "too-big" is forbidden: maximum memory usage per Container is 512Mi, but limit is 2Gi
+```
+Now hit the **quota**: a Deployment with 6 replicas, but the namespace allows 4 Pods (1 already used).
+
+##CODE
+%%bash
+kubectl -n lab-07-team create deployment web --image=busybox:1.36 --replicas=6 -- sleep 3600
+sleep 8
+kubectl -n lab-07-team get deploy web
+kubectl -n lab-07-team describe resourcequota team-budget
+echo "--- Why are replicas missing? Look at the ReplicaSet events:"
+kubectl -n lab-07-team describe rs -l app=web | grep -m2 'exceeded quota'
+
+##MD
+**Expected output**
+```
+NAME   READY   UP-TO-DATE   AVAILABLE
+web    3/6     3            3
+Name:            team-budget
+Resource         Used   Hard
+--------         ----   ----
+limits.memory    1Gi    1Gi
+persistentvolumeclaims 0  2
+pods             4      4
+requests.cpu     400m   1
+requests.memory  256Mi  512Mi
+...
+--- Why are replicas missing? Look at the ReplicaSet events:
+  Warning  FailedCreate ... pods "web-..." is forbidden: exceeded quota: team-budget, requested: limits.memory=256Mi,pods=1, used: limits.memory=1Gi,pods=4, limited: limits.memory=1Gi,pods=4
+```
+Note: quota errors appear on the **ReplicaSet**, not on the Deployment or a Pod — a common place where people get lost.
+
+##CODE
+%%bash
+kubectl delete namespace lab-07-team --wait=false
+
+##MD
+### Troubleshooting quotas and limit ranges
+| Symptom | Cause | Fix |
+|---|---|---|
+| Deployment shows fewer ready replicas, no Pods failing | ReplicaSet blocked by quota | `kubectl describe rs`; raise quota or reduce replicas |
+| `must specify requests.cpu` | Quota on requests, Pod has none, no LimitRange default | Add requests or a LimitRange `defaultRequest` |
+| `maximum ... per Container is X` | LimitRange `max` | Lower the limit or change the LimitRange |
+| Pods got unexpected limits | LimitRange `default` applied | Set explicit resources in the Pod spec |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Small numbers | Quotas sized per team from capacity planning; reviewed with usage dashboards |
+| Applied by hand | Created with the namespace by a platform pipeline (namespace-as-a-service) |
+| No alerts | Alert at 80% quota usage (`kube_resourcequota` metrics) |
+
+### Check yourself
+1. Which object fills missing requests: ResourceQuota or LimitRange?
+<details><summary>Answer</summary>LimitRange (<code>defaultRequest</code> and <code>default</code>).</details>
+
+2. Where do you see the error when a Deployment cannot create Pods because of quota?
+<details><summary>Answer</summary>In the events of the ReplicaSet (<code>kubectl describe rs</code>), as FailedCreate.</details>
+
+3. Are quotas checked when Pods run, or when they are created?
+<details><summary>Answer</summary>At creation (admission). Running Pods are not killed if the quota is later lowered.</details>
+
+##MD
+---
+# Topic 3 — Quality of Service (QoS) classes
+
+### What is it?
+Kubernetes puts every Pod in one **QoS class**, based on its requests and limits:
+| QoS class | Rule | Meaning |
+|---|---|---|
+| **Guaranteed** | every container has CPU **and** memory requests **=** limits | highest protection |
+| **Burstable** | at least one request or limit set, but not Guaranteed | medium |
+| **BestEffort** | no requests and no limits at all | first to be killed |
+
+### Why do we need it?
+When a node runs out of memory, someone must go. QoS decides the order. Critical workloads (databases) should be **Guaranteed**.
+
+### How it works internally
+```
+ Node memory low (e.g. memory.available < 100Mi = kubelet eviction threshold)
+   kubelet EVICTION order:  BestEffort -> Burstable using MORE than its request -> ... -> Guaranteed last
+ Kernel OOM (sudden): oom_score_adj per QoS
+   Guaranteed: -997   Burstable: 2..999 (depends on request)   BestEffort: 1000  (higher = killed first)
+```
+
+### Real production scenario
+A node in your OKE cluster runs MySQL, a batch report job, and some test Pods with no resources. The batch job spikes memory. Without QoS planning, MySQL could be killed. With MySQL **Guaranteed** and test Pods **BestEffort**, kubelet evicts the test Pods first.
+
+##MD
+### Hands-on lab 3 — three Pods, three QoS classes
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/07/qos.yaml
+apiVersion: v1
+kind: Pod
+metadata: {name: qos-guaranteed, namespace: lab-07}
+spec:
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}   # requests == limits for CPU AND memory
+        limits:   {cpu: 100m, memory: 64Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: qos-burstable, namespace: lab-07}
+spec:
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 50m, memory: 32Mi}    # requests < limits
+        limits:   {memory: 128Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: qos-besteffort, namespace: lab-07}
+spec:
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: ["sleep", "3600"]              # no resources at all
+
+##CODE
+%%bash
+kubectl apply -f labs/07/qos.yaml
+kubectl wait --for=condition=Ready pod/qos-guaranteed pod/qos-burstable pod/qos-besteffort --timeout=90s
+kubectl get pod qos-guaranteed qos-burstable qos-besteffort -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+echo "--- Kernel OOM score adjustment per Pod:"
+for p in qos-guaranteed qos-burstable qos-besteffort; do
+  echo "$p: $(kubectl exec $p -- cat /proc/1/oom_score_adj)"
+done
+
+##MD
+**Expected output**
+```
+NAME             QOS
+qos-guaranteed   Guaranteed
+qos-burstable    Burstable
+qos-besteffort   BestEffort
+--- Kernel OOM score adjustment per Pod:
+qos-guaranteed: -997
+qos-burstable: 999      <- exact number depends on request vs node memory
+qos-besteffort: 1000
+```
+
+##CODE
+%%bash
+kubectl delete pod qos-guaranteed qos-burstable qos-besteffort --wait=false
+
+##MD
+### Troubleshooting QoS
+| Symptom | Cause | Fix |
+|---|---|---|
+| Important Pod evicted first | It was BestEffort/Burstable over its request | Make it Guaranteed (requests = limits) |
+| Pod is Burstable though you set requests=limits | One container (or init container) differs, or CPU missing | Every container needs CPU **and** memory requests = limits |
+| Many `Evicted` Pods left over | Eviction leaves Failed Pods | `kubectl delete pod --field-selector=status.phase=Failed` |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Demo Pods | Databases/critical: Guaranteed. Web apps: Burstable with good requests. No BestEffort in prod namespaces (LimitRange defaults) |
+
+### Check yourself
+1. Requests and limits are equal for memory but CPU has no limit. Which QoS?
+<details><summary>Answer</summary>Burstable. Guaranteed needs CPU and memory requests = limits for every container.</details>
+
+2. Which QoS class is evicted first under memory pressure?
+<details><summary>Answer</summary>BestEffort.</details>
+
+##MD
+---
+# Topic 4 — nodeSelector, node affinity and anti-affinity
+
+### What is it?
+Ways to tell the scheduler **which nodes** a Pod may (or prefers to) run on, using **node labels**:
+- `nodeSelector`: simple exact match (`disktype: ssd`). Hard rule.
+- **Node affinity**: richer rules with operators `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`.
+  - `requiredDuringSchedulingIgnoredDuringExecution` = **hard** rule (must).
+  - `preferredDuringSchedulingIgnoredDuringExecution` = **soft** rule (try, with a `weight` 1–100).
+- **Node anti-affinity** = node affinity with `NotIn` / `DoesNotExist` (keep away from some nodes).
+
+"IgnoredDuringExecution" means: if node labels change later, running Pods are **not** moved.
+
+### Why do we need it?
+- GPU workloads must run on GPU nodes.
+- A Windows/ARM image must run on matching nodes (`kubernetes.io/arch: arm64` — OCI Ampere A1).
+- Licensing: some software is licensed only for specific nodes.
+- Keep apps off nodes reserved for something else.
+
+### How it works internally
+```
+ Scheduler, for each new Pod:
+   1. FILTER  nodes: drop nodes failing nodeSelector / required node affinity / taints / resources
+   2. SCORE   remaining nodes: preferred affinity weights + other plugins (balance, spread)
+   3. BIND    Pod to the best node (writes spec.nodeName)
+```
+Well-known labels set automatically: `kubernetes.io/hostname`, `kubernetes.io/arch`, `kubernetes.io/os`, `topology.kubernetes.io/zone`, `node.kubernetes.io/instance-type`. On OKE you also get labels like the node pool name and the fault domain.
+
+### Real production scenario
+Your OKE cluster has two node pools: `pool-x86` (VM.Standard.E5.Flex) and `pool-arm` (VM.Standard.A1.Flex, cheaper). Your new image is multi-arch, but an old vendor image is x86 only. You add required node affinity `kubernetes.io/arch In [amd64]` to the vendor app, and a **preferred** affinity for `arm64` on the new apps to save cost.
+
+##MD
+### Hands-on lab 4 — label nodes and steer Pods
+
+We add a custom label `disktype=ssd` to `learn-worker` only.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl label node learn-worker disktype=ssd --overwrite
+kubectl get nodes -L disktype,kubernetes.io/arch
+
+##CODE
+%%writefile labs/07/node-affinity.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-db-client
+  namespace: lab-07
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: fast-db-client}
+  template:
+    metadata:
+      labels: {app: fast-db-client}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:   # HARD rule
+            nodeSelectorTerms:                              # terms are ORed
+              - matchExpressions:                           # expressions inside a term are ANDed
+                  - key: disktype
+                    operator: In
+                    values: ["ssd"]
+          preferredDuringSchedulingIgnoredDuringExecution:  # SOFT rule
+            - weight: 50                                    # 1-100, added to the node's score
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["arm64"]
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/node-affinity.yaml
+kubectl rollout status deploy/fast-db-client --timeout=90s
+kubectl get pods -l app=fast-db-client -o wide | awk '{print $1, $3, $7}'
+
+##MD
+**Expected output** — all replicas on `learn-worker`:
+```
+NAME STATUS NODE
+fast-db-client-6c9...-abcde Running learn-worker
+fast-db-client-6c9...-fghij Running learn-worker
+fast-db-client-6c9...-klmno Running learn-worker
+```
+Now ask for a label that **no node has**, and see the Pending reason. We use the simple `nodeSelector` form:
+
+##CODE
+%%bash
+kubectl run gpu-job --image=busybox:1.36 --overrides='{"spec":{"nodeSelector":{"accelerator":"nvidia-a10"}}}' -- sleep 3600
+sleep 5
+kubectl get pod gpu-job
+kubectl describe pod gpu-job | grep -A1 FailedScheduling | tail -1
+kubectl delete pod gpu-job --wait=false
+kubectl delete deploy fast-db-client
+
+##MD
+**Expected output**
+```
+gpu-job   0/1   Pending ...
+  ... 0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 node(s) didn't match Pod's node affinity/selector. preemption: ...
+```
+Read the message carefully: it explains for **each** node why it was filtered out.
+
+### Troubleshooting node selection
+| Symptom | Cause | Fix |
+|---|---|---|
+| `didn't match Pod's node affinity/selector` | No node has the label/value | `kubectl get nodes --show-labels`; fix the label or the rule |
+| Pods all on one node | Required rule matches only one node | Use preferred, or label more nodes |
+| Label changed, Pods did not move | "IgnoredDuringExecution" | Restart the Pods (rollout restart) |
+| Rule with two `nodeSelectorTerms` matches too much | Terms are **OR** | Put conditions in one term's `matchExpressions` (AND) |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Hand-made label | Labels set by the node pool (OKE node pool "initial node labels", Terraform) so new nodes get them automatically |
+| Required rule | Prefer **soft** rules unless there is a hard technical reason (arch, GPU, licence) — hard rules reduce flexibility during failures |
+
+### Check yourself
+1. Two `nodeSelectorTerms` — AND or OR?
+<details><summary>Answer</summary>OR. Expressions inside one term are AND.</details>
+
+2. What does "IgnoredDuringExecution" mean?
+<details><summary>Answer</summary>The rule is checked only when scheduling. Running Pods are not evicted if labels change later.</details>
+
+3. Why prefer node pool labels over `kubectl label`?
+<details><summary>Answer</summary>Manual labels disappear when nodes are replaced (autoscaling, upgrades). Node pool labels are applied to every new node automatically.</details>
+
+##MD
+---
+# Topic 5 — Pod affinity and anti-affinity
+
+### What is it?
+Rules based on **other Pods**, not node labels:
+- **Pod affinity**: "run me **near** Pods with label X" (same node / same zone).
+- **Pod anti-affinity**: "run me **away from** Pods with label X".
+- `topologyKey` defines what "near" means: `kubernetes.io/hostname` = same node, `topology.kubernetes.io/zone` = same zone/AD.
+
+### Why do we need it?
+- **Anti-affinity for high availability**: 3 replicas of an API on 3 different nodes, so one node failure does not take all of them.
+- **Affinity for performance**: put a cache next to the app that uses it (low latency, no cross-AD traffic cost).
+
+### How it works internally
+```
+ New Pod with podAntiAffinity (labelSelector app=web, topologyKey=hostname):
+   scheduler groups nodes by the topologyKey value (each hostname = one group)
+   FILTER: drop groups that already have a Pod matching app=web   (required)
+   SCORE:  lower score for those groups                             (preferred)
+```
+Pod (anti-)affinity is more expensive to compute than node affinity. In large clusters (thousands of nodes) use it carefully, or use topology spread constraints (Topic 7).
+
+### Real production scenario
+Your `hub-api` Deployment on OKE has 3 replicas. After a node pool upgrade, all 3 end up on one node. That node is then drained for patching — **total outage** of hub-api for 40 seconds. Required pod anti-affinity on hostname (or a topology spread constraint) would have prevented it.
+
+##MD
+### Hands-on lab 5.1 — required anti-affinity: one replica per node
+
+We have only **2** worker nodes. We ask for **3** replicas with a hard "one per node" rule. Predict what happens before you run it.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/07/anti-affinity.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hub-api
+  namespace: lab-07
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: hub-api}
+  template:
+    metadata:
+      labels: {app: hub-api}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: hub-api}      # "away from other hub-api Pods"
+              topologyKey: kubernetes.io/hostname  # "away" = not on the same node
+      containers:
+        - name: api
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/anti-affinity.yaml
+sleep 10
+kubectl get pods -l app=hub-api -o wide | awk '{print $1, $3, $7}'
+PENDING=$(kubectl get pods -l app=hub-api --field-selector=status.phase=Pending -o name | head -1)
+[ -n "$PENDING" ] && kubectl describe $PENDING | grep -A1 FailedScheduling | tail -1
+
+##MD
+**Expected output**
+```
+NAME STATUS NODE
+hub-api-7d4...-aaaaa Running learn-worker
+hub-api-7d4...-bbbbb Running learn-worker2
+hub-api-7d4...-ccccc Pending <none>
+  ... 0/3 nodes are available: 1 node(s) had untolerated taint ..., 2 node(s) didn't match pod anti-affinity rules ...
+```
+A **hard** rule that cannot be satisfied leaves Pods Pending. In production, use **preferred** anti-affinity (spread when possible, still run when not), or have more nodes than replicas.
+
+Change it to **preferred** and see all 3 run:
+
+##CODE
+%%bash
+kubectl patch deploy hub-api --type=json -p='[
+ {"op":"remove","path":"/spec/template/spec/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution"},
+ {"op":"add","path":"/spec/template/spec/affinity/podAntiAffinity/preferredDuringSchedulingIgnoredDuringExecution","value":[
+   {"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app":"hub-api"}},"topologyKey":"kubernetes.io/hostname"}}]}]'
+kubectl rollout status deploy/hub-api --timeout=90s
+kubectl get pods -l app=hub-api -o wide | awk '{print $1, $3, $7}'
+
+##MD
+**Expected output** — all Running, spread as much as possible (2 + 1):
+```
+hub-api-5b8...-xxxxx Running learn-worker
+hub-api-5b8...-yyyyy Running learn-worker2
+hub-api-5b8...-zzzzz Running learn-worker
+```
+
+### Hands-on lab 5.2 — pod affinity: put the cache next to the app
+
+##CODE
+%%writefile labs/07/pod-affinity.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hub-cache
+  namespace: lab-07
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: hub-cache}
+  template:
+    metadata:
+      labels: {app: hub-cache}
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: hub-api}        # "near hub-api Pods"
+              topologyKey: kubernetes.io/hostname  # "near" = on the same node
+      containers:
+        - name: cache
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/pod-affinity.yaml
+kubectl rollout status deploy/hub-cache --timeout=90s
+kubectl get pods -l 'app in (hub-api,hub-cache)' -o wide --sort-by=.spec.nodeName | awk '{print $1, $7}'
+kubectl delete deploy hub-api hub-cache
+
+##MD
+**Expected output** — every cache Pod is on a node that has a hub-api Pod.
+
+### Troubleshooting pod (anti-)affinity
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pending: `didn't match pod anti-affinity rules` | Hard rule, not enough nodes/zones | More nodes, or switch to preferred |
+| Pending: `didn't match pod affinity rules` | Target Pods do not exist yet / wrong label | Start target first; check labelSelector and namespace |
+| Affinity "ignored" | labelSelector matches Pods in another namespace only | Add `namespaces:` or `namespaceSelector` |
+| Scheduling slow in big clusters | Many inter-pod affinity rules | Prefer topology spread constraints |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| 2 nodes, hostname key | Spread over **zones/ADs** (`topology.kubernetes.io/zone`) **and** nodes; OCI single-AD regions: spread over **fault domains** (OKE label for FD) |
+| Required anti-affinity demo | Usually preferred anti-affinity or topology spread + PodDisruptionBudget |
+
+### Check yourself
+1. What does `topologyKey: topology.kubernetes.io/zone` mean in anti-affinity?
+<details><summary>Answer</summary>Two matching Pods should not be in the same zone. Nodes are grouped by zone label value.</details>
+
+2. Why can a hard anti-affinity rule cause an outage during a node upgrade?
+<details><summary>Answer</summary>When a node is drained, its Pod cannot be rescheduled if all other nodes already have one replica — it stays Pending and capacity drops.</details>
+
+##MD
+---
+# Topic 6 — Taints and tolerations
+
+### What is it?
+- A **taint** is put on a **node**: "do not schedule here unless you tolerate me". Format: `key=value:Effect`.
+- A **toleration** is put on a **Pod**: "I accept this taint".
+- Effects:
+  - `NoSchedule`: new Pods without toleration are not scheduled. Running Pods stay.
+  - `PreferNoSchedule`: soft version.
+  - `NoExecute`: new Pods are not scheduled **and** running Pods without toleration are **evicted** (optionally after `tolerationSeconds`).
+
+**Important:** a toleration **allows** a node; it does **not attract** the Pod to it. To *dedicate* nodes, use a taint **plus** node affinity/selector.
+
+### Why do we need it?
+- Dedicated node pools (database nodes, GPU nodes, nodes for one customer).
+- Keep normal workloads off the control plane (you saw `node-role.kubernetes.io/control-plane:NoSchedule`).
+- Kubernetes itself taints unhealthy nodes: `node.kubernetes.io/not-ready:NoExecute`, `node.kubernetes.io/unreachable:NoExecute`, `memory-pressure`, `disk-pressure`.
+
+### How it works internally
+```
+ Scheduler FILTER: node taints (NoSchedule/NoExecute) not tolerated by the Pod -> node dropped
+ Node lifecycle controller: node NotReady -> adds taint not-ready:NoExecute
+ Taint manager: evicts Pods without toleration; Pods get a default toleration of 300 s for
+                not-ready/unreachable (that is why Pods wait ~5 min before moving off a dead node)
+ DaemonSets automatically tolerate many node taints (so node agents keep running)
+```
+
+### Real production scenario
+You create an OKE node pool `pool-db` with bigger memory shapes for MySQL and Elasticsearch. Without taints, random web Pods fill it. You add the taint `workload=db:NoSchedule` to the pool (node pool setting), and give DB Pods a toleration **and** node affinity `pool=db`. Now only DB Pods run there, and DB Pods run only there.
+
+##MD
+### Hands-on lab 6 — dedicate learn-worker2 to "db" workloads
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl taint node learn-worker2 workload=db:NoSchedule --overwrite
+kubectl label node learn-worker2 pool=db --overwrite
+kubectl get node learn-worker2 -o jsonpath='{.spec.taints}'; echo
+
+##MD
+Step 1: a normal Deployment with 4 replicas. Where do the Pods go?
+
+##CODE
+%%bash
+kubectl create deployment web --image=busybox:1.36 --replicas=4 -- sleep 3600
+kubectl rollout status deploy/web --timeout=90s
+kubectl get pods -l app=web -o wide | awk '{print $1, $7}'
+
+##MD
+**Expected output** — all on `learn-worker` (worker2 is tainted, control plane is tainted).
+
+Step 2: a DB Pod with a **toleration** and **node affinity** — it goes to worker2.
+
+##CODE
+%%writefile labs/07/tolerations.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: lab-07
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: db}
+  template:
+    metadata:
+      labels: {app: db}
+    spec:
+      tolerations:
+        - key: workload           # must match the taint key
+          operator: Equal         # Equal: key AND value must match; Exists: key only
+          value: db
+          effect: NoSchedule      # must match the taint effect (or leave empty for all effects)
+      nodeSelector:
+        pool: db                  # the toleration only ALLOWS worker2; this ATTRACTS the Pod there
+      containers:
+        - name: db
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/tolerations.yaml
+kubectl rollout status deploy/db --timeout=90s
+kubectl get pods -l app=db -o wide | awk '{print $1, $7}'
+
+##MD
+**Expected output** — both on `learn-worker2`.
+
+Step 3: `NoExecute` evicts running Pods. Add a NoExecute taint to `learn-worker` and watch the `web` Pods (no toleration) become Pending — there is no other node they may use.
+
+##CODE
+%%bash
+kubectl taint node learn-worker maintenance=true:NoExecute --overwrite
+sleep 15
+kubectl get pods -l app=web -o wide | awk '{print $1, $3, $7}'
+echo "--- remove the NoExecute taint (the trailing '-' removes it):"
+kubectl taint node learn-worker maintenance=true:NoExecute-
+kubectl rollout status deploy/web --timeout=90s
+
+##MD
+**Expected output**
+```
+web-...  Pending  <none>
+web-...  Pending  <none>
+...
+--- remove the NoExecute taint (the trailing '-' removes it):
+node/learn-worker untainted
+deployment "web" successfully rolled out
+```
+Clean up this lab's taint and label:
+
+##CODE
+%%bash
+kubectl delete deploy web db
+kubectl taint node learn-worker2 workload=db:NoSchedule-
+kubectl label node learn-worker2 pool-
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints[*].key
+
+##MD
+### Troubleshooting taints
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pending: `had untolerated taint {key: value}` | No toleration for that node's taint | Add toleration (and affinity if the node is dedicated) |
+| Pod with toleration still lands on normal nodes | Tolerations do not attract | Add nodeSelector/affinity to the dedicated label |
+| DaemonSet (e.g. log agent, CSI node plugin) missing on tainted pool | DaemonSet lacks toleration | Add `tolerations: [{operator: Exists}]` to node agents |
+| Pods evicted ~5 min after node failure | Default 300 s toleration for not-ready/unreachable | Lower `tolerationSeconds` for fast failover (carefully) |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| `kubectl taint` by hand | Taints defined on the OKE node pool (or Terraform) so every new node gets them |
+| Single dedicated node | Dedicated pool with ≥2 nodes in different ADs/FDs |
+
+### Check yourself
+1. Does a toleration force a Pod onto the tainted node?
+<details><summary>Answer</summary>No. It only allows it. Use node affinity/nodeSelector to attract.</details>
+
+2. Difference between `NoSchedule` and `NoExecute`?
+<details><summary>Answer</summary>NoSchedule blocks new Pods only. NoExecute also evicts running Pods that do not tolerate it.</details>
+
+3. Why do Pods take ~5 minutes to move off a failed node?
+<details><summary>Answer</summary>Pods get default tolerations for <code>not-ready</code> and <code>unreachable</code> NoExecute taints with <code>tolerationSeconds: 300</code>.</details>
+
+##MD
+---
+# Topic 7 — Topology spread constraints
+
+### What is it?
+A rule that spreads Pods **evenly** across a topology (zones, nodes, fault domains):
+- `maxSkew`: the maximum allowed difference in Pod count between any two domains.
+- `topologyKey`: the node label that defines domains.
+- `whenUnsatisfiable`: `DoNotSchedule` (hard) or `ScheduleAnyway` (soft).
+- `labelSelector`: which Pods to count.
+
+### Why do we need it?
+Pod anti-affinity only says "not together". With 6 replicas and 3 zones, anti-affinity per zone cannot place more than 3. Topology spread says "**about 2 per zone**" — and it scales.
+
+### How it works internally
+```
+ Domains (zone label):     zone-a      zone-b
+ Matching pods now:          2           1
+ New pod: placing in zone-a -> skew = 3-1 = 2 > maxSkew(1) -> not allowed
+          placing in zone-b -> skew = 2-2 = 0             -> allowed
+ Nodes WITHOUT the topologyKey label are ignored for spreading.
+```
+Cluster default constraints also exist (the scheduler spreads by hostname and zone softly by default).
+
+### Real production scenario
+OCI region `me-jeddah-1` has **one AD** with 3 **fault domains**. Your OKE nodes are spread over FD-1, FD-2, FD-3. You add a topology spread constraint on the fault-domain label with `maxSkew: 1`, so a hardware failure in one FD takes at most a third of your replicas.
+
+##MD
+### Hands-on lab 7 — simulate two zones and spread 4 replicas
+
+We label the two workers as two "zones".
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl label node learn-worker  topology.kubernetes.io/zone=zone-a --overwrite
+kubectl label node learn-worker2 topology.kubernetes.io/zone=zone-b --overwrite
+kubectl get nodes -L topology.kubernetes.io/zone
+
+##CODE
+%%writefile labs/07/spread.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread-web
+  namespace: lab-07
+spec:
+  replicas: 4
+  selector:
+    matchLabels: {app: spread-web}
+  template:
+    metadata:
+      labels: {app: spread-web}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1                               # zones may differ by at most 1 Pod
+          topologyKey: topology.kubernetes.io/zone # domain = zone
+          whenUnsatisfiable: DoNotSchedule         # hard rule
+          labelSelector:
+            matchLabels: {app: spread-web}         # count only these Pods
+          matchLabelKeys: ["pod-template-hash"]    # count Pods of the SAME rollout only (k8s 1.27+)
+        - maxSkew: 1                               # second rule: spread across nodes too
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway        # soft rule
+          labelSelector:
+            matchLabels: {app: spread-web}
+      containers:
+        - name: web
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/spread.yaml
+kubectl rollout status deploy/spread-web --timeout=90s
+echo "Pods per zone:"
+for p in $(kubectl get pods -l app=spread-web -o jsonpath='{.items[*].spec.nodeName}'); do
+  kubectl get node $p -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}'
+done | sort | uniq -c
+
+##MD
+**Expected output**
+```
+Pods per zone:
+   2 zone-a
+   2 zone-b
+```
+Try `kubectl scale deploy spread-web --replicas=5` — you get 3/2 (skew 1, allowed). Now **cordon** zone-b (no new Pods there) and scale to 6. Predict: how many run?
+
+##CODE
+%%bash
+kubectl cordon learn-worker2
+kubectl scale deploy spread-web --replicas=6
+sleep 10
+kubectl get pods -l app=spread-web -o wide | awk '{print $1, $3, $7}'
+kubectl uncordon learn-worker2
+sleep 5
+kubectl get pods -l app=spread-web --field-selector=status.phase=Pending -o name | wc -l | xargs echo "Pending after uncordon:"
+kubectl delete deploy spread-web
+
+##MD
+**Expected output:** while zone-b is cordoned, zone-a gets 3 Pods and the 6th Pod is `Pending` (a 4th Pod in zone-a would make skew 2). After uncordon, the Pending Pod lands in zone-b: `Pending after uncordon: 0`.
+
+Note: cordoned nodes still **count** as a domain here (default `nodeTaintsPolicy: Ignore`, and cordon is a taint). This is a classic surprise during maintenance — use `ScheduleAnyway` if you prefer availability over perfect spread.
+
+### Troubleshooting topology spread
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pending: `didn't match pod topology spread constraints` | Hard constraint, one domain full/cordoned | `ScheduleAnyway`, add capacity, or `nodeTaintsPolicy: Honor` |
+| Spread uneven after scale-down | Scheduler only acts at scheduling time | Descheduler, or rollout restart |
+| Spread ignores some nodes | Nodes lack the topologyKey label | Label all nodes (node pool labels) |
+| Uneven during rolling update | Old + new ReplicaSet Pods counted together | `matchLabelKeys: ["pod-template-hash"]` |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Fake zone labels | Real labels from the cloud: zone/AD, plus OCI fault-domain label |
+| Hard zone rule | Hard on zone/AD (if ≥2 AD), soft on hostname; combined with PDB |
+
+### Check yourself
+1. Zone A has 3 Pods, zone B has 1, `maxSkew: 1`, `DoNotSchedule`. Where does the next Pod go?
+<details><summary>Answer</summary>Zone B. Placing it in A gives 4 vs 1 (skew 3, not allowed). Placing it in B gives 3 vs 2 (skew 1, allowed).</details>
+
+2. Why use topology spread instead of pod anti-affinity?
+<details><summary>Answer</summary>It allows many Pods per domain while keeping them balanced, scales to any replica count, and is cheaper for the scheduler.</details>
+
+##MD
+---
+# Topic 8 — PriorityClasses and preemption
+
+### What is it?
+A **PriorityClass** gives Pods a number (priority). When the cluster is **full**, the scheduler can **preempt** (evict) lower-priority Pods to make room for a higher-priority Pod.
+
+Built-in classes: `system-node-critical` (2000001000) and `system-cluster-critical` (2000000000) for CoreDNS, CNI, etc. Your own classes should be well below 1,000,000,000.
+
+### Why do we need it?
+When capacity is short (node failure, sudden traffic), you want **payments** to keep running and **batch reports** to wait — not the other way around.
+
+### How it works internally
+```
+ New high-priority Pod cannot fit anywhere
+   -> scheduler "PostFilter" (preemption): find a node where evicting LOWER-priority Pods frees enough room
+   -> marks the Pod with status.nominatedNodeName
+   -> deletes victim Pods gracefully (respects terminationGracePeriod; tries to respect PDBs, but may violate them)
+   -> schedules the high-priority Pod when room is free
+ Also: higher priority Pods are placed FIRST in the scheduling queue.
+ preemptionPolicy: Never -> high queue priority, but never evicts others.
+```
+
+### Real production scenario
+An OKE worker node fails during Black Friday. The remaining nodes are full. Without priorities, the replacement `payments` Pods wait Pending behind a reporting batch job. With `payments` at priority 100000 and `batch` at 1000, the scheduler evicts batch Pods and payments recover in seconds. The Cluster Autoscaler then adds a node for the batch Pods.
+
+##MD
+### Hands-on lab 8 — fill the workers with low-priority Pods, then preempt
+
+We compute a CPU request = 60% of one worker's allocatable CPU. Two low-priority Pods (one per worker) then fill the cluster. A third, high-priority Pod with the same request must preempt one.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/07/priorityclasses.yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: lab-business-critical        # cluster-wide object
+value: 100000                        # higher number = more important
+globalDefault: false                 # true = used for Pods without priorityClassName (only ONE class may be default)
+preemptionPolicy: PreemptLowerPriority   # may evict lower-priority Pods (default)
+description: "Payments and other revenue-critical services"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: lab-batch-low
+value: 1000
+globalDefault: false
+preemptionPolicy: Never              # batch never evicts anybody
+description: "Reports and batch jobs; first to be preempted"
+
+##CODE
+%%bash
+kubectl apply -f labs/07/priorityclasses.yaml
+A=$(kubectl get node learn-worker -o jsonpath='{.status.allocatable.cpu}')
+case "$A" in *m) M=${A%m} ;; *) M=$((A*1000)) ;; esac
+REQ=$((M*60/100))m
+echo "Worker allocatable CPU: $A -> each test Pod requests $REQ"
+echo "$REQ" > labs/07/req.txt
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: batch-report, namespace: lab-07}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: batch-report}}
+  template:
+    metadata: {labels: {app: batch-report}}
+    spec:
+      priorityClassName: lab-batch-low
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: job
+          image: busybox:1.36
+          command: ["sleep", "3600"]
+          resources: {requests: {cpu: "$REQ", memory: 16Mi}}
+EOF
+kubectl rollout status deploy/batch-report --timeout=90s
+kubectl get pods -l app=batch-report -o wide | awk '{print $1, $3, $7}'
+
+##MD
+**Expected output** — one batch Pod per worker (each takes 60% of a node):
+```
+Worker allocatable CPU: 10 -> each test Pod requests 6000m
+batch-report-...-aaaaa Running learn-worker
+batch-report-...-bbbbb Running learn-worker2
+```
+Now create the high-priority **payments** Pod with the same request. No node has 60% free.
+
+##CODE
+%%bash
+REQ=$(cat labs/07/req.txt)
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: payments, namespace: lab-07}
+spec:
+  priorityClassName: lab-business-critical
+  containers:
+    - name: api
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources: {requests: {cpu: "$REQ", memory: 16Mi}}
+EOF
+sleep 20
+kubectl get pods -o wide | awk '{print $1, $3, $7}'
+echo "--- events:"
+kubectl get events --field-selector reason=Preempted -o custom-columns=OBJECT:.involvedObject.name,MESSAGE:.message | tail -3
+
+##MD
+**Expected output**
+```
+NAME                       STATUS    NODE
+batch-report-...-aaaaa     Running   learn-worker
+batch-report-...-ccccc     Pending   <none>          <- recreated by the ReplicaSet, cannot fit
+payments                   Running   learn-worker2
+--- events:
+OBJECT                   MESSAGE
+batch-report-...-bbbbb   Preempted by pod <uid> on node learn-worker2
+```
+The batch Pod was evicted, payments runs, and the replacement batch Pod waits. In production the Cluster Autoscaler would now add a node for it.
+
+##CODE
+%%bash
+kubectl delete pod payments --wait=false
+kubectl delete deploy batch-report
+kubectl delete priorityclass lab-business-critical lab-batch-low
+
+##MD
+### Troubleshooting priority and preemption
+| Symptom | Cause | Fix |
+|---|---|---|
+| Important Pods Pending, batch Pods running | No PriorityClasses, or equal priority | Define classes and use `priorityClassName` |
+| Random Pods disappear when big Pods arrive | A class with high priority + preemption used too widely | Reserve high values for few workloads; batch with `preemptionPolicy: Never` |
+| `no PriorityClass with name X was found` | Typo or class missing | `kubectl get priorityclass` |
+| Preemption violated a PDB | PDBs are best-effort for preemption | Plan capacity; PDBs protect voluntary disruptions (drain) more strictly |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| Two classes | A small, documented set (e.g. platform-critical, business-critical, default, batch); quota per priority class (ResourceQuota `scopeSelector`) so teams cannot all use "critical" |
+
+### Check yourself
+1. What does `preemptionPolicy: Never` do?
+<details><summary>Answer</summary>The Pod is placed earlier in the scheduling queue but never evicts other Pods.</details>
+
+2. Which field shows the node a preempting Pod is waiting for?
+<details><summary>Answer</summary><code>status.nominatedNodeName</code>.</details>
+
+##MD
+---
+# Topic 9 — PodDisruptionBudgets (PDB)
+
+### What is it?
+A **PodDisruptionBudget** limits how many Pods of an app can be down **at the same time** during **voluntary disruptions**: `kubectl drain`, node pool upgrades, Cluster Autoscaler scale-down. You set `minAvailable` **or** `maxUnavailable` (number or %).
+
+It does **not** protect against involuntary disruptions (node crash, OOM).
+
+### Why do we need it?
+During an OKE node pool upgrade, nodes are cordoned and drained one by one. Without a PDB, a drain can evict all replicas of an app at once (if they share a node, or if several nodes drain in parallel).
+
+### How it works internally
+```
+ kubectl drain node  -> cordon (unschedulable) -> for each Pod: POST /eviction  (Eviction API)
+ API server checks PDBs matching the Pod:
+     allowed disruptions = currentHealthy - minAvailable   (or maxUnavailable - currentUnhealthy)
+     > 0 -> eviction OK, the counter goes down
+     = 0 -> HTTP 429 "Cannot evict pod as it would violate the pod's disruption budget" -> drain retries
+ kubectl delete pod does NOT check PDBs (only the Eviction API does)
+```
+
+### Real production scenario
+Your `events-api` has 3 replicas and a PDB `minAvailable: 2`. The OKE node pool upgrade drains nodes one by one; each eviction waits until a new replica is Ready on another node before the next one is allowed. Users see no errors. A bad PDB (`maxUnavailable: 0`) on another app blocks the upgrade forever — the upgrade hangs until someone fixes the PDB.
+
+##MD
+### Hands-on lab 9 — drain a node with a PDB, then a PDB that blocks
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+
+##CODE
+%%writefile labs/07/pdb.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: events-api
+  namespace: lab-07
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: events-api}
+  template:
+    metadata:
+      labels: {app: events-api}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: api
+          image: nginx:1.27
+          readinessProbe:               # PDB counts READY Pods as healthy
+            httpGet: {path: /, port: 80}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: events-api-pdb
+  namespace: lab-07
+spec:
+  minAvailable: 2                     # at least 2 Ready Pods during voluntary disruptions
+  selector:
+    matchLabels: {app: events-api}    # must match the Deployment's Pod labels
+  unhealthyPodEvictionPolicy: AlwaysAllow   # allow evicting Pods that are not Ready (avoids stuck drains)
+
+##CODE
+%%bash
+kubectl apply -f labs/07/pdb.yaml
+kubectl rollout status deploy/events-api --timeout=120s
+kubectl get pdb events-api-pdb
+kubectl get pods -l app=events-api -o wide | awk '{print $1, $7}'
+
+##MD
+**Expected output**
+```
+NAME             MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+events-api-pdb   2               N/A               1
+```
+`ALLOWED DISRUPTIONS: 1` = only one Pod may be evicted right now.
+
+Now **drain** `learn-worker` (like a node pool upgrade). Flags:
+- `--ignore-daemonsets`: DaemonSet Pods (kube-proxy, CNI) stay — they cannot move anyway.
+- `--delete-emptydir-data`: allow evicting Pods with emptyDir (their scratch data is lost).
+- `--timeout`: give up after this time.
+
+##CODE
+%%bash
+kubectl drain learn-worker --ignore-daemonsets --delete-emptydir-data --timeout=120s 2>&1 | grep -E 'evict|drained|error|cordoned' | head -20
+kubectl get pods -l app=events-api -o wide | awk '{print $1, $3, $7}'
+kubectl get nodes
+
+##MD
+**Expected output** (the drain may print "will retry" lines while waiting for the PDB):
+```
+node/learn-worker cordoned
+evicting pod lab-07/events-api-...-aaaaa
+error when evicting pods/"events-api-...-bbbbb" -n "lab-07" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/events-api-...-aaaaa evicted
+pod/events-api-...-bbbbb evicted
+node/learn-worker drained
+...
+learn-worker    Ready,SchedulingDisabled   <- cordoned
+```
+The PDB made the drain go **one Pod at a time**, waiting for replacements to be Ready.
+
+Bring the node back:
+
+##CODE
+%%bash
+kubectl uncordon learn-worker
+kubectl get nodes
+
+##MD
+Now a **blocking** PDB: `maxUnavailable: 0`. The drain can never evict these Pods.
+
+##CODE
+%%bash
+kubectl patch pdb events-api-pdb --type=json -p='[{"op":"remove","path":"/spec/minAvailable"},{"op":"add","path":"/spec/maxUnavailable","value":0}]'
+kubectl get pdb events-api-pdb
+NODE=$(kubectl get pods -l app=events-api -o jsonpath='{.items[0].spec.nodeName}')
+echo "Draining $NODE with a blocking PDB (timeout 30s)..."
+kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --timeout=30s 2>&1 | grep -E 'violate|timed out|error' | tail -2
+kubectl uncordon "$NODE"
+
+##MD
+**Expected output**
+```
+NAME             MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+events-api-pdb   N/A             0                 0
+Draining learn-worker2 with a blocking PDB (timeout 30s)...
+error when evicting pods/"events-api-..." -n "lab-07" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+There are pending pods in node "learn-worker2" when an error occurred: error when waiting for pod "events-api-..." terminating: global timeout reached: 30s
+```
+This is exactly how a node pool upgrade gets **stuck**.
+
+##CODE
+%%bash
+kubectl delete -f labs/07/pdb.yaml
+
+##MD
+### Troubleshooting PDBs
+| Symptom | Cause | Fix |
+|---|---|---|
+| Drain / node pool upgrade hangs | PDB with `ALLOWED DISRUPTIONS 0` (maxUnavailable 0, minAvailable = replicas, or single replica with minAvailable 1) | `kubectl get pdb -A`; fix the PDB or scale up first |
+| PDB does nothing | Selector does not match Pods | `kubectl describe pdb` shows expected Pods |
+| Drain stuck on an unhealthy app | Not-Ready Pods counted against the budget | `unhealthyPodEvictionPolicy: AlwaysAllow` |
+| Outage during manual `kubectl delete pod` | delete bypasses PDB | Use drain / eviction for maintenance |
+| Drain error `cannot delete Pods not managed by ReplicationController, ReplicaSet, Job...` | Bare Pods (left over from other labs) on the node | Delete them, or add `--force` (they will NOT be recreated) |
+
+### Lab vs Production
+| Lab | Production |
+|---|---|
+| One app | Every multi-replica app has a PDB (`maxUnavailable: 1` or 25%); single-replica apps: no PDB that blocks, or accept downtime |
+| Manual drain | OKE node pool upgrades/cycling, Cluster Autoscaler scale-down respect PDBs |
+
+### Check yourself
+1. Does a PDB protect against a node crash?
+<details><summary>Answer</summary>No. Only voluntary disruptions that use the Eviction API (drain, upgrades, autoscaler).</details>
+
+2. A Deployment has 1 replica and a PDB `minAvailable: 1`. What happens during a drain?
+<details><summary>Answer</summary>The drain blocks forever (allowed disruptions = 0). Use 2+ replicas or a PDB that allows 1 unavailable.</details>
+
+3. Does `kubectl delete pod` respect PDBs?
+<details><summary>Answer</summary>No. Only the Eviction API does.</details>
+
+##MD
+---
+# Topic 10 — Autoscaling: HPA, VPA, Cluster Autoscaler, Karpenter
+
+### What is it?
+| Autoscaler | Scales | Based on |
+|---|---|---|
+| **HPA** (Horizontal Pod Autoscaler) | number of **Pod replicas** | CPU/memory utilization vs **requests**, or custom/external metrics |
+| **VPA** (Vertical Pod Autoscaler) | **requests/limits** of Pods | historical usage |
+| **Cluster Autoscaler** (CA) | number of **nodes** in node pools | Pending Pods (scale up), under-used nodes (scale down) |
+| **Karpenter** | **nodes**, choosing the instance type per need | Pending Pods; consolidation |
+
+### Why do we need it?
+Traffic changes. Paying for peak capacity 24/7 wastes money; under-provisioning causes outages. HPA adds Pods; CA/Karpenter add nodes for those Pods.
+
+### How they work together
+```
+ Traffic up -> CPU per Pod > target -> HPA raises replicas
+           -> new Pods Pending (no room) -> Cluster Autoscaler / Karpenter adds nodes
+ Traffic down -> HPA lowers replicas (after stabilization window)
+           -> nodes under-used -> CA drains + removes nodes (respects PDBs)
+ VPA: sets right-sized requests (better scheduling and HPA math). Do NOT use VPA and HPA on the SAME CPU/memory metric.
+```
+
+### HPA internals
+```
+ metrics-server scrapes kubelet (cAdvisor) every ~15 s -> Metrics API (metrics.k8s.io)
+ HPA controller every 15 s:
+   desiredReplicas = ceil( currentReplicas * currentUtilization / targetUtilization )
+   utilization = usage / REQUEST     <- no requests = HPA cannot work
+ behavior: scaleUp/scaleDown policies and stabilizationWindowSeconds (default scale-down 300 s)
+```
+
+### Real production scenario
+The Events registration API on OKE gets 10x traffic when registration opens at 10:00. HPA (target 60% CPU, min 3, max 30) scales Pods within a minute. Pods go Pending; the **OKE Cluster Autoscaler add-on** grows the node pool from 3 to 8 nodes. At 13:00 traffic drops; HPA scales down after 5 minutes, and CA removes empty nodes after ~10 minutes.
+
+##MD
+### Hands-on lab 10.1 — install metrics-server (kind needs `--kubelet-insecure-tls`)
+
+kind's kubelets use self-signed certificates. metrics-server must skip verifying them. **Never use this flag in production.**
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }; echo "OK: $ctx"
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system get deploy metrics-server -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q kubelet-insecure-tls || \
+  kubectl -n kube-system patch deployment metrics-server --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server --timeout=180s
+sleep 30
+kubectl top nodes
+
+##MD
+**Expected output** (wait up to a minute for the first metrics):
+```
+deployment "metrics-server" successfully rolled out
+NAME                  CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+learn-control-plane   180m         1%       700Mi           9%
+learn-worker          60m          0%       350Mi           4%
+learn-worker2         50m          0%       300Mi           3%
+```
+If you see `metrics not available yet`, wait 30 s and run `kubectl top nodes` again.
+
+### Hands-on lab 10.2 — HPA with a CPU-heavy app and a load generator
+The app is a tiny Python HTTP server that burns CPU on each request.
+
+##CODE
+%%writefile labs/07/hpa-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-app
+  namespace: lab-07
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cpu-app}
+  template:
+    metadata:
+      labels: {app: cpu-app}
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+              class H(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      x = 0
+                      for i in range(300000):   # burn some CPU per request
+                          x += i * i
+                      self.send_response(200); self.end_headers(); self.wfile.write(b"ok\n")
+                  def log_message(self, *a): pass
+              ThreadingHTTPServer(("", 8080), H).serve_forever()
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m           # HPA utilization = usage / this request
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpu-app
+  namespace: lab-07
+spec:
+  selector: {app: cpu-app}
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cpu-app
+  namespace: lab-07
+spec:
+  scaleTargetRef:                 # what to scale
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cpu-app
+  minReplicas: 1
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50  # keep average CPU at 50% of requests (50m per Pod)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0     # react immediately to load
+      policies:
+        - type: Percent
+          value: 100                    # at most double the replicas...
+          periodSeconds: 15             # ...every 15 seconds
+    scaleDown:
+      stabilizationWindowSeconds: 60    # lab: 60 s (default 300 s) before scaling down
+
+##CODE
+%%bash
+kubectl apply -f labs/07/hpa-app.yaml
+kubectl rollout status deploy/cpu-app --timeout=120s
+sleep 30
+kubectl get hpa cpu-app
+
+##MD
+**Expected output** (idle):
+```
+NAME      REFERENCE            TARGETS       MINPODS   MAXPODS   REPLICAS
+cpu-app   Deployment/cpu-app   cpu: 1%/50%   1         6         1
+```
+Start the **load generator**: a busybox Pod that calls the service in a loop. Then watch the HPA for about 2 minutes.
+
+##CODE
+%%bash
+kubectl run load-gen --image=busybox:1.36 --restart=Never -- /bin/sh -c "while true; do wget -q -O- http://cpu-app >/dev/null; done"
+for i in $(seq 1 8); do
+  sleep 15
+  kubectl get hpa cpu-app --no-headers | awk -v t=$((i*15)) '{print t"s  targets="$3" "$4"  replicas="$NF}'
+done
+
+##MD
+**Expected output** (your numbers will differ):
+```
+15s  targets=cpu: 210%/50%  replicas=1
+30s  targets=cpu: 230%/50%  replicas=2
+45s  targets=cpu: 120%/50%  replicas=4
+60s  targets=cpu: 75%/50%   replicas=6
+...
+```
+Replicas go up until the average falls near the target or `maxReplicas` is reached. See the HPA's decisions:
+
+##CODE
+%%bash
+kubectl describe hpa cpu-app | sed -n '/Events/,$p' | tail -6
+
+##MD
+Now **stop the load** and watch it scale down after the 60 s stabilization window.
+
+##CODE
+%%bash
+kubectl delete pod load-gen --wait=false
+for i in $(seq 1 8); do
+  sleep 15
+  kubectl get hpa cpu-app --no-headers | awk -v t=$((i*15)) '{print t"s  targets="$3" "$4"  replicas="$NF}'
+done
+
+##MD
+**Expected output:** CPU drops to ~1% quickly, but replicas stay for about 60 s, then go down to 1.
+
+##CODE
+%%bash
+kubectl delete -f labs/07/hpa-app.yaml
+
+##MD
+### VPA — Vertical Pod Autoscaler (concept + manifest)
+VPA watches real usage and **recommends** (or applies) better requests. Modes (`updatePolicy.updateMode`):
+- `Off`: only recommendations (safe; start here).
+- `Initial`: set requests only when Pods are created.
+- `Recreate` / `Auto`: evict Pods to apply new requests (restarts!). Newer versions add `InPlaceOrRecreate` using in-place resize.
+
+VPA is **not** built in. Install from the `kubernetes/autoscaler` repo (`vertical-pod-autoscaler/hack/vpa-up.sh`). It can run on kind, but the script expects Linux tools and may fail on macOS; we only show the manifest here.
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: hub-api-vpa
+  namespace: hub
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hub-api
+  updatePolicy:
+    updateMode: "Off"             # recommendations only
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        minAllowed: {cpu: 50m, memory: 64Mi}
+        maxAllowed: {cpu: "2", memory: 2Gi}
+```
+Read recommendations with `kubectl describe vpa hub-api-vpa` (Target, Lower Bound, Upper Bound).
+
+### Cluster Autoscaler and Karpenter (concepts — cannot run on kind)
+kind nodes are Docker containers on your Mac; there is no cloud API to create nodes, so these cannot run locally.
+
+**Cluster Autoscaler (CA)**
+- Watches for Pods `Pending` with reason "Insufficient cpu/memory". Simulates: "if I add one node of this node pool, would the Pod fit?" Then increases the node pool size (cloud API).
+- Scale down: a node whose Pods' requests are below ~50% for 10 min, and whose Pods can move elsewhere (PDBs, no local storage, not annotated `safe-to-evict: false`) is drained and deleted.
+- Works with **node pools of fixed shapes**. Each pool has min/max size.
+- **On OKE:** install the **Cluster Autoscaler add-on** (managed add-on), and configure node pools as `ocid:min:max`. The add-on needs an IAM policy/dynamic group (or workload identity) to manage the node pools.
+
+**Karpenter**
+- Not node-pool based: looks at Pending Pods and **launches the best-fitting instance type** directly (any size, Spot/on-demand).
+- **Consolidation**: replaces several under-used nodes with fewer/cheaper ones.
+- Objects: `NodePool` (constraints: instance families, zones, capacity type, limits) and `NodeClass` (cloud details: image, subnets, security groups).
+- Main support: **AWS (EKS)**; **Azure** via AKS Node Auto Provisioning. On OKE, use the Cluster Autoscaler add-on.
+
+| | Cluster Autoscaler | Karpenter |
+|---|---|---|
+| Unit | Node pools (fixed shape) | Individual nodes, flexible shapes |
+| Speed | Minutes (pool resize) | Often faster (direct launch) |
+| Cost optimisation | Scale down empty/underused nodes | Consolidation + right instance choice |
+| Clouds | All major, incl. **OKE add-on** | AWS, Azure (AKS NAP) |
+| Config | Flags + node pool min/max | NodePool + NodeClass CRDs |
+
+### Troubleshooting autoscaling
+| Symptom | Cause | Fix |
+|---|---|---|
+| HPA `TARGETS <unknown>` | metrics-server missing, or Pods without CPU requests | Install metrics-server; set requests |
+| HPA does not scale down | stabilization window (300 s default), or minReplicas | Wait / tune `behavior.scaleDown` |
+| HPA scales but Pods Pending | Not enough nodes | Cluster Autoscaler, or raise node pool max |
+| HPA flapping up/down | No stabilization, noisy metric | Stabilization windows, scaling policies |
+| CA does not remove a node | Pod with local storage / no controller / PDB blocking / `safe-to-evict: "false"` | Check CA logs/status ConfigMap `cluster-autoscaler-status` |
+| CA does not add a node | Pod would not fit even on a new node (too big, affinity, taints), or pool at max | Check pool shape/max; Pending event says why |
+| VPA + HPA fight | Both on CPU | Use HPA on CPU/custom metrics, VPA in `Off` mode or on memory only |
+
+### Lab vs Production
+| Lab | Production (OKE) |
+|---|---|
+| metrics-server with `--kubelet-insecure-tls` | metrics-server with verified TLS (OKE add-on) |
+| HPA on CPU only | HPA on CPU + custom metrics (requests/sec via Prometheus Adapter or KEDA) |
+| 60 s scale-down window | 300 s+ to avoid flapping |
+| No node autoscaling | Cluster Autoscaler add-on with node pools min/max per AD, plus PDBs |
+
+### Check yourself
+1. HPA shows `cpu: <unknown>/50%`. Two likely causes?
+<details><summary>Answer</summary>metrics-server is not installed/working, or the Pods have no CPU requests (utilization cannot be computed).</details>
+
+2. 4 Pods at 90% CPU, target 60%. How many replicas does HPA want?
+<details><summary>Answer</summary>ceil(4 × 90 / 60) = ceil(6) = 6.</details>
+
+3. Which autoscaler adds nodes on OKE?
+<details><summary>Answer</summary>The Cluster Autoscaler (OKE managed add-on), scaling node pools between min and max.</details>
+
+4. Why should VPA and HPA not both act on CPU for the same Deployment?
+<details><summary>Answer</summary>VPA changes requests, which changes HPA's utilization math; they react to each other and cause unstable scaling.</details>
+
+##MD
+---
+# Interview and real-world questions
+
+1. **A Pod is Pending. Walk me through your investigation.**
+<details><summary>Answer</summary><code>kubectl describe pod</code> → FailedScheduling message lists per-node reasons: insufficient cpu/memory (requests vs allocatable — <code>kubectl describe node</code>), taints, node affinity/selector, pod (anti-)affinity, topology spread, volume node affinity, quota (check ReplicaSet events). Then fix the rule or add capacity (Cluster Autoscaler, node pool max).</details>
+
+2. **Should we set CPU limits?**
+<details><summary>Answer</summary>Always set CPU requests. CPU limits cause throttling and higher latency even when the node has idle CPU; many teams skip CPU limits for latency-sensitive services, but keep them for noisy or untrusted workloads and in multi-tenant namespaces (or enforce via quotas). Always set memory limits.</details>
+
+3. **Explain QoS classes and why they matter in an incident.**
+<details><summary>Answer</summary>Guaranteed (requests = limits for all containers), Burstable, BestEffort. Under node memory pressure kubelet evicts BestEffort first, then Burstable over its requests; Guaranteed last. Critical workloads should be Guaranteed.</details>
+
+4. **A node pool upgrade on OKE is stuck draining. What do you check?**
+<details><summary>Answer</summary><code>kubectl get pdb -A</code> for ALLOWED DISRUPTIONS 0 (single replica + minAvailable 1, maxUnavailable 0, unhealthy pods); Pods with local storage or no controller; Pending replacement Pods (no capacity, affinity, taints); then fix the PDB, scale up, or add capacity.</details>
+
+5. **Taints vs node affinity — when do you need both?**
+<details><summary>Answer</summary>To dedicate nodes: the taint keeps other Pods off; affinity/nodeSelector keeps the dedicated Pods on. A toleration alone does not attract.</details>
+
+6. **How do HPA and Cluster Autoscaler work together?**
+<details><summary>Answer</summary>HPA adds replicas based on metrics; if they do not fit, they are Pending; CA sees Pending Pods and adds nodes from node pools. On scale-down, HPA reduces replicas, CA removes under-used nodes after draining them (respecting PDBs).</details>
+
+##MD
+---
+# Practical Assignment — "Make the hub API production-ready on the scheduler side"
+
+**Scenario:** `hub-api` (nginx) runs with 1 replica, no resources, no PDB. Last week a node drain caused an outage, and during a traffic spike the Pod was evicted. In namespace `lab-07`:
+1. Run 3 replicas with requests `cpu: 50m, memory: 64Mi` and limits `memory: 128Mi` (no CPU limit).
+2. Spread replicas across the two simulated zones (`topology.kubernetes.io/zone`, re-add the labels from Topic 7), **hard** on zone with `maxSkew: 1`, **soft** on hostname.
+3. Add a PDB so at most 1 Pod is unavailable during drains.
+4. Give it a PriorityClass `lab-hub-critical` (value 50000).
+5. Add an HPA: min 3, max 8, target 70% CPU, scale-down stabilization 300 s.
+6. Prove: drain `learn-worker` — at least 2 Pods stay Ready the whole time. Uncordon afterwards.
+
+**Success criteria**
+- `kubectl get pdb` shows ALLOWED DISRUPTIONS 1.
+- Pods are 2/1 across zones.
+- `kubectl get hpa` shows targets with a real percentage (not `<unknown>`).
+- During the drain, `kubectl get deploy hub-api` never shows fewer than 2 available.
+
+**Hints:** reuse YAML from Topics 7, 8, 9 and 10. Watch availability in a loop: `while true; do kubectl get deploy hub-api --no-headers; sleep 1; done` in a terminal.
+
+<details><summary>Full solution</summary>
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: lab-hub-critical}
+value: 50000
+description: "hub API"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: hub-api, namespace: lab-07}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: hub-api}}
+  template:
+    metadata: {labels: {app: hub-api}}
+    spec:
+      priorityClassName: lab-hub-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: hub-api}}
+          matchLabelKeys: ["pod-template-hash"]
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: hub-api}}
+      containers:
+        - name: web
+          image: nginx:1.27
+          readinessProbe: {httpGet: {path: /, port: 80}, periodSeconds: 2}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: hub-api, namespace: lab-07}
+spec:
+  maxUnavailable: 1
+  selector: {matchLabels: {app: hub-api}}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: hub-api, namespace: lab-07}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: hub-api}
+  minReplicas: 3
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+  behavior:
+    scaleDown: {stabilizationWindowSeconds: 300}
+```
+```bash
+kubectl label node learn-worker  topology.kubernetes.io/zone=zone-a --overwrite
+kubectl label node learn-worker2 topology.kubernetes.io/zone=zone-b --overwrite
+kubectl apply -f hub-solution.yaml
+kubectl rollout status deploy/hub-api
+kubectl drain learn-worker --ignore-daemonsets --delete-emptydir-data --timeout=180s
+kubectl get deploy hub-api        # AVAILABLE stays >= 2
+kubectl uncordon learn-worker
+```
+Note: with the zone rule **hard**, while zone-a is drained, Pods that would break the skew stay Pending. That is the trade-off of hard spread rules — discuss: would you choose `ScheduleAnyway` for zone in a 2-zone cluster?
+</details>
+
+##MD
+---
+# "Break it" challenge
+
+A teammate deployed this "highly available" app. Only one Pod runs, the HPA shows `<unknown>`, and the PDB blocks every drain. Find **all** problems.
+
+##CODE
+%%writefile labs/07/break-it.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: lab-07
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: checkout}
+  template:
+    metadata:
+      labels: {app: checkout}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: checkout}
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: db
+          effect: NoSchedule
+      nodeSelector:
+        pool: checkout
+      containers:
+        - name: web
+          image: nginx:1.27
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout
+  namespace: lab-07
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels: {app: checkout}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+  namespace: lab-07
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: checkout}
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+
+##CODE
+%%bash
+kubectl apply -f labs/07/break-it.yaml
+sleep 10
+kubectl get pods -l app=checkout -o wide | awk '{print $1, $3, $7}'
+kubectl get pdb checkout; kubectl get hpa checkout
+
+##MD
+<details><summary>Answer</summary>
+
+1. **`nodeSelector: pool: checkout`** — no node has that label → all Pods Pending. (If one node were labeled, the **required anti-affinity** would allow only 1 Pod on it → "only one Pod runs".)
+2. **Required pod anti-affinity on hostname** with 3 replicas needs 3 eligible nodes. With fewer, the rest stay Pending. Use preferred anti-affinity or topology spread.
+3. **Toleration for `workload=db`** — wrong taint, and it does not attract anyway. Remove it, or match the real dedicated pool's taint.
+4. **No resource requests** → HPA cannot compute CPU utilization → `<unknown>`. Add `resources.requests.cpu`. (metrics-server must also be installed.)
+5. **PDB `minAvailable: 3` with 3 replicas** → ALLOWED DISRUPTIONS 0 → every drain blocks. Use `maxUnavailable: 1`.
+
+Fixed spec (key parts): remove `nodeSelector` and the toleration (or label/taint a real pool), use `preferredDuringScheduling...` anti-affinity or `topologySpreadConstraints`, add `resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 128Mi}}`, PDB `maxUnavailable: 1`.
+</details>
+
+##CODE
+%%bash
+kubectl delete -f labs/07/break-it.yaml --ignore-not-found
+
+##MD
+---
+# Cleanup
+
+Deletes the lab namespaces, removes every label/taint this notebook added, uncordons nodes, and resets your default namespace. metrics-server stays installed (later notebooks use `kubectl top`).
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context); [ "$ctx" = "kind-learn" ] || { echo "STOP: context is $ctx"; exit 1; }
+kubectl delete namespace lab-07 lab-07-team --ignore-not-found --wait=true --timeout=180s
+kubectl delete priorityclass lab-business-critical lab-batch-low lab-hub-critical --ignore-not-found
+for n in learn-worker learn-worker2; do
+  kubectl uncordon $n >/dev/null
+  kubectl label node $n disktype- pool- topology.kubernetes.io/zone- >/dev/null 2>&1
+  kubectl taint node $n workload- maintenance- >/dev/null 2>&1
+done
+rm -f labs/07/req.txt
+kubectl config set-context --current --namespace=default
+kubectl get nodes -L disktype,pool,topology.kubernetes.io/zone -o wide | awk '{print $1,$2,$NF}'
+echo "Cleanup done"
+
+##MD
+---
+**Next notebook:** [08-Security.ipynb](08-Security.ipynb) — RBAC, ServiceAccounts, Pod Security, network policies and supply-chain security.

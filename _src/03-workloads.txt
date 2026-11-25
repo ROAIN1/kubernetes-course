@@ -1,0 +1,1681 @@
+##MD
+# Phase 3 — Kubernetes Workloads
+
+A **workload** is an application that runs on Kubernetes. Kubernetes gives you different workload objects. Each one solves a different problem.
+
+**What you will learn**
+- Pods: the smallest unit Kubernetes runs
+- ReplicaSets and Deployments: keep N copies running, update with no downtime, roll back
+- StatefulSets: apps that need a stable name and their own disk (databases)
+- DaemonSets: one Pod on every node (log agents, node exporters)
+- Jobs and CronJobs: run a task to the end, or on a schedule (backups)
+- Init containers, sidecar containers (also native sidecars), multi-container Pods
+- Static Pods: how the control plane itself runs
+- Pod lifecycle, phases, probes (liveness, readiness, startup), restart policies
+- How the scheduler picks a node (basics; deeper in notebook 07)
+
+**Time:** about 4–5 hours (do it over 2–3 days).
+
+**Prerequisites:** Notebook 00 (kind cluster `learn` is running) and notebook 02 (architecture, kubectl basics).
+
+**How to use this notebook**
+- Run cells from top to bottom. Click a cell and press **Shift+Enter**.
+- `%%bash` cells run shell commands. `%%writefile` cells create YAML files in `labs/03/`.
+- Read the text **before** you run a cell. Then compare your output with the "Expected output".
+- Answers to quizzes are hidden. Try first, then click **Answer**.
+
+##MD
+## 0. Safety check and lab namespace
+
+This cell checks that kubectl talks to the **local** kind cluster. If not, it stops. This protects your real OKE clusters.
+
+A **namespace** is a folder inside the cluster. We put all objects of this notebook in `lab-03`. At the end we delete the folder and everything inside it.
+
+##CODE
+%%bash
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx'. This notebook only runs on kind-learn."
+  echo "Fix: kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using $ctx"
+mkdir -p labs/03
+kubectl create namespace lab-03 --dry-run=client -o yaml | kubectl apply -f -
+kubectl config set-context --current --namespace=lab-03
+kubectl get nodes
+
+##MD
+**Expected output**
+```
+OK: using kind-learn
+namespace/lab-03 created
+Context "kind-learn" modified.
+NAME                  STATUS   ROLES           AGE   VERSION
+learn-control-plane   Ready    control-plane   ...   v1.3x.x
+learn-worker          Ready    <none>          ...   v1.3x.x
+learn-worker2         Ready    <none>          ...   v1.3x.x
+```
+`set-context --namespace=lab-03` makes `lab-03` the default. So you do not need `-n lab-03` on every command.
+
+##MD
+---
+## 1. Pods
+
+### What is it?
+A **Pod** is the smallest thing Kubernetes runs. A Pod is a wrapper around one or more **containers**. All containers in one Pod:
+- run on the **same node**,
+- share the **same IP address** and ports (they talk on `localhost`),
+- can share **volumes** (disks).
+
+### Why do we need it?
+Kubernetes does not manage containers directly. It manages Pods. The Pod gives the container(s) an IP, storage, and settings (CPU, memory, probes). It is the "unit of scheduling": the scheduler places a Pod, not a container.
+
+### How it works internally
+```
+ kubectl apply ──► API Server ──► etcd (stores Pod, nodeName empty)
+                        │
+                 Scheduler watches: "Pod without node" ──► picks node ──► writes nodeName
+                        │
+             Kubelet on that node watches: "Pod for me" ──► asks container runtime (containerd)
+                        │
+             containerd: 1) start "pause" container (holds network namespace = Pod IP)
+                         2) start your containers inside that namespace
+                        │
+             Kubelet reports status back ──► API Server ──► etcd
+```
+The small **pause** container keeps the network namespace alive. Your containers join it. That is why they share one IP.
+
+### Real production scenario
+Your Events API runs on OKE. A developer runs `kubectl run` to test a new image directly as a bare Pod. The node is drained for patching. The Pod is gone and **nobody recreates it**. Lesson: a bare Pod has no controller. In production you almost never create bare Pods. You use a Deployment (section 2).
+
+##MD
+### Hands-on lab: your first Pod
+Read every comment in the YAML. The comments explain each field.
+
+##CODE
+%%writefile labs/03/pod-web.yaml
+apiVersion: v1            # Pods are in the core API group "v1"
+kind: Pod                 # type of object
+metadata:
+  name: web               # Pod name, unique in the namespace
+  labels:                 # key/value tags. Services and controllers find Pods by labels
+    app: web
+    tier: frontend
+spec:
+  containers:
+    - name: nginx                 # container name inside the Pod
+      image: nginx:1.27-alpine    # always pin a version tag in real work, never ":latest"
+      ports:
+        - containerPort: 80       # documentation only; the port is open even without this line
+      resources:
+        requests:                 # what the scheduler reserves on the node
+          cpu: 50m                # 50 millicores = 5% of one CPU core
+          memory: 32Mi
+        limits:                   # hard maximum. Above memory limit => OOMKilled
+          cpu: 200m
+          memory: 64Mi
+
+##MD
+Now we:
+1. `apply` the file (create or update the object),
+2. `get -o wide` to see the Pod IP and node,
+3. `describe` to see the events (the story of what happened),
+4. `exec` to run a command inside the container.
+
+##CODE
+%%bash
+kubectl apply -f labs/03/pod-web.yaml
+kubectl wait --for=condition=Ready pod/web --timeout=90s
+kubectl get pod web -o wide
+echo "----- events -----"
+kubectl describe pod web | sed -n '/Events:/,$p'
+echo "----- inside the container -----"
+kubectl exec web -- wget -qO- localhost | head -4
+
+##MD
+**Expected output** (names and times will differ)
+```
+pod/web created
+pod/web condition met
+NAME   READY   STATUS    RESTARTS   AGE   IP           NODE
+web    1/1     Running   0          10s   10.244.1.5   learn-worker
+----- events -----
+Normal  Scheduled  ...  Successfully assigned lab-03/web to learn-worker
+Normal  Pulling    ...  Pulling image "nginx:1.27-alpine"
+Normal  Pulled     ...  Successfully pulled image
+Normal  Created    ...  Created container nginx
+Normal  Started    ...  Started container nginx
+----- inside the container -----
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+```
+The events show the flow from the diagram: **Scheduled** (scheduler) → **Pulling/Created/Started** (kubelet + containerd).
+
+##MD
+### Prove it: a bare Pod is not recreated
+Delete the Pod. Then check. It is gone forever. No controller brings it back.
+
+##CODE
+%%bash
+kubectl delete pod web --wait=true
+kubectl get pods
+
+##MD
+**Expected output**
+```
+pod "web" deleted
+No resources found in lab-03 namespace.
+```
+
+##MD
+### Troubleshooting Pods
+
+| Symptom (`kubectl get pods`) | Likely cause | How to check / fix |
+|---|---|---|
+| `Pending` | No node has enough CPU/memory, or nodeSelector/taint does not match | `kubectl describe pod` → Events: `FailedScheduling` |
+| `ImagePullBackOff` / `ErrImagePull` | Wrong image name/tag, private registry without `imagePullSecrets` | `describe pod`, fix image or add pull secret |
+| `CrashLoopBackOff` | App starts and exits again and again | `kubectl logs <pod> --previous` |
+| `OOMKilled` (in describe → Last State) | Memory above limit | Raise memory limit or fix memory leak |
+| `CreateContainerConfigError` | Missing ConfigMap/Secret key | `describe pod`, create the missing object |
+
+Most useful commands, in this order: `get -o wide` → `describe` → `logs` (and `logs --previous`) → `exec`.
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| Bare Pod | Pod created by a Deployment/StatefulSet | Controllers recreate failed Pods |
+| `nginx:1.27-alpine` from Docker Hub | Image from your private registry (e.g. OCIR), pinned by tag or digest | Rate limits, security scanning, supply chain |
+| No probes | Readiness + liveness probes | Traffic only to healthy Pods; auto-restart hung apps |
+| Small requests/limits | Requests based on real metrics | Good scheduling, no noisy neighbours |
+
+##MD
+### Check yourself
+1. Two containers are in the same Pod. How does container A call container B on port 8080?
+2. Which component chooses the node for a Pod? Which component starts the container?
+3. What is the `pause` container for?
+4. A bare Pod's node dies. What happens to the Pod?
+
+<details><summary>Answer</summary>
+
+1. `localhost:8080`. They share the network namespace.
+2. The **scheduler** chooses the node. The **kubelet** on that node starts it (through containerd).
+3. It holds the Pod's network namespace (the Pod IP), so app containers can restart without losing the IP.
+4. It is lost. Nothing recreates it. That is why we use controllers.
+</details>
+
+##MD
+---
+## 2. ReplicaSets and Deployments
+
+### What is it?
+- A **ReplicaSet** keeps a fixed number of identical Pods running. If one dies, it creates a new one.
+- A **Deployment** manages ReplicaSets. It adds **rolling updates** (replace Pods step by step) and **rollback** (go back to an old version).
+
+You create Deployments. The Deployment creates ReplicaSets. The ReplicaSet creates Pods.
+
+### Why do we need it?
+- Self-healing: a Pod dies → a new one starts.
+- Scaling: `replicas: 3` → three copies.
+- Safe updates with no downtime, and a fast way back if the new version is bad.
+
+### How it works internally
+A **controller** runs a **reconcile loop**: compare *desired state* (spec) with *actual state*, then act to close the gap.
+```
+Deployment web (replicas=3, image v2)
+   │  owns
+   ├── ReplicaSet web-7d4b9 (image v1)  replicas 3 → 2 → 1 → 0
+   └── ReplicaSet web-5f8c6 (image v2)  replicas 0 → 1 → 2 → 3
+                          │ owns
+                          └── Pods web-5f8c6-xxxxx (label pod-template-hash=5f8c6)
+```
+During a rolling update the Deployment controller scales the new ReplicaSet up and the old one down. `maxSurge` = how many *extra* Pods are allowed. `maxUnavailable` = how many Pods may be missing. The old ReplicaSet stays (with 0 replicas). That is your rollback history.
+
+### Real production scenario
+You deploy version 2 of the Events frontend on a Thursday evening. The new image has a bug: Pods start but the app returns errors. With readiness probes, the rollout **stops** because new Pods never become Ready, and old Pods keep serving users. You run `kubectl rollout undo` and you are back on v1 in seconds.
+
+##MD
+### Hands-on lab: Deployment, scaling, rolling update, rollback
+We use `hashicorp/http-echo`. It is a tiny web server that prints a text. We print the version, so you can *see* which version answers.
+
+##CODE
+%%writefile labs/03/deploy-web.yaml
+apiVersion: apps/v1               # Deployments live in the "apps" API group
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3                     # desired number of Pods
+  revisionHistoryLimit: 5         # keep 5 old ReplicaSets for rollback
+  selector:                       # which Pods this Deployment owns. Must match template labels. Cannot change later!
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate           # other option: Recreate (kill all, then start all = downtime)
+    rollingUpdate:
+      maxSurge: 1                 # at most 1 extra Pod above 3 during update
+      maxUnavailable: 0           # never go below 3 ready Pods => zero downtime
+  template:                       # the Pod template. Every Pod is created from this
+    metadata:
+      labels:
+        app: web                  # must match spec.selector
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0
+          args: ["-text=version-1", "-listen=:5678"]
+          ports:
+            - containerPort: 5678
+          readinessProbe:         # Pod gets traffic only when this succeeds (more in section 9)
+            httpGet:
+              path: /
+              port: 5678
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/03/deploy-web.yaml
+kubectl rollout status deployment/web --timeout=120s
+echo "--- the three levels: Deployment -> ReplicaSet -> Pods ---"
+kubectl get deploy,rs,pods -l app=web -o wide
+
+##MD
+**Expected output**
+```
+deployment "web" successfully rolled out
+NAME                  READY   UP-TO-DATE   AVAILABLE
+deployment.apps/web   3/3     3            3
+NAME                             DESIRED   CURRENT   READY
+replicaset.apps/web-6c9f8d7b5d   3         3         3
+NAME                       READY   STATUS    NODE
+pod/web-6c9f8d7b5d-abcde   1/1     Running   learn-worker
+pod/web-6c9f8d7b5d-fghij   1/1     Running   learn-worker2
+pod/web-6c9f8d7b5d-klmno   1/1     Running   learn-worker
+```
+The Pod name = ReplicaSet name + random suffix. The ReplicaSet name = Deployment name + hash of the Pod template.
+
+##MD
+### Self-healing
+We delete one Pod. The ReplicaSet sees 2 instead of 3 and creates a new one at once.
+
+##CODE
+%%bash
+victim=$(kubectl get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+echo "Deleting $victim"
+kubectl delete pod "$victim" --wait=false
+sleep 3
+kubectl get pods -l app=web
+
+##MD
+You see a new Pod with a young AGE. Desired state (3) is restored.
+
+### Scaling
+`kubectl scale` changes `replicas`. In production you prefer to change the YAML in Git (GitOps), or use an autoscaler (notebook 07).
+
+##CODE
+%%bash
+kubectl scale deployment/web --replicas=5
+kubectl rollout status deployment/web --timeout=60s
+kubectl get pods -l app=web
+kubectl scale deployment/web --replicas=3
+
+##MD
+### Rolling update to version 2
+We change the container args (that changes the Pod template). `--record` is deprecated, so we add a **change-cause annotation**. It shows in the rollout history.
+
+We open a second watcher in the same cell so you see Pods being replaced.
+
+##CODE
+%%bash
+kubectl annotate deployment/web kubernetes.io/change-cause="v1 initial" --overwrite
+kubectl patch deployment web --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["-text=version-2","-listen=:5678"]}]'
+kubectl annotate deployment/web kubernetes.io/change-cause="v2 new text" --overwrite
+kubectl rollout status deployment/web --timeout=120s
+kubectl get rs -l app=web
+echo "--- which version answers? ---"
+kubectl port-forward deploy/web 15678:5678 >/dev/null 2>&1 &
+PF=$!; sleep 3
+curl -s localhost:15678
+kill $PF
+
+##MD
+**Expected output**
+```
+deployment.apps/web patched
+Waiting for deployment "web" rollout to finish: 1 out of 3 new replicas have been updated...
+...
+deployment "web" successfully rolled out
+NAME             DESIRED   CURRENT   READY
+web-6c9f8d7b5d   0         0         0      <- old ReplicaSet kept for rollback
+web-58d9c6f4b7   3         3         3      <- new ReplicaSet
+--- which version answers? ---
+version-2
+```
+Note: the `http-echo` image has no shell or wget, so we use **port-forward** (a tunnel from your Mac to one Pod of the Deployment) and `curl` on the Mac.
+
+##MD
+### History and rollback
+
+##CODE
+%%bash
+kubectl rollout history deployment/web
+kubectl rollout undo deployment/web            # back to the previous revision
+kubectl rollout status deployment/web --timeout=120s
+kubectl rollout history deployment/web
+kubectl get deploy web -o jsonpath='{.spec.template.spec.containers[0].args}'; echo
+
+##MD
+**Expected output**
+```
+REVISION  CHANGE-CAUSE
+1         v1 initial
+2         v2 new text
+...
+REVISION  CHANGE-CAUSE
+2         v2 new text
+3         v1 initial        <- revision 1 became revision 3
+["-text=version-1","-listen=:5678"]
+```
+`kubectl rollout undo --to-revision=2` goes to a specific revision.
+
+##MD
+### Troubleshooting Deployments
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `rollout status` hangs, new Pods not Ready | Readiness probe fails on new version | `kubectl describe pod`, `logs`; then `rollout undo` |
+| Deployment shows `0/3`, no Pods | Pod template invalid, or ResourceQuota blocks | `kubectl describe rs <new-rs>` → Events |
+| Error: `selector does not match template labels` | `spec.selector` ≠ template labels | Make labels identical |
+| Error: `field is immutable` on selector | You changed `spec.selector` | Delete and recreate the Deployment (plan a window) |
+| Two Deployments fight over Pods | Same labels/selector used twice | Use unique labels per app |
+
+Useful: `kubectl rollout pause/resume deployment/web` to batch several changes into one rollout.
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| `kubectl patch/scale` by hand | Change YAML in Git → CI/CD or Argo CD | Audit trail, review, repeatable |
+| 3 replicas, maybe same node | ≥3 replicas spread across nodes/fault domains (topologySpreadConstraints, notebook 07) | Node or AD failure must not kill all copies |
+| No PodDisruptionBudget | PDB (`minAvailable`) | Node drain during patching keeps enough Pods |
+| `maxUnavailable: 0` | Same, plus `progressDeadlineSeconds` and alerting on failed rollouts | Detect stuck rollouts |
+
+##MD
+### Check yourself
+1. You change only `replicas` from 3 to 5. Is a new ReplicaSet created?
+2. What do `maxSurge: 1` and `maxUnavailable: 0` mean with 3 replicas?
+3. Why does the old ReplicaSet stay with 0 replicas?
+4. What is the difference between `RollingUpdate` and `Recreate`? When would you use `Recreate`?
+
+<details><summary>Answer</summary>
+
+1. No. Only changes to the **Pod template** create a new ReplicaSet. Scaling just changes the existing one.
+2. At most 4 Pods exist during the update, and at least 3 are always available. Zero downtime, but needs room for 1 extra Pod.
+3. It is the rollback history. `rollout undo` scales it up again.
+4. `Recreate` kills all old Pods first, then starts new ones (downtime). Use it when two versions cannot run at the same time, e.g. an app that holds an exclusive lock on a ReadWriteOnce volume, or a DB schema that is not backward compatible.
+</details>
+
+##MD
+---
+## 3. StatefulSets
+
+### What is it?
+A **StatefulSet** runs Pods that need:
+- a **stable, unique name**: `db-0`, `db-1`, `db-2` (not random),
+- a **stable DNS name** through a *headless Service*: `db-0.db.lab-03.svc.cluster.local`,
+- **its own disk** that follows it (one PersistentVolumeClaim per Pod, from `volumeClaimTemplates`),
+- **ordered** start and stop (0, then 1, then 2).
+
+### Why do we need it?
+Databases and clusters (PostgreSQL with Patroni, MongoDB replica sets, Kafka, Elasticsearch) need to know "who am I" and "who are my peers". Each member keeps its own data. A Deployment gives random names and shared/identical disks — wrong for this.
+
+### How it works internally
+```
+StatefulSet db (replicas=3, serviceName=db)
+   ├── Pod db-0  ── PVC data-db-0 ── PV (disk A)
+   ├── Pod db-1  ── PVC data-db-1 ── PV (disk B)
+   └── Pod db-2  ── PVC data-db-2 ── PV (disk C)
+Headless Service "db" (clusterIP: None) ─► DNS A record per Pod: db-0.db, db-1.db, db-2.db
+```
+If `db-1` dies, the new Pod is again called `db-1` and gets **the same PVC**. Data survives. When you delete the StatefulSet or scale down, the PVCs stay by default (safety).
+
+### Real production scenario
+You run a 3-member PostgreSQL Patroni cluster. Node 2 is patched and rebooted. `pg-1` is recreated on another node, mounts its own block volume again, and rejoins the cluster as a replica. On OKE the block volume is in one Availability Domain, so the Pod can only move to a node in the **same AD** — plan node pools per AD.
+
+##MD
+### Hands-on lab: StatefulSet with per-Pod storage
+kind has a default StorageClass called `standard` (local-path). It creates a small local disk for each PVC.
+
+##CODE
+%%writefile labs/03/sts-db.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None            # "headless": no virtual IP; DNS returns Pod IPs and per-Pod names
+  selector:
+    app: db
+  ports:
+    - port: 80
+      name: web
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db            # must point to the headless Service above (gives Pod DNS names)
+  replicas: 3
+  podManagementPolicy: OrderedReady   # start db-0, wait Ready, then db-1... (Parallel = all at once)
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          # writes its own hostname into its own disk, then serves the file over HTTP
+          command: ["sh", "-c", "echo \"I am $(hostname), first started $(date)\" >> /data/history.txt; httpd -f -p 80 -h /data"]
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket: {port: 80}
+            periodSeconds: 2
+  volumeClaimTemplates:      # one PVC per Pod, named <template>-<pod>: data-db-0, data-db-1, ...
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]   # one node can mount it read-write
+        resources:
+          requests:
+            storage: 100Mi
+
+##CODE
+%%bash
+kubectl apply -f labs/03/sts-db.yaml
+kubectl rollout status statefulset/db --timeout=180s
+kubectl get pods -l app=db -o wide
+kubectl get pvc
+
+##MD
+**Expected output**
+```
+NAME   READY   STATUS    NODE
+db-0   1/1     Running   learn-worker2
+db-1   1/1     Running   learn-worker
+db-2   1/1     Running   learn-worker2
+NAME        STATUS   VOLUME        CAPACITY   ACCESS MODES   STORAGECLASS
+data-db-0   Bound    pvc-...       100Mi      RWO            standard
+data-db-1   Bound    pvc-...       100Mi      RWO            standard
+data-db-2   Bound    pvc-...       100Mi      RWO            standard
+```
+Watch the AGE column: db-0 is oldest. They started in order.
+
+##MD
+### Prove: stable name, stable DNS, and the data survives
+1. We call each Pod by its **own DNS name** from a temporary busybox Pod.
+2. We delete `db-1`. A new `db-1` comes back with the **same disk**, so `history.txt` now has 2 lines.
+
+##CODE
+%%bash
+kubectl run dns-test --image=busybox:1.36 --restart=Never --rm -i --quiet -- \
+  sh -c 'for i in 0 1 2; do wget -qO- db-$i.db; done'
+echo "--- delete db-1 ---"
+kubectl delete pod db-1
+kubectl wait --for=condition=Ready pod/db-1 --timeout=120s
+kubectl exec db-1 -- cat /data/history.txt
+
+##MD
+**Expected output**
+```
+I am db-0, first started ...
+I am db-1, first started ...
+I am db-2, first started ...
+--- delete db-1 ---
+pod "db-1" deleted
+pod/db-1 condition met
+I am db-1, first started Mon ... 10:00:01
+I am db-1, first started Mon ... 10:03:12     <- same disk, second start
+```
+
+##MD
+### Troubleshooting StatefulSets
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `db-0` Pending, PVC `Pending` | No StorageClass / no default SC / quota | `kubectl describe pvc data-db-0`; set `storageClassName` |
+| `db-1` never starts | `db-0` not Ready and policy is `OrderedReady` | Fix db-0 first (`logs db-0`) |
+| Pod stuck Pending after node failure | Volume is zonal (OCI block volume in one AD) and no node in that AD | Add node in that AD, or use regional storage design |
+| DNS `db-0.db` does not resolve | `serviceName` wrong or Service not headless | Check `clusterIP: None` and name |
+| Scale down then up: old data appears | PVCs are kept on purpose | Delete PVCs manually if you really want fresh disks |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| busybox writing a file | Real DB, often via an **Operator** (CloudNativePG, Percona, MongoDB operator) | Operators handle failover, backup, upgrades |
+| local-path disk on the node | Network block storage (OCI Block Volume CSI) with snapshots | Disk survives node loss |
+| No backup | Backups (Commvault / Velero / DB-native) + tested restore | A PVC is not a backup |
+| Pods may land on same node | Pod anti-affinity: one member per node/AD | One node failure must not kill quorum |
+
+##MD
+### Check yourself
+1. What three things does a StatefulSet give that a Deployment does not?
+2. What is the PVC name for Pod `db-2` with `volumeClaimTemplates` name `data`?
+3. You delete the StatefulSet. What happens to the PVCs?
+4. Why must `serviceName` point to a headless Service?
+
+<details><summary>Answer</summary>
+
+1. Stable ordinal names, stable per-Pod DNS, per-Pod persistent storage (plus ordered rollout).
+2. `data-db-2`.
+3. They stay (default `persistentVolumeClaimRetentionPolicy` is Retain). You delete them yourself.
+4. The headless Service creates the per-Pod DNS records like `db-0.db.<ns>.svc.cluster.local`.
+</details>
+
+##MD
+---
+## 4. DaemonSets
+
+### What is it?
+A **DaemonSet** runs **one copy of a Pod on every node** (or on every node that matches a selector). When a node joins, the Pod is added. When a node leaves, the Pod is removed.
+
+### Why do we need it?
+Some software must run on each node: log collectors (Fluent Bit), node metrics (Prometheus **node-exporter**), CNI agents (Calico, Cilium), CSI node plugins, security agents. You know this from your Prometheus stack: node-exporter is a DaemonSet.
+
+### How it works internally
+The DaemonSet controller creates one Pod per eligible node and sets **node affinity** to that node name. The normal scheduler then binds it. DaemonSet Pods automatically **tolerate** some taints (like `node.kubernetes.io/not-ready`), so they can run even on unhealthy nodes.
+```
+node: control-plane   node: worker    node: worker2
+   [agent] (*)          [agent]          [agent]
+(*) only if the DaemonSet tolerates the control-plane taint
+```
+
+### Real production scenario
+You add a new OKE node pool for a batch workload. Nobody installs the monitoring agent by hand. The node-exporter DaemonSet places a Pod on each new node automatically, and Thanos/Grafana show the new nodes within a minute.
+
+##MD
+### Hands-on lab: a node agent on every node, including control plane
+
+##CODE
+%%writefile labs/03/ds-agent.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+spec:
+  selector:
+    matchLabels:
+      app: node-agent
+  updateStrategy:
+    type: RollingUpdate        # update one node at a time
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: node-agent
+    spec:
+      tolerations:             # allow running on the control-plane node, which has a NoSchedule taint
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: busybox:1.36
+          # prints which node it runs on. NODE_NAME comes from the Downward API below
+          command: ["sh", "-c", "while true; do echo \"collecting metrics on $NODE_NAME\"; sleep 30; done"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName   # Downward API: inject Pod info into env vars
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+
+##CODE
+%%bash
+kubectl apply -f labs/03/ds-agent.yaml
+kubectl rollout status daemonset/node-agent --timeout=90s
+kubectl get ds node-agent
+kubectl get pods -l app=node-agent -o wide
+for p in $(kubectl get pods -l app=node-agent -o name); do kubectl logs "$p" | head -1; done
+
+##MD
+**Expected output**
+```
+NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE
+node-agent   3         3         3       3            3
+NAME               READY   STATUS    NODE
+node-agent-4xk2p   1/1     Running   learn-control-plane
+node-agent-9fz7q   1/1     Running   learn-worker
+node-agent-qq8lm   1/1     Running   learn-worker2
+collecting metrics on learn-control-plane
+collecting metrics on learn-worker
+collecting metrics on learn-worker2
+```
+Try it: remove the `tolerations` block, apply again. DESIRED becomes 2 (no Pod on control plane).
+
+##MD
+### Troubleshooting DaemonSets
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| DESIRED less than node count | Node has a taint the DS does not tolerate, or `nodeSelector` excludes it | `kubectl describe node <n>` → Taints; add toleration |
+| Pod Pending on one node | Node is full; DS Pod still needs requests | Lower requests, or use a PriorityClass (notebook 07) |
+| Update takes very long on large cluster | `maxUnavailable: 1` | Raise `maxUnavailable` (e.g. `10%`) |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| busybox loop | Real agent from a Helm chart (node-exporter, Fluent Bit) | Maintained, tested configs |
+| No priority | `priorityClassName: system-node-critical` for critical agents | Not evicted first when node is under pressure |
+| Tolerate one taint | Tolerate exactly the taints you need | Too broad tolerations put agents where you don't want them |
+
+### Check yourself
+1. A new node joins the cluster. What does the DaemonSet do?
+2. Why might a DaemonSet show DESIRED 2 on a 3-node cluster?
+3. Name three real tools that run as DaemonSets.
+
+<details><summary>Answer</summary>
+
+1. It creates its Pod on the new node automatically.
+2. One node has a taint (e.g. control-plane) the DaemonSet does not tolerate, or a nodeSelector excludes it.
+3. node-exporter, Fluent Bit / Fluentd, Calico/Cilium agent, kube-proxy, CSI node plugin.
+</details>
+
+##MD
+---
+## 5. Jobs and CronJobs
+
+### What is it?
+- A **Job** runs Pods until a task **finishes successfully** (exit code 0). Then it stops. Example: DB migration, data import.
+- A **CronJob** creates a Job on a **schedule** (cron format). Example: nightly backup at 00:00.
+
+### Why do we need it?
+A Deployment restarts a container that exits — forever. That is wrong for a task that should run once. A Job knows "done". It also retries on failure (`backoffLimit`) and can run many Pods in parallel (`parallelism`, `completions`).
+
+### How it works internally
+```
+CronJob nightly-backup (schedule "0 0 * * *", timeZone Asia/Riyadh)
+   └── at 00:00 creates Job nightly-backup-28741230
+            └── creates Pod(s); restartPolicy OnFailure/Never
+                   exit 0  -> Job Complete
+                   exit !0 -> retry until backoffLimit -> Job Failed
+```
+Cron format: `minute hour day-of-month month day-of-week`. `*/1 * * * *` = every minute.
+
+### Real production scenario
+You already run a nightly MySQL dump from cron on a VM. On Kubernetes the same task becomes a CronJob: `schedule: "0 0 * * *"`, `timeZone: "Asia/Riyadh"`, `concurrencyPolicy: Forbid` (never two backups at once), `activeDeadlineSeconds: 7200` (kill it if it runs past 2 hours so it does not overlap with the 03:00 backup collection), and an alert when a Job fails.
+
+##MD
+### Hands-on lab: a Job with retries and parallelism
+
+##CODE
+%%writefile labs/03/job-pi.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: calc
+spec:
+  completions: 4              # total successful Pods needed
+  parallelism: 2              # how many Pods run at the same time
+  backoffLimit: 3             # retries before the Job is marked Failed
+  activeDeadlineSeconds: 120  # hard time limit for the whole Job
+  ttlSecondsAfterFinished: 600   # auto-delete Job and Pods 10 min after finish (keeps cluster clean)
+  template:
+    spec:
+      restartPolicy: Never    # Jobs need Never or OnFailure (Always is not allowed)
+      containers:
+        - name: worker
+          image: busybox:1.36
+          command: ["sh", "-c", "echo working on $(hostname); sleep 5; echo done"]
+
+##CODE
+%%bash
+kubectl apply -f labs/03/job-pi.yaml
+kubectl wait --for=condition=complete job/calc --timeout=120s
+kubectl get job calc
+kubectl get pods -l job-name=calc
+kubectl logs -l job-name=calc --tail=1
+
+##MD
+**Expected output**
+```
+job.batch/calc condition met
+NAME   STATUS     COMPLETIONS   DURATION
+calc   Complete   4/4           12s
+NAME         READY   STATUS      RESTARTS
+calc-2b7xk   0/1     Completed   0
+calc-6dq9m   0/1     Completed   0
+calc-h4f8z   0/1     Completed   0
+calc-wr2sn   0/1     Completed   0
+done
+...
+```
+Duration is ~2× the sleep: 4 completions, 2 at a time.
+
+##MD
+### A failing Job: see retries and backoffLimit
+
+##CODE
+%%bash
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fail-demo
+spec:
+  backoffLimit: 2            # 1 run + 2 retries, then Failed
+  template:
+    spec:
+      restartPolicy: Never   # each retry is a NEW Pod, so you can see every attempt
+      containers:
+        - name: c
+          image: busybox:1.36
+          command: ["sh", "-c", "echo trying; exit 1"]
+EOF
+sleep 50
+kubectl get job fail-demo
+kubectl get pods -l job-name=fail-demo
+kubectl describe job fail-demo | sed -n '/Events:/,$p'
+
+##MD
+**Expected output**
+```
+NAME        STATUS   COMPLETIONS
+fail-demo   Failed   0/1          (if still Running, wait 20s and rerun the cell)
+NAME              READY   STATUS
+fail-demo-4kq2x   0/1     Error
+fail-demo-8zl5m   0/1     Error
+fail-demo-wq7tn   0/1     Error
+Events: ... Warning  BackoffLimitExceeded  Job has reached the specified backoff limit
+```
+Retries wait longer each time (10s, 20s, 40s ... exponential backoff). The default `backoffLimit` is 6, which can take over 10 minutes — set it explicitly.
+
+##MD
+### Hands-on lab: CronJob every minute
+
+##CODE
+%%writefile labs/03/cronjob-backup.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fake-backup
+spec:
+  schedule: "*/1 * * * *"         # every minute (for the lab; real backup e.g. "0 0 * * *")
+  timeZone: "Asia/Riyadh"         # schedule in KSA time (supported since v1.27)
+  concurrencyPolicy: Forbid       # skip a run if the previous one is still running
+  startingDeadlineSeconds: 60     # if the run is missed by >60s (controller down), skip it
+  successfulJobsHistoryLimit: 3   # keep last 3 successful Jobs for inspection
+  failedJobsHistoryLimit: 3
+  jobTemplate:                    # a full Job spec
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 50
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: busybox:1.36
+              command: ["sh", "-c", "echo backup started at $(date); sleep 3; echo backup finished"]
+
+##CODE
+%%bash
+kubectl apply -f labs/03/cronjob-backup.yaml
+echo "Waiting ~70s for the first scheduled run..."
+sleep 70
+kubectl get cronjob fake-backup
+kubectl get jobs
+echo "--- trigger a run now, by hand (useful for testing) ---"
+kubectl create job manual-backup --from=cronjob/fake-backup
+kubectl wait --for=condition=complete job/manual-backup --timeout=60s
+kubectl logs job/manual-backup
+
+##MD
+**Expected output**
+```
+NAME          SCHEDULE      TIMEZONE      SUSPEND   ACTIVE   LAST SCHEDULE
+fake-backup   */1 * * * *   Asia/Riyadh   False     0        20s
+NAME                   STATUS     COMPLETIONS
+fake-backup-2874123x   Complete   1/1
+--- trigger a run now ---
+job.batch/manual-backup created
+backup started at ...
+backup finished
+```
+`kubectl create job --from=cronjob/...` is how you test a CronJob without waiting for its schedule. Stop it with `kubectl patch cronjob fake-backup -p '{"spec":{"suspend":true}}'`.
+
+##CODE
+%%bash
+kubectl patch cronjob fake-backup -p '{"spec":{"suspend":true}}'
+kubectl delete job fail-demo manual-backup --ignore-not-found
+
+##MD
+### Troubleshooting Jobs and CronJobs
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Job never completes, Pods restart | `restartPolicy: OnFailure` + app always fails | `kubectl logs job/<name>`; fix the app |
+| Hundreds of old Pods/Jobs | No `ttlSecondsAfterFinished` / history limits | Set TTL and history limits |
+| CronJob did not run | Wrong schedule / timezone, `suspend: true`, missed `startingDeadlineSeconds` | `kubectl describe cronjob`, check LAST SCHEDULE |
+| Two backups at once | `concurrencyPolicy: Allow` (default) | Use `Forbid` |
+| Job "Failed: DeadlineExceeded" | Ran longer than `activeDeadlineSeconds` | Make it faster or raise limit |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| Every minute | Real schedule with timezone | Predictable, documented runs |
+| `echo` | Real tool image; credentials from Secrets | Never put passwords in YAML |
+| Check by hand | Alert on `kube_job_status_failed` (kube-state-metrics → Prometheus) | Backups that fail silently are the worst failure |
+| No resource limits | Requests/limits; maybe its own node pool | Heavy jobs must not starve the web app |
+
+### Check yourself
+1. Why can't a Job use `restartPolicy: Always`?
+2. What does `concurrencyPolicy: Forbid` do?
+3. How do you run a CronJob right now, for testing?
+4. A Job has `completions: 6` and `parallelism: 3`, each Pod takes 1 minute. About how long does it take?
+
+<details><summary>Answer</summary>
+
+1. `Always` restarts even on success. A Job must stop when the task succeeds.
+2. If the last Job is still running at the next schedule time, the new run is skipped.
+3. `kubectl create job <name> --from=cronjob/<cronjob>`.
+4. About 2 minutes (two waves of 3 Pods).
+</details>
+
+##MD
+---
+## 6. Init containers, sidecar containers, and multi-container Pods
+
+### What is it?
+- **Init containers** run **before** the app containers, one after another. Each must finish successfully. Use them for setup: wait for a database, download config, fix file permissions, run a migration.
+- **Sidecar containers** run **next to** the app for the whole Pod life: log shipper, proxy (Envoy/Istio), config reloader, metrics exporter.
+- **Native sidecars** (stable in Kubernetes 1.33, on by default since 1.29): an init container with `restartPolicy: Always`. It starts **before** the app, keeps running, and stops **after** the app. This fixes old problems (sidecar not ready when the app starts; Jobs that never finish because the sidecar keeps running).
+
+### Why do we need it?
+Keep the main app image simple. Add helpers as separate containers with their own image and lifecycle. They share the Pod network (`localhost`) and volumes.
+
+### How it works internally
+```
+Pod start order:
+  init-1 (run to end) ─► init-2 (run to end) ─► native sidecar (starts, stays running) ─► app containers start
+Pod stop order:
+  app containers stop ─► native sidecars stop (reverse order)
+Shared: network namespace (localhost), volumes (e.g. emptyDir)
+```
+**emptyDir** is a temporary empty folder created for the Pod. All containers in the Pod can mount it. It is deleted with the Pod.
+
+### Real production scenario
+Your Laravel API crashes on start when MySQL is not reachable yet (e.g. after a DR failover). An init container waits until the DB port answers. A sidecar ships the app's log files to your log system, because the app writes to files and not to stdout.
+
+##MD
+### Hands-on lab: init container + native sidecar + app
+
+##CODE
+%%writefile labs/03/pod-multi.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi
+  labels:
+    app: multi
+spec:
+  volumes:
+    - name: shared            # temporary folder shared by all containers in the Pod
+      emptyDir: {}
+  initContainers:
+    - name: wait-for-dns      # classic init container: must finish before anything else starts
+      image: busybox:1.36
+      command: ["sh", "-c", "until nslookup kubernetes.default.svc.cluster.local; do echo waiting for DNS; sleep 2; done; echo DNS ok"]
+    - name: make-config       # writes a file the app will serve
+      image: busybox:1.36
+      command: ["sh", "-c", "echo '<h1>Config created by init container</h1>' > /work/index.html"]
+      volumeMounts:
+        - name: shared
+          mountPath: /work
+    - name: log-shipper       # NATIVE SIDECAR: init container with restartPolicy Always
+      image: busybox:1.36
+      restartPolicy: Always   # <- this line makes it a sidecar (keeps running, starts before app)
+      command: ["sh", "-c", "touch /work/access.log; tail -F /work/access.log | sed 's/^/[shipped] /'"]
+      volumeMounts:
+        - name: shared
+          mountPath: /work
+  containers:
+    - name: app
+      image: busybox:1.36
+      # serves index.html and appends a log line every 5s into the shared log file
+      command: ["sh", "-c", "httpd -p 8080 -h /work; while true; do echo \"$(date) GET /\" >> /work/access.log; sleep 5; done"]
+      volumeMounts:
+        - name: shared
+          mountPath: /work
+
+##CODE
+%%bash
+kubectl apply -f labs/03/pod-multi.yaml
+kubectl get pod multi -w --request-timeout=40s 2>/dev/null | head -6 &
+kubectl wait --for=condition=Ready pod/multi --timeout=120s
+wait
+echo "--- init logs ---"
+kubectl logs multi -c wait-for-dns | tail -1
+echo "--- app is serving the file from the init container ---"
+kubectl exec multi -c app -- wget -qO- localhost:8080
+sleep 6
+echo "--- sidecar shipping the app logs ---"
+kubectl logs multi -c log-shipper --tail=3
+
+##MD
+**Expected output**
+```
+NAME    READY   STATUS     RESTARTS
+multi   0/2     Init:0/3   0
+multi   0/2     Init:1/3   0
+multi   0/2     Init:2/3   0
+multi   1/2     PodInitializing
+multi   2/2     Running
+--- init logs ---
+DNS ok
+--- app is serving the file from the init container ---
+<h1>Config created by init container</h1>
+--- sidecar shipping the app logs ---
+[shipped] ... GET /
+```
+READY shows `2/2`: the native sidecar counts as a running container.
+`-c <name>` chooses which container for `logs` and `exec`.
+
+##MD
+### Troubleshooting multi-container Pods
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Init:0/2` forever | Init container waits/loops (DB not reachable) | `kubectl logs <pod> -c <init-name>` |
+| `Init:CrashLoopBackOff` | Init container exits with error | Logs of init container; fix script |
+| `error: a container name must be specified` | Pod has >1 container | Add `-c <container>` |
+| Job never completes | Old-style sidecar (in `containers`) keeps running | Use native sidecar (`initContainers` + `restartPolicy: Always`) |
+| Containers cannot share files | No shared volume | Mount the same `emptyDir` in both |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| `until nslookup` loop | Wait with a timeout; app should also retry by itself | Endless init loop hides real outage |
+| Sidecar `tail` to stdout | Fluent Bit sidecar or (better) app logs to stdout + DaemonSet collector | Fewer containers per Pod = less cost |
+| No resources on sidecar | Requests/limits on every container | Pod requests = sum of all containers |
+
+### Check yourself
+1. In what order do init containers run? Can they run in parallel?
+2. What single field turns an init container into a native sidecar?
+3. Two containers in one Pod must share a file. What do you use?
+4. Why do native sidecars help Jobs?
+
+<details><summary>Answer</summary>
+
+1. One after another, in the order listed. Never in parallel. Each must exit 0.
+2. `restartPolicy: Always` on the init container.
+3. A shared volume, usually `emptyDir`, mounted in both containers.
+4. Native sidecars stop automatically when the main containers finish, so the Job can complete.
+</details>
+
+##MD
+---
+## 7. Static Pods
+
+### What is it?
+A **static Pod** is created **directly by the kubelet** from a YAML file on the node's disk (default folder `/etc/kubernetes/manifests`). The API server does not create it. The kubelet creates a read-only **mirror Pod** in the API so you can see it with kubectl.
+
+### Why do we need it?
+Chicken and egg: the API server itself must run somewhere before there is an API. On kubeadm clusters (and kind), the control plane — `kube-apiserver`, `etcd`, `kube-scheduler`, `kube-controller-manager` — runs as static Pods.
+
+On managed clusters (OKE, EKS, AKS) the control plane is hidden and managed by the cloud provider. You will not see these static Pods there.
+
+### How it works internally
+```
+/etc/kubernetes/manifests/*.yaml  ──watched by──►  kubelet  ──►  containerd starts containers
+                                                       └──► creates mirror Pod "<name>-<nodeName>" in API (read-only)
+```
+Delete the mirror Pod with kubectl → kubelet recreates it immediately. To really remove it, delete the file on the node.
+
+### Hands-on lab: look at the control plane, then create your own static Pod
+A kind node is a Docker container. So we use `docker exec` to "log in" to the node.
+
+##CODE
+%%bash
+echo "--- static pod files on the control-plane node ---"
+docker exec learn-control-plane ls /etc/kubernetes/manifests
+echo "--- their mirror Pods (note the -learn-control-plane suffix) ---"
+kubectl get pods -n kube-system -o wide | grep -E 'apiserver|etcd|scheduler|controller-manager'
+echo "--- kubelet config: where static pods come from ---"
+docker exec learn-control-plane grep staticPodPath /var/lib/kubelet/config.yaml
+
+##MD
+**Expected output**
+```
+etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
+etcd-learn-control-plane                      1/1  Running  learn-control-plane
+kube-apiserver-learn-control-plane            1/1  Running  learn-control-plane
+...
+staticPodPath: /etc/kubernetes/manifests
+```
+
+##CODE
+%%bash
+# write a static Pod file on worker node 'learn-worker'
+docker exec learn-worker sh -c 'cat > /etc/kubernetes/manifests/static-web.yaml <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: static-web
+  namespace: lab-03
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+EOF'
+sleep 15
+kubectl get pods -o wide | grep static-web
+echo "--- try to delete the mirror pod ---"
+kubectl delete pod static-web-learn-worker --wait=false
+sleep 5
+kubectl get pods | grep static-web || true
+echo "--- remove it for real: delete the file on the node ---"
+docker exec learn-worker rm /etc/kubernetes/manifests/static-web.yaml
+sleep 10
+kubectl get pods | grep static-web || echo "static-web is gone"
+
+##MD
+**Expected output**
+```
+static-web-learn-worker   1/1   Running   0   10s   ...   learn-worker
+--- try to delete the mirror pod ---
+pod "static-web-learn-worker" deleted
+static-web-learn-worker   1/1   Running   0   2s      <- came back
+--- remove it for real ---
+static-web is gone
+```
+
+##MD
+### Troubleshooting and production notes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| API server down on kubeadm cluster | Bad edit in `/etc/kubernetes/manifests/kube-apiserver.yaml` | SSH to node; `crictl ps -a`, `crictl logs`; fix YAML (kubectl does not work now!) |
+| Static Pod not appearing | YAML error, or wrong folder | `journalctl -u kubelet` on the node |
+| Cannot delete Pod with kubectl | It is a mirror Pod | Remove the file on the node |
+
+**Lab vs Production:** in kind/kubeadm you own the control plane static Pods and must back up etcd. On OKE "Enhanced/Basic clusters" Oracle runs the control plane; you only manage worker nodes. Static Pods are rare in production apps — use DaemonSets instead.
+
+### Check yourself
+1. Who creates a static Pod: the API server or the kubelet?
+2. Why does `kubectl delete` not remove a static Pod?
+3. Why don't you see `kube-apiserver` Pods on OKE?
+
+<details><summary>Answer</summary>
+
+1. The kubelet, from a file on the node.
+2. kubectl deletes only the mirror Pod; the kubelet recreates it from the file.
+3. The control plane is managed by Oracle and runs outside your worker nodes.
+</details>
+
+##MD
+---
+## 8. Pod lifecycle, phases, and restart policies
+
+### What is it?
+A Pod moves through **phases**:
+
+| Phase | Meaning |
+|---|---|
+| `Pending` | Accepted, but not all containers run yet (waiting for scheduling or image pull) |
+| `Running` | Bound to a node, at least one container running |
+| `Succeeded` | All containers exited 0 and will not restart |
+| `Failed` | All containers stopped, at least one with error |
+| `Unknown` | Node not reachable (kubelet lost contact) |
+
+`CrashLoopBackOff`, `ImagePullBackOff`, `Completed` are **not** phases. They are container *reasons* shown by kubectl in the STATUS column.
+
+Each container has a **state**: `Waiting`, `Running`, `Terminated`.
+
+**restartPolicy** (for all containers in the Pod):
+- `Always` (default, needed by Deployments) — restart on any exit
+- `OnFailure` — restart only on non-zero exit (Jobs)
+- `Never` — never restart (Jobs, one-off tasks)
+
+Restarts use **exponential backoff**: 10s, 20s, 40s ... max 5 minutes. That waiting is what `CrashLoopBackOff` means.
+
+### Graceful shutdown (very important for zero downtime)
+```
+kubectl delete pod / rollout / node drain
+   ├─► Pod marked Terminating; removed from Service endpoints (stops new traffic)
+   ├─► preStop hook runs (if defined)          ┐
+   ├─► SIGTERM sent to container (PID 1)       ├ terminationGracePeriodSeconds (default 30s)
+   └─► still running after grace period? SIGKILL ┘
+```
+Removing from endpoints and sending SIGTERM happen **at the same time**. A short `preStop: sleep 5` gives load balancers time to stop sending traffic.
+
+### Hands-on lab: see restart policies and exit codes
+
+##CODE
+%%bash
+kubectl run always-crash --image=busybox:1.36 --restart=Always -- sh -c 'echo start; sleep 2; exit 1'
+kubectl run onfail-ok    --image=busybox:1.36 --restart=OnFailure -- sh -c 'echo ok; exit 0'
+kubectl run never-fail   --image=busybox:1.36 --restart=Never -- sh -c 'echo bye; exit 3'
+sleep 40
+kubectl get pods always-crash onfail-ok never-fail
+echo "--- phase, reason and exit code ---"
+for p in always-crash onfail-ok never-fail; do
+  kubectl get pod $p -o jsonpath='{.metadata.name}{"  phase="}{.status.phase}{"  restarts="}{.status.containerStatuses[0].restartCount}{"  waiting="}{.status.containerStatuses[0].state.waiting.reason}{"  lastExit="}{.status.containerStatuses[0].lastState.terminated.exitCode}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
+done
+
+##MD
+**Expected output**
+```
+NAME           READY   STATUS             RESTARTS
+always-crash   0/1     CrashLoopBackOff   3 (15s ago)
+onfail-ok      0/1     Completed          0
+never-fail     0/1     Error              0
+--- phase, reason and exit code ---
+always-crash  phase=Running  restarts=3  waiting=CrashLoopBackOff  lastExit=1
+onfail-ok     phase=Succeeded  restarts=0  waiting=  lastExit=0
+never-fail    phase=Failed  restarts=0  waiting=  lastExit=3
+```
+Note: `always-crash` phase is **Running** while STATUS says CrashLoopBackOff. Phase ≠ STATUS.
+
+Common exit codes: `0` ok, `1` app error, `137` = 128+9 SIGKILL (often **OOMKilled**), `143` = 128+15 SIGTERM.
+
+##CODE
+%%bash
+kubectl delete pod always-crash onfail-ok never-fail --wait=false
+
+##MD
+### Check yourself
+1. Is `CrashLoopBackOff` a Pod phase?
+2. A container exits with code 137. What is the most likely reason?
+3. Which restartPolicy does a Deployment require?
+4. Why add a `preStop: sleep 5` hook to a web app?
+
+<details><summary>Answer</summary>
+
+1. No. The phase is usually `Running`; CrashLoopBackOff is the container's waiting reason.
+2. It was killed with SIGKILL, most often OOMKilled (memory limit) or not stopping within the grace period.
+3. `Always`.
+4. Endpoint removal and SIGTERM happen at the same time. The sleep lets load balancers/kube-proxy stop sending new requests before the app shuts down, so no requests fail.
+</details>
+
+##MD
+---
+## 9. Probes: liveness, readiness, startup
+
+### What is it?
+The kubelet checks container health with **probes**:
+
+| Probe | Question | On failure |
+|---|---|---|
+| **readiness** | "Can you take traffic now?" | Pod removed from Service endpoints. **Not** restarted |
+| **liveness** | "Are you alive, or stuck?" | Container **restarted** |
+| **startup** | "Have you finished starting?" | Liveness and readiness wait until it succeeds. Too many failures → restart |
+
+Probe types: `httpGet` (2xx/3xx = ok), `tcpSocket` (port open), `exec` (command exit 0), `grpc`.
+
+Key fields: `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, `successThreshold`.
+
+### Why do we need it?
+"Process is running" does not mean "app works". A Java app may deadlock; a PHP-FPM pool may be full; an app may need 60 seconds to warm up. Probes let Kubernetes route traffic only to healthy Pods and restart broken ones.
+
+### Real production scenario
+An app takes 90 seconds to start. Someone sets only a liveness probe with `initialDelaySeconds: 10`. Liveness fails during startup → kubelet restarts → app never finishes starting → endless restart loop. Fix: a **startup probe** with `failureThreshold: 30, periodSeconds: 5` (150 s budget). Liveness only begins after startup succeeds.
+
+Another classic: liveness probe checks the **database**. The DB has a short outage → *all* Pods restart at once → bigger outage. Rule: **liveness checks only the process itself**. Readiness may check dependencies.
+
+##MD
+### Hands-on lab: watch readiness and liveness change behaviour
+The container creates `/tmp/ready` and `/tmp/alive`. We delete the files by hand and watch what Kubernetes does.
+
+##CODE
+%%writefile labs/03/pod-probes.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probes
+  labels:
+    app: probes
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 8; touch /tmp/ready /tmp/alive; sleep 3600"]
+      startupProbe:              # protects slow starts. Others wait until this succeeds
+        exec:
+          command: ["cat", "/tmp/alive"]
+        periodSeconds: 2
+        failureThreshold: 15     # 15 x 2s = 30s maximum start time
+      readinessProbe:            # failing => removed from Service endpoints, no restart
+        exec:
+          command: ["cat", "/tmp/ready"]
+        periodSeconds: 2
+        failureThreshold: 1
+      livenessProbe:             # failing => container restarted
+        exec:
+          command: ["cat", "/tmp/alive"]
+        periodSeconds: 3
+        failureThreshold: 2      # 2 failures in a row => restart
+
+##CODE
+%%bash
+kubectl apply -f labs/03/pod-probes.yaml
+for i in 1 2 3 4 5 6; do kubectl get pod probes --no-headers; sleep 2; done
+echo "--- 1) remove readiness file: Pod becomes NOT ready, but no restart ---"
+kubectl exec probes -- rm /tmp/ready
+sleep 5; kubectl get pod probes
+echo "--- 2) remove liveness file: container gets restarted ---"
+kubectl exec probes -- rm /tmp/alive
+sleep 15; kubectl get pod probes
+kubectl describe pod probes | grep -E 'Unhealthy|Killing' | tail -3
+
+##MD
+**Expected output**
+```
+probes   0/1   Running   0   2s     <- startup probe still failing (first 8s)
+...
+probes   1/1   Running   0   10s    <- startup ok, readiness ok
+--- 1) remove readiness file ---
+probes   0/1   Running   0          <- not ready, RESTARTS still 0
+--- 2) remove liveness file ---
+probes   0/1   Running   1          <- restarted (fresh container recreates the files after 8s)
+Warning  Unhealthy  ...  Liveness probe failed: cat: can't open '/tmp/alive'
+Normal   Killing    ...  Container app failed liveness probe, will be restarted
+```
+
+##CODE
+%%bash
+kubectl delete pod probes --wait=false
+
+##MD
+### Troubleshooting probes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Restart loop right after start | Liveness runs before app is up | Add startupProbe |
+| All Pods restart during DB blip | Liveness checks dependencies | Liveness = process only |
+| Pod Running but `0/1`, no traffic | Readiness failing (wrong path/port) | `describe pod` → "Readiness probe failed: HTTP 404" |
+| Random restarts under load | `timeoutSeconds: 1` too short when CPU throttled | Raise timeout; check CPU limits |
+
+### Lab vs Production
+
+| This lab | Production | Why |
+|---|---|---|
+| File-based exec probes | HTTP `/healthz` (liveness) and `/ready` (readiness) endpoints | Cheap, meaningful checks |
+| Very short periods | Period 10s, timeout 2–5s, thresholds tuned | Avoid false restarts and probe load |
+| — | Alert on restart count (`kube_pod_container_status_restarts_total`) | Restarts hide real problems |
+
+### Check yourself
+1. Which probe failure restarts the container?
+2. Which probe failure only removes the Pod from the Service?
+3. When do you need a startup probe?
+4. Should a liveness probe call the database? Why?
+
+<details><summary>Answer</summary>
+
+1. Liveness (and startup, after its threshold).
+2. Readiness.
+3. When the app starts slowly; it stops liveness from killing it during startup.
+4. No. A DB outage would restart every Pod at once and make things worse. Check dependencies in readiness, if at all.
+</details>
+
+##MD
+---
+## 10. Pod scheduling basics
+
+### What is it?
+**Scheduling** = choosing a node for a Pod. The **kube-scheduler** does it for every Pod whose `spec.nodeName` is empty.
+
+### How it works internally
+Two steps, for each Pod:
+```
+All nodes ──► 1) FILTER  (can it run here?)            ──► feasible nodes ──► 2) SCORE (which is best?) ──► highest score wins
+               - enough free CPU/memory (requests!)                            - least allocated / balanced
+               - nodeSelector / node affinity match                            - spread Pods of same app
+               - taints tolerated                                              - image already on node
+               - volume zone matches                                           - affinity preferences
+               - ports free
+Then BIND: scheduler writes spec.nodeName ──► kubelet on that node starts the Pod
+```
+Important: the scheduler looks at **requests**, not real usage. A node at 20% CPU usage can still be "full" if requests add up to 100%.
+
+Simple ways to influence placement (full details in notebook 07):
+- `nodeName: <node>` — skip the scheduler completely, place directly. Rarely used.
+- `nodeSelector: {key: value}` — only nodes with this label.
+
+### Real production scenario
+On OKE you have a node pool with large-memory shapes for your analytics app. You label those nodes `pool=highmem` and set `nodeSelector: {pool: highmem}` in the analytics Deployment. (OKE also adds labels by itself, e.g. the AD and the shape, which you can select on.)
+
+### Hands-on lab: nodeSelector, nodeName, and a Pending Pod
+
+##CODE
+%%bash
+kubectl label node learn-worker2 disk=ssd --overwrite
+kubectl get nodes -L disk
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: needs-ssd
+spec:
+  nodeSelector:
+    disk: ssd                  # only nodes with label disk=ssd
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: needs-gpu
+spec:
+  nodeSelector:
+    gpu: "true"                # no node has this label => Pending
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: direct
+spec:
+  nodeName: learn-worker       # bypasses the scheduler entirely
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-big
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+      resources:
+        requests:
+          memory: 500Gi        # no node has 500Gi => Pending
+EOF
+sleep 10
+kubectl get pods needs-ssd needs-gpu direct too-big -o wide
+echo "--- why Pending? ---"
+kubectl describe pod needs-gpu | grep -A2 FailedScheduling | tail -2
+kubectl describe pod too-big   | grep -A2 FailedScheduling | tail -2
+
+##MD
+**Expected output**
+```
+NAME        READY   STATUS    NODE
+needs-ssd   1/1     Running   learn-worker2
+needs-gpu   0/1     Pending   <none>
+direct      1/1     Running   learn-worker
+too-big     0/1     Pending   <none>
+--- why Pending? ---
+0/3 nodes are available: 1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: }, 2 node(s) didn't match Pod's node affinity/selector.
+0/3 nodes are available: 1 node(s) had untolerated taint ..., 2 Insufficient memory.
+```
+Always read the `FailedScheduling` message. It says exactly why each node was rejected.
+
+##CODE
+%%bash
+kubectl delete pod needs-ssd needs-gpu direct too-big --wait=false
+kubectl label node learn-worker2 disk-
+
+##MD
+### Troubleshooting and production notes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pending: `Insufficient cpu/memory` | Requests too high or cluster full | Lower requests or add nodes (Cluster Autoscaler) |
+| Pending: `didn't match node selector` | Label missing / typo | `kubectl get nodes --show-labels` |
+| Pending: `untolerated taint` | Node tainted | Add toleration or use other nodes |
+| Pending: `volume node affinity conflict` | PV in another zone/AD | Schedule in same zone; zonal storage design |
+
+**Lab vs Production:** prefer labels that the cloud sets (zone, shape) or that your node pool config sets (OKE node pool "Kubernetes labels"), not labels added by hand with kubectl — hand-made labels are lost when a node is replaced. `nodeName` is for debugging only.
+
+### Check yourself
+1. What are the two main steps the scheduler runs?
+2. Does the scheduler use real CPU usage or requests?
+3. A Pod has `nodeName` set. Does the scheduler see it?
+
+<details><summary>Answer</summary>
+
+1. Filter (which nodes can run it) and Score (which is best), then bind.
+2. Requests.
+3. No. The kubelet on that node starts it directly; scheduler checks (resources, taints) are skipped.
+</details>
+
+##MD
+---
+## Interview and real-world questions
+
+<details><summary>1. Deployment vs StatefulSet — when do you use each?</summary>
+
+Deployment for stateless apps: identical, replaceable Pods (web, API). StatefulSet when each Pod needs a stable identity and its own disk: databases, Kafka, ZooKeeper, Elasticsearch. For real databases, prefer an operator built on StatefulSets.
+</details>
+
+<details><summary>2. How does a rolling update achieve zero downtime?</summary>
+
+The Deployment creates a new ReplicaSet and shifts Pods step by step (`maxSurge`/`maxUnavailable`). Readiness probes make sure new Pods get traffic only when ready. Graceful shutdown (preStop + SIGTERM handling) makes sure old Pods finish their in-flight requests. Plus a PDB during node drains.
+</details>
+
+<details><summary>3. A Pod is in CrashLoopBackOff. Walk me through your steps.</summary>
+
+`kubectl describe pod` (events, exit code, OOMKilled?) → `kubectl logs <pod> --previous` (logs of the crashed run) → check config: env vars, ConfigMaps/Secrets, command/args → check probes (liveness killing it?) → check resources (exit 137) → reproduce with `kubectl debug` or run the image locally.
+</details>
+
+<details><summary>4. What is the difference between readiness and liveness probes?</summary>
+
+Readiness failure removes the Pod from Service endpoints (no traffic, no restart). Liveness failure restarts the container. Startup probe delays both for slow-starting apps.
+</details>
+
+<details><summary>5. How would you run a nightly database backup on Kubernetes?</summary>
+
+A CronJob with `timeZone`, `concurrencyPolicy: Forbid`, `activeDeadlineSeconds`, `backoffLimit`, history limits; credentials from a Secret; dump to object storage or a PVC that the backup tool collects; alert on failed Jobs via kube-state-metrics; test restores regularly.
+</details>
+
+<details><summary>6. What happens when you run `kubectl delete pod` on a Pod owned by a Deployment?</summary>
+
+The Pod gets graceful termination. The ReplicaSet controller sees fewer Pods than desired and creates a replacement with a new name, which the scheduler places on a node (maybe a different one).
+</details>
+
+<details><summary>7. How does the control plane run on a kubeadm cluster?</summary>
+
+As static Pods: the kubelet reads manifests from `/etc/kubernetes/manifests` and runs etcd, kube-apiserver, scheduler and controller-manager. Mirror Pods show them in the API.
+</details>
+
+##MD
+---
+## Practical assignment: "Events Platform"
+
+**Scenario.** Your team moves a small events platform to Kubernetes. Build it in namespace `lab-03`:
+
+1. **Frontend** Deployment `events-web`: 3 replicas of `nginx:1.27-alpine`, rolling update with zero downtime, readiness probe on `/`, liveness probe on `/`, requests/limits set, `preStop` sleep 5.
+2. **Cache** StatefulSet `events-cache`: 2 replicas of `redis:7-alpine`, headless Service, 100Mi PVC per Pod mounted at `/data`.
+3. **Log agent** DaemonSet `events-agent` (busybox loop printing the node name) on all worker nodes **only** (not on control plane).
+4. **Cleanup CronJob** `events-cleanup`: every 5 minutes, Riyadh time, never overlapping, keeps 2 successful Jobs, deadline 60s.
+5. Update the frontend to `nginx:1.27.3-alpine`, check history, then roll back.
+
+**Success criteria**
+- `kubectl get deploy,sts,ds,cronjob` shows all ready.
+- `kubectl rollout history deploy/events-web` shows 2+ revisions with change-causes.
+- `kubectl get pods -l app=events-agent -o wide` shows exactly 2 Pods on the workers.
+- `kubectl get pvc` shows `data-events-cache-0` and `data-events-cache-1` Bound.
+
+**Hints:** copy from the labs above. For the DaemonSet, simply do *not* add the control-plane toleration. For change-cause use `kubectl annotate ... kubernetes.io/change-cause=...`.
+
+<details><summary>Full solution</summary>
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: events-web}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: events-web}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 0}}
+  template:
+    metadata: {labels: {app: events-web}}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports: [{containerPort: 80}]
+          readinessProbe: {httpGet: {path: /, port: 80}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /, port: 80}, periodSeconds: 10, failureThreshold: 3}
+          lifecycle: {preStop: {exec: {command: ["sh", "-c", "sleep 5"]}}}
+          resources: {requests: {cpu: 50m, memory: 32Mi}, limits: {cpu: 200m, memory: 64Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: events-cache}
+spec: {clusterIP: None, selector: {app: events-cache}, ports: [{port: 6379}]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: events-cache}
+spec:
+  serviceName: events-cache
+  replicas: 2
+  selector: {matchLabels: {app: events-cache}}
+  template:
+    metadata: {labels: {app: events-cache}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{containerPort: 6379}]
+          volumeMounts: [{name: data, mountPath: /data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 100Mi}}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: events-agent}
+spec:
+  selector: {matchLabels: {app: events-agent}}
+  template:
+    metadata: {labels: {app: events-agent}}
+    spec:
+      containers:
+        - name: agent
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do echo on $NODE_NAME; sleep 60; done"]
+          env: [{name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: events-cleanup}
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: Asia/Riyadh
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 60
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers: [{name: c, image: busybox:1.36, command: ["sh", "-c", "echo cleaning"]}]
+```
+```bash
+kubectl apply -f solution.yaml
+kubectl annotate deploy/events-web kubernetes.io/change-cause="initial 1.27" --overwrite
+kubectl set image deploy/events-web nginx=nginx:1.27.3-alpine
+kubectl annotate deploy/events-web kubernetes.io/change-cause="upgrade 1.27.3" --overwrite
+kubectl rollout status deploy/events-web
+kubectl rollout history deploy/events-web
+kubectl rollout undo deploy/events-web
+```
+</details>
+
+##MD
+---
+## "Break it" challenge
+This manifest has **4 bugs**. Apply it, observe, and fix each bug. Use `kubectl apply`, `get`, `describe`, `logs`.
+
+##CODE
+%%writefile labs/03/broken.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: broken-api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: nginx:1.27-alpne
+          ports:
+            - containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+          resources:
+            limits:
+              memory: 4Mi
+
+##CODE
+%%bash
+kubectl apply -f labs/03/broken.yaml || echo "^^^ read the error above"
+
+##MD
+<details><summary>Solution</summary>
+
+1. **Selector mismatch**: `selector.matchLabels.app: broken-api` but template label `app: api`. The API rejects it (`selector does not match template labels`). Fix: make both `broken-api`.
+2. **Image typo**: `nginx:1.27-alpne` → `ImagePullBackOff`. Fix: `nginx:1.27-alpine`.
+3. **Wrong liveness port**: nginx listens on 80, probe uses 8080 → probe fails → restarts (CrashLoopBackOff). Fix: `port: 80`.
+4. **Memory limit too small**: `4Mi` → container OOMKilled (exit 137) or fails to start. Fix: e.g. `limits: {memory: 64Mi}` and add requests.
+
+How you find them: bug 1 at apply time; then `kubectl get pods` → `ImagePullBackOff`; after fixing image, `kubectl describe pod` shows `Liveness probe failed: connection refused` and/or `OOMKilled` in Last State.
+</details>
+
+##MD
+---
+## Cleanup
+Delete the whole lab namespace (all objects inside it go too). Set the default namespace back.
+
+##CODE
+%%bash
+kubectl delete namespace lab-03 --wait=false
+kubectl config set-context --current --namespace=default
+docker exec learn-worker rm -f /etc/kubernetes/manifests/static-web.yaml
+echo "Cleanup started. 'kubectl get ns' will show lab-03 as Terminating for a few seconds."
+
+##MD
+---
+**Next notebook:** [04-Networking.ipynb](04-Networking.ipynb) — how Pods talk to each other, Services, DNS, Ingress, and Network Policies.

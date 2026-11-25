@@ -1,0 +1,1460 @@
+##MD
+# Phase 11 — CI/CD and GitOps
+
+**What you will learn**
+- What CI, CD and continuous deployment mean, and the stages of a real pipeline.
+- How Jenkins, GitHub Actions, GitLab CI and Azure DevOps build and deploy to Kubernetes.
+- What GitOps is, and how it differs from a "push" pipeline.
+- How to install **Argo CD** on kind, deploy an app from Git, and watch it **self-heal**.
+- How **Flux CD** compares to Argo CD.
+- Deployment strategies: **rolling update**, **blue-green**, **canary**, and **rollback** — all as hands-on labs.
+
+**Time:** 5–6 hours (do it in 2–3 sessions).
+
+**Prerequisites**
+- Notebooks 00–10 done. The `learn` kind cluster is running.
+- Notebook 04 (Ingress) and notebook 09 (Helm) are most important for this one.
+- Internet access (we pull Argo CD manifests and images).
+- Docker Desktop memory: 6 GB or more is comfortable. Argo CD uses about 500–800 MB.
+
+**How to use this notebook**
+- Run cells from top to bottom with **Shift+Enter**.
+- `%%writefile` cells create files under `labs/11/`. `%%bash` cells run shell commands.
+- Read the text **before** each cell. It tells you what the command does.
+- Answers to quizzes are hidden. Click **Answer** to open them, but try first.
+
+##MD
+## 0. Setup
+
+Every lab section starts with a **guard cell**. It stops if your kubectl context is not the local lab cluster. This protects your real OKE clusters.
+
+##CODE
+%%bash
+# GUARD: stop if we are not on the local lab cluster.
+ctx=$(kubectl config current-context 2>/dev/null)
+if [ "$ctx" != "kind-learn" ]; then
+  echo "STOP: current context is '$ctx', not 'kind-learn'."
+  echo "Fix:  kubectl config use-context kind-learn"
+  exit 1
+fi
+echo "OK: using kind-learn"
+
+##MD
+Create the lab folder and the namespace `lab-11`. A **namespace** is a folder inside the cluster for our objects. At the end we delete it, and everything inside goes away.
+
+##CODE
+%%bash
+mkdir -p labs/11
+kubectl create namespace lab-11 --dry-run=client -o yaml | kubectl apply -f -
+kubectl get ns lab-11
+
+##MD
+We also need a small **client pod**. It has `curl` inside. We use it to call our Services from inside the cluster.
+
+##CODE
+%%writefile labs/11/client.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client                  # We exec into this pod to run curl.
+  namespace: lab-11
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1   # Small image that has curl.
+      command: ["sleep", "infinity"]  # Keep the container running forever.
+
+##CODE
+%%bash
+kubectl apply -f labs/11/client.yaml
+kubectl -n lab-11 wait --for=condition=Ready pod/client --timeout=120s
+
+##MD
+---
+## 1. CI/CD fundamentals
+
+### What is it?
+- **CI (Continuous Integration):** every code change is built and tested automatically. Developers merge small changes often. Problems are found in minutes, not weeks.
+- **CD (Continuous Delivery):** every change that passes CI is packaged and **ready** to release. A human still clicks "approve" for production.
+- **Continuous Deployment:** like Continuous Delivery, but **no human approval**. If all tests pass, the change goes to production automatically.
+
+### Why do we need it?
+Without CI/CD, people build on their laptops, copy files with `scp`, and run commands by hand. Problems:
+- "It works on my machine" — builds are not repeatable.
+- Releases are rare and big, so they are risky.
+- Nobody knows exactly what is running in production.
+
+CI/CD makes every release **the same, small, tested, and traceable**.
+
+### How does it work? The pipeline stages
+
+```
+ git push
+    │
+    ▼
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌──────────────┐
+│ BUILD  │──▶│  TEST  │──▶│  SCAN  │──▶│  PUSH  │──▶│    DEPLOY    │
+│ compile│   │ unit + │   │ image  │   │ image  │   │ dev → stage  │
+│ docker │   │ integr.│   │ CVEs,  │   │ to     │   │ → (approve)  │
+│ build  │   │ tests  │   │ secrets│   │registry│   │ → prod       │
+└────────┘   └────────┘   └────────┘   └────────┘   └──────────────┘
+      CI ─────────────────────────────────────┘          CD
+```
+
+| Stage | What happens | Typical tools |
+|---|---|---|
+| Build | Compile code, build a container image | `docker build`, BuildKit, Maven, npm |
+| Test | Unit tests, integration tests (sometimes on a temporary kind cluster) | pytest, jest, kind |
+| Scan | Find known vulnerabilities (CVEs) and leaked secrets | Trivy, Grype, gitleaks |
+| Push | Upload the image to a registry with a unique tag | OCIR, ACR, ECR, GHCR, Harbor |
+| Deploy | Change the cluster to run the new image | kubectl, Helm, Argo CD, Flux |
+
+**Key rule: tag images with the Git commit SHA** (for example `shop/api:3f9c2a1`). Never deploy `:latest` to production. With a SHA you always know exactly which code runs.
+
+### Real production scenario
+A team releases once a month. Each release has 200 changes. One release breaks checkout. Finding which of the 200 changes broke it takes two days. After moving to CI/CD, they release 5 times a day with 3–5 changes each. When something breaks, they roll back one small change in 2 minutes.
+
+### Lab vs production
+
+| Topic | Lab | Production |
+|---|---|---|
+| Image tag | `nginx:1.27` | Immutable tag = commit SHA, often also signed |
+| Approval | None | Manual approval gate for prod, change request (CR) number linked |
+| Secrets | In a file | In the CI secret store / vault; never in Git |
+| Rollback | `kubectl rollout undo` | Git revert + automated redeploy; tested rollback plan |
+
+### Check yourself
+1. What is the difference between Continuous Delivery and Continuous Deployment?
+2. Why should you tag images with the commit SHA instead of `latest`?
+3. In which stage would you find a critical CVE in the base image?
+
+<details><summary>Answer</summary>
+
+1. Delivery: release is ready but a human approves production. Deployment: no human; passing tests means automatic production release.
+2. `latest` changes over time, so you cannot know what is running, and rollback is unreliable. A SHA is unique and points to exact code.
+3. The **scan** stage (for example Trivy scanning the built image).
+</details>
+
+##MD
+---
+## 2. Jenkins with Kubernetes
+
+### What is it?
+**Jenkins** is an old, very popular open-source CI server. The **Kubernetes plugin** lets Jenkins run each build inside a **temporary pod** (called an *agent pod*).
+
+### Why do we need it?
+Old Jenkins setups had a few fixed build servers. They were always busy or always idle, and each one had different tools installed. With the Kubernetes plugin:
+- Every build gets a **fresh, clean pod**. No leftovers from old builds.
+- Builds scale with the cluster. 20 builds = 20 pods.
+- Each build defines its own tools as containers (one container for Maven, one for kubectl, ...).
+
+### How does it work internally?
+
+```
+ Jenkins controller (pod)
+   │ 1. job starts
+   │ 2. asks Kubernetes API: "create agent pod from this template"
+   ▼
+ ┌───────────── agent pod (temporary) ──────────────┐
+ │ jnlp container  ← connects back to controller    │
+ │ build container ← runs "docker-like" build       │
+ │ kubectl container ← runs deploy commands         │
+ │ shared workspace volume (emptyDir)               │
+ └──────────────────────────────────────────────────┘
+   │ 3. steps run inside containers
+   │ 4. job ends → pod is deleted
+```
+
+The `jnlp` container is the Jenkins agent. It talks to the controller. All containers in the pod share the workspace folder, so the build container and the kubectl container see the same files.
+
+### Example Jenkinsfile (read and understand; we do not run Jenkins in this lab)
+
+Building images inside Kubernetes needs a tool that does not need the Docker daemon. Common choices are **BuildKit** (rootless mode) or **Kaniko**. Note: the original Google Kaniko project was archived in 2025; forks exist. This example uses BuildKit.
+
+##CODE
+%%writefile labs/11/Jenkinsfile
+// Declarative pipeline that runs inside a temporary Kubernetes pod.
+pipeline {
+  agent {
+    kubernetes {
+      // The pod template. Each container is a "tool box" the steps can use.
+      yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-deployer      # SA with RBAC to deploy only to its namespaces
+  containers:
+    - name: buildkit
+      image: moby/buildkit:v0.16.0-rootless # Builds images without a Docker daemon
+      command: ["sleep"]
+      args: ["infinity"]
+      securityContext:
+        seccompProfile:
+          type: Unconfined                  # Rootless BuildKit needs this (or a custom profile)
+        runAsUser: 1000
+        runAsGroup: 1000
+    - name: kubectl
+      image: alpine/k8s:1.31.4              # Any image with kubectl + helm + a shell
+      command: ["sleep"]
+      args: ["infinity"]
+'''
+    }
+  }
+  environment {
+    IMAGE = "registry.example.com/shop/api"   // Your registry (OCIR, ACR, Harbor, ...)
+  }
+  stages {
+    stage('Test') {
+      steps {
+        container('kubectl') {
+          sh 'echo "run unit tests here (for example: make test)"'
+        }
+      }
+    }
+    stage('Build and push') {
+      steps {
+        container('buildkit') {
+          // GIT_COMMIT is set by Jenkins. We use it as the image tag.
+          sh '''
+            buildctl-daemonless.sh build \
+              --frontend dockerfile.v0 \
+              --local context=. --local dockerfile=. \
+              --output type=image,name=${IMAGE}:${GIT_COMMIT},push=true
+          '''
+        }
+      }
+    }
+    stage('Deploy to dev') {
+      steps {
+        container('kubectl') {
+          sh 'kubectl -n shop-dev set image deployment/api api=${IMAGE}:${GIT_COMMIT}'
+          sh 'kubectl -n shop-dev rollout status deployment/api --timeout=180s'
+        }
+      }
+    }
+    stage('Deploy to prod') {
+      when { branch 'main' }
+      steps {
+        input message: 'Deploy to production?'   // Manual approval gate
+        container('kubectl') {
+          sh 'kubectl -n shop-prod set image deployment/api api=${IMAGE}:${GIT_COMMIT}'
+          sh 'kubectl -n shop-prod rollout status deployment/api --timeout=300s'
+        }
+      }
+    }
+  }
+}
+
+##MD
+### Troubleshooting Jenkins on Kubernetes
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Build waits forever "waiting for agent" | Agent pod Pending (no CPU/memory) or image pull failed | `kubectl get pods -n jenkins`, `kubectl describe pod <agent>` |
+| Agent pod starts then dies | `jnlp` container cannot reach the controller URL | Check Jenkins URL / tunnel settings and the controller Service |
+| `kubectl` step: `forbidden` | ServiceAccount has no RBAC for the target namespace | Add a Role + RoleBinding for that namespace (notebook 08) |
+| BuildKit: permission errors | Rootless needs relaxed seccomp/AppArmor | Use the documented securityContext, or a privileged build node pool |
+
+### Lab vs production
+
+| Topic | Lab | Production |
+|---|---|---|
+| Jenkins controller | Not run | HA is limited; back up `JENKINS_HOME`; or use a managed CI |
+| Agent pods | — | Separate node pool for builds, resource limits, short-lived |
+| Credentials | — | Jenkins credentials store or external vault, least-privilege SA |
+
+### Check yourself
+1. Why is a fresh agent pod per build better than a fixed build server?
+2. What does the `jnlp` container do?
+3. Why can't we just run `docker build` in a normal pod?
+
+<details><summary>Answer</summary>
+
+1. Clean environment every time (repeatable), scales with demand, each job brings its own tools.
+2. It is the Jenkins agent process. It connects to the controller and runs the steps.
+3. Modern Kubernetes nodes use containerd, not the Docker daemon. Mounting a Docker socket is also a big security risk (root on the node). Use BuildKit rootless or Kaniko-style builders.
+</details>
+
+##MD
+---
+## 3. GitHub Actions
+
+### What is it?
+**GitHub Actions** is CI/CD built into GitHub. You write a **workflow** file in `.github/workflows/`. It runs on **runners** (GitHub-hosted virtual machines, or your own self-hosted runners).
+
+### Why do we need it?
+- No CI server to install or patch.
+- The pipeline lives next to the code, in Git.
+- A big marketplace of ready-made "actions" (checkout, login, build, kind).
+
+### How it works
+```
+push / pull_request  ──▶  workflow  ──▶ job "test"  (runner VM) ──▶ steps
+                                    └─▶ job "build" (needs: test) ──▶ steps
+```
+- **Workflow** = the whole file. **Job** = a set of steps on one runner. **Step** = one command or one action.
+- `needs:` makes jobs run in order.
+
+### Example workflow
+This workflow:
+1. Builds the image.
+2. Creates a **temporary kind cluster inside the runner**, loads the image, deploys it, and runs a smoke test.
+3. If that passes on `main`, pushes the image to GitHub Container Registry (GHCR) with the commit SHA tag.
+
+##CODE
+%%writefile labs/11/github-ci.yaml
+# Save in your repo as .github/workflows/ci.yaml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write          # Needed to push to ghcr.io
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/api   # Image name in GitHub Container Registry
+
+jobs:
+  test-on-kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4              # Get the code
+      - name: Build image (not pushed yet)
+        run: docker build -t $IMAGE:${{ github.sha }} .
+      - name: Create a kind cluster inside the runner
+        uses: helm/kind-action@v1              # Installs kind + kubectl, creates a cluster
+        with:
+          cluster_name: ci
+      - name: Load image into kind
+        run: kind load docker-image $IMAGE:${{ github.sha }} --name ci   # No registry needed for the test
+      - name: Deploy and smoke test
+        run: |
+          kubectl create deployment api --image=$IMAGE:${{ github.sha }} --port=8080
+          kubectl rollout status deployment/api --timeout=120s
+          kubectl expose deployment api --port=8080
+          # curlimages/curl's entrypoint is curl, so we pass only curl arguments:
+          kubectl run smoke --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            -sf http://api:8080/healthz
+
+  push:
+    needs: test-on-kind                       # Only runs if the test job passed
+    if: github.ref == 'refs/heads/main'       # Only on main branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # Built-in short-lived token
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+# Security tip: pin third-party actions to a full commit SHA (uses: org/action@<40-char-sha>).
+# Tags can be moved by an attacker; this has happened to popular actions.
+
+##MD
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `denied: permission_denied` on push | Workflow token has no `packages: write` | Add `permissions: packages: write` |
+| Pod in kind is `ImagePullBackOff` | Image not loaded into kind, or `imagePullPolicy: Always` | Run `kind load docker-image`; use `IfNotPresent` |
+| Job never starts | No runner matches `runs-on` (self-hosted label wrong) | Check runner labels |
+
+### Check yourself
+1. Why test on a kind cluster inside CI before pushing?
+2. What does `needs:` do?
+3. Why use `secrets.GITHUB_TOKEN` instead of a personal token?
+
+<details><summary>Answer</summary>
+
+1. It proves the image really starts and serves traffic on Kubernetes, before anyone else can use it.
+2. It makes a job wait for another job and only run if that job succeeded.
+3. It is created per run, expires automatically, and has limited permissions. A personal token is long-lived and powerful.
+</details>
+
+##MD
+---
+## 4. GitLab CI
+
+### What is it?
+GitLab's built-in CI. The pipeline is in `.gitlab-ci.yml` at the repo root. Jobs run on **GitLab Runners** (the runner can itself use the Kubernetes executor, which creates a pod per job — the same idea as Jenkins agent pods).
+
+### Example `.gitlab-ci.yml`
+
+##CODE
+%%writefile labs/11/gitlab-ci.yml
+# Save as .gitlab-ci.yml in the repo root
+stages: [test, build, deploy]          # Stages run in this order
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE/api        # GitLab's own registry for this project
+
+unit-test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install -r requirements.txt
+    - pytest -q
+
+build-image:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]           # Docker-in-Docker service (needs privileged runner)
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $IMAGE:$CI_COMMIT_SHORT_SHA
+
+deploy-prod:
+  stage: deploy
+  image: alpine/k8s:1.31.4             # Has kubectl + helm + shell
+  environment: production              # Shows deployments in GitLab "Environments"
+  when: manual                         # Manual approval button
+  only: [main]
+  script:
+    - kubectl -n shop-prod set image deployment/api api=$IMAGE:$CI_COMMIT_SHORT_SHA
+    - kubectl -n shop-prod rollout status deployment/api --timeout=300s
+
+##MD
+`when: manual` gives you an approval button. `environment:` gives you a history of what was deployed where.
+
+---
+## 5. Azure DevOps Pipelines (you use this at work)
+
+Azure DevOps uses `azure-pipelines.yml`. Main ideas:
+- **Stages → Jobs → Steps**, like GitHub Actions.
+- **Service connections** store credentials (to a registry, to a Kubernetes cluster). Pipelines reference them by name.
+- **Environments** give approvals and checks, and keep a deployment history. A `deployment` job targets an environment.
+- **Self-hosted agents** (you have configured these) run jobs on your own VMs — useful when the cluster API is private, as with a private OKE endpoint.
+
+##CODE
+%%writefile labs/11/azure-pipelines.yml
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  imageRepo: shop/api
+  tag: $(Build.SourceVersion)                # Full commit SHA as the image tag
+
+stages:
+  - stage: Build
+    jobs:
+      - job: build
+        pool:
+          name: self-hosted-linux             # Your self-hosted agent pool
+        steps:
+          - task: Docker@2
+            inputs:
+              containerRegistry: ocir-connection   # Service connection to the registry
+              repository: $(imageRepo)
+              command: buildAndPush
+              tags: $(tag)
+
+  - stage: DeployProd
+    dependsOn: Build
+    jobs:
+      - deployment: deploy
+        pool:
+          name: self-hosted-linux
+        environment: shop-prod.shop-prod      # Environment "shop-prod", resource = namespace shop-prod
+                                              # Approvals and checks are set on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: KubernetesManifest@1
+                  inputs:
+                    action: deploy
+                    namespace: shop-prod
+                    manifests: k8s/deployment.yaml
+                    containers: registry.example.com/$(imageRepo):$(tag)   # Replaces the image in the manifest
+
+##MD
+### Troubleshooting CI deploy steps (all tools)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Unable to connect to the server` | Agent cannot reach a private API endpoint | Use a self-hosted agent inside the VCN / VNet, or a bastion |
+| `forbidden: User ... cannot patch deployments` | The service connection identity has no RBAC | Bind a Role for that namespace |
+| Rollout step times out | New pods fail (CrashLoop, readiness never OK) | `kubectl describe pod`, `kubectl logs` (see notebook 13) |
+| Pipeline is green but app is old | Deployed the same tag again (e.g. `latest`), pods not restarted | Use a unique tag per build |
+
+### Check yourself
+1. In Azure DevOps, where do you configure "a senior must approve production"?
+2. Why might you need a self-hosted agent to deploy to OKE?
+3. What does the `containers:` input in `KubernetesManifest@1` do?
+
+<details><summary>Answer</summary>
+
+1. On the **Environment** (Approvals and checks). The `deployment` job targets that environment.
+2. If the OKE API endpoint is private, Microsoft-hosted agents on the internet cannot reach it. An agent inside the VCN can.
+3. It replaces the image reference in the manifest with the exact tag built in this run.
+</details>
+
+##MD
+---
+## 6. GitOps architecture: push vs pull
+
+### What is it?
+**GitOps** means: **Git is the single source of truth** for what runs in the cluster. A program **inside the cluster** keeps comparing the cluster with Git, and fixes any difference.
+
+Four principles:
+1. **Declarative** — desired state is written as YAML (or Helm/Kustomize).
+2. **Versioned** — that YAML is in Git. Every change is a commit, with history and review.
+3. **Pulled automatically** — an agent in the cluster pulls changes from Git.
+4. **Continuously reconciled** — the agent keeps fixing drift.
+
+### Why do we need it?
+With a "push" pipeline, CI has admin credentials to the cluster, and if someone changes the cluster by hand, nobody notices. GitOps fixes both.
+
+### Push vs pull
+
+```
+ PUSH (classic CI/CD)                     PULL (GitOps)
+ ─────────────────────                    ─────────────────────────────
+ git ─▶ CI ──kubectl/helm──▶ cluster      git ◀── watches ── Argo CD / Flux
+          (CI holds cluster creds)                           (inside cluster)
+                                                                │ applies
+ manual change in cluster = invisible                           ▼
+                                                             cluster
+                                          manual change = detected and reverted
+```
+
+| | Push | Pull (GitOps) |
+|---|---|---|
+| Who changes the cluster | CI server | Agent inside the cluster |
+| Cluster credentials | Stored in CI (big risk) | Stay inside the cluster |
+| Drift detection | None | Continuous |
+| Rollback | Re-run old pipeline | `git revert` |
+| Audit trail | CI logs | Git history (who, what, when, why, reviewed) |
+
+A common combined design: **CI builds and pushes the image, then commits the new image tag to a "config" Git repo. The GitOps agent deploys it.**
+
+```
+app repo ──CI──▶ image registry
+   │
+   └─CI commits new tag──▶ config repo ◀──pull── Argo CD ──▶ cluster
+```
+
+### Check yourself
+1. Name two security benefits of pull-based GitOps.
+2. What is "drift"?
+3. In the combined design, what does CI do and what does Argo CD do?
+
+<details><summary>Answer</summary>
+
+1. CI does not need cluster admin credentials; every change is reviewed and recorded in Git.
+2. Drift = the live cluster state is different from the state in Git (for example someone ran `kubectl scale` by hand).
+3. CI builds/tests/pushes the image and updates the tag in the config repo. Argo CD sees the commit and applies it to the cluster.
+</details>
+
+##MD
+---
+## 7. Argo CD (hands-on)
+
+### What is it?
+**Argo CD** is a GitOps controller for Kubernetes, with a web UI. You create an **Application** object that says: "take this path in this Git repo, and apply it to this cluster and namespace".
+
+### How it works internally
+
+```
+                ┌──────────────────── argocd namespace ────────────────────┐
+ Git repo ◀─────│ repo-server: clones repo, renders YAML (Helm/Kustomize)  │
+                │ application-controller: compares desired vs live,       │
+                │      syncs, self-heals  ──────────────▶ Kubernetes API   │
+                │ server: API + web UI (what you log in to)                │
+                │ redis: cache                                             │
+                └──────────────────────────────────────────────────────────┘
+```
+
+- The **application-controller** is the reconcile loop. It watches live objects and re-checks Git every 3 minutes by default (or immediately with a Git webhook).
+- Status words: **Synced / OutOfSync** (does live match Git?) and **Healthy / Progressing / Degraded** (is the app working?).
+
+### Real production scenario
+At 02:00 an engineer fixes an incident by running `kubectl edit` on production and raising replicas. He forgets to tell anyone. Next week a deploy overwrites it and the incident returns. With Argo CD **self-heal**, the manual change is reverted in seconds, so the team must make the fix in Git — reviewed and recorded.
+
+### Lab: install Argo CD
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null)
+[ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx', not kind-learn"; exit 1; }
+echo "OK: using kind-learn"
+
+##MD
+This installs Argo CD from the official **stable** manifest. We use `--server-side` because Argo CD's CRDs are too large for normal client-side apply (the `last-applied` annotation would be over the size limit).
+
+##CODE
+%%bash
+kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -n argocd --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml | tail -5
+echo "Waiting for Argo CD pods (can take 2-4 minutes on first pull)..."
+kubectl -n argocd rollout status deploy/argocd-server --timeout=300s
+kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s
+kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+kubectl -n argocd get pods
+
+##MD
+**Expected output** (names end with random letters):
+```
+NAME                                                READY   STATUS    RESTARTS   AGE
+argocd-application-controller-0                     1/1     Running   0          2m
+argocd-applicationset-controller-...                1/1     Running   0          2m
+argocd-dex-server-...                               1/1     Running   0          2m
+argocd-notifications-controller-...                 1/1     Running   0          2m
+argocd-redis-...                                    1/1     Running   0          2m
+argocd-repo-server-...                              1/1     Running   0          2m
+argocd-server-...                                   1/1     Running   0          2m
+```
+
+Get the first admin password. Argo CD creates it in a Secret. Secret values are base64-encoded, so we decode them.
+
+##CODE
+%%bash
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+
+##MD
+Open the UI in the background with **port-forward**. `kubectl port-forward` makes `localhost:8080` on your Mac go to the `argocd-server` Service. We start it in the background and save its process ID, so we can stop it at cleanup.
+
+Then open **https://localhost:8080** in your browser. Accept the self-signed certificate warning (lab only). User: `admin`, password: from the cell above.
+
+##CODE
+%%bash
+nohup kubectl -n argocd port-forward svc/argocd-server 8080:443 > labs/11/pf-argocd.log 2>&1 &
+echo $! > labs/11/pf-argocd.pid
+sleep 3
+curl -sk -o /dev/null -w "Argo CD UI HTTP status: %{http_code}\n" https://localhost:8080
+
+##MD
+### Lab: deploy the guestbook app from Git
+
+We point Argo CD at the public example repo `argoproj/argocd-example-apps`, folder `guestbook`. Read every comment.
+
+##CODE
+%%writefile labs/11/guestbook-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook
+  namespace: argocd                     # Application objects live in the argocd namespace
+spec:
+  project: default                      # AppProject: limits which repos/clusters/namespaces are allowed
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD                # Branch, tag, or commit. Production: a tag or a fixed branch.
+    path: guestbook                     # Folder with the YAML
+  destination:
+    server: https://kubernetes.default.svc   # "This same cluster"
+    namespace: lab-11-guestbook         # Where the app objects go
+  syncPolicy:
+    automated:                          # Sync without clicking the button
+      prune: true                       # Delete objects that were removed from Git
+      selfHeal: true                    # Revert manual changes made in the cluster
+    syncOptions:
+      - CreateNamespace=true            # Create lab-11-guestbook if missing
+
+##CODE
+%%bash
+kubectl apply -f labs/11/guestbook-app.yaml
+echo "Waiting for sync..."
+for i in $(seq 1 30); do
+  s=$(kubectl -n argocd get application guestbook -o jsonpath='{.status.sync.status}/{.status.health.status}')
+  echo "status: $s"
+  [ "$s" = "Synced/Healthy" ] && break
+  sleep 5
+done
+kubectl -n lab-11-guestbook get deploy,svc,pods
+
+##MD
+**Expected output** (end):
+```
+status: Synced/Healthy
+NAME                           READY   UP-TO-DATE   AVAILABLE
+deployment.apps/guestbook-ui   1/1     1            1
+NAME                   TYPE        CLUSTER-IP     PORT(S)
+service/guestbook-ui   ClusterIP   10.96.x.x      80/TCP
+```
+In the UI you now see the `guestbook` app as a tree: Application → Service + Deployment → ReplicaSet → Pod.
+
+### Lab: self-heal (drift correction)
+
+Now we act like the engineer at 02:00. We scale the Deployment by hand to 3 replicas. Git says 1. Watch Argo CD put it back.
+
+##CODE
+%%bash
+kubectl -n lab-11-guestbook scale deployment guestbook-ui --replicas=3
+for i in 1 2 3 4 5 6; do
+  echo "t=${i}x5s replicas=$(kubectl -n lab-11-guestbook get deploy guestbook-ui -o jsonpath='{.spec.replicas}')"
+  sleep 5
+done
+
+##MD
+**Expected:** replicas goes to 3, and within a few seconds back to **1**. The Argo CD UI shows a sync event caused by self-heal.
+
+To change replicas **for real**, you would change `guestbook-ui-deployment.yaml` in Git and merge a pull request. That is the GitOps way.
+
+### Concept: App of Apps and ApplicationSet
+With 30 microservices you do not want to apply 30 Application files by hand.
+- **App of Apps:** one "root" Application points to a Git folder that contains other Application YAMLs. Add a file to Git → a new app appears.
+- **ApplicationSet:** a controller that **generates** Applications from a template, for example one per cluster (dev/stage/prod) or one per folder.
+
+```
+root-app ──▶ git: apps/
+               ├── payments.yaml  (Application) ──▶ payments
+               ├── orders.yaml    (Application) ──▶ orders
+               └── monitoring.yaml(Application) ──▶ kube-prometheus-stack
+```
+
+### Troubleshooting Argo CD
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| App `OutOfSync` forever | Field changed by another controller (e.g. HPA changes replicas) | Use `ignoreDifferences` for that field, or remove `replicas` from Git when HPA is used |
+| `ComparisonError: repository not accessible` | Private repo, no credentials | Add repo credentials (Settings → Repositories, or a labelled Secret) |
+| App `Degraded` | Pods not healthy | Normal pod debugging (notebook 13); Argo CD only reports it |
+| Sync fails: `namespace not found` | Namespace missing | `CreateNamespace=true` or manage the namespace in Git |
+| CRD apply error: annotation too long | Client-side apply of large CRDs | Use `ServerSideApply=true` sync option |
+
+Commands:
+```
+kubectl -n argocd get applications
+kubectl -n argocd describe application guestbook     # conditions and last sync result
+kubectl -n argocd logs statefulset/argocd-application-controller | tail
+```
+
+### Lab vs production
+
+| Topic | Lab | Production |
+|---|---|---|
+| Install | Plain manifest, single replica | HA manifest or Helm chart, Redis HA, resource limits |
+| Login | Initial admin password | SSO (OIDC: Azure AD / OCI IAM Identity Domains), admin disabled |
+| Access | Port-forward | Ingress with TLS, private network only |
+| Projects | `default` | One AppProject per team, restricted repos and namespaces |
+| Secrets | none | Sealed Secrets / External Secrets — never plain Secrets in Git |
+| targetRevision | `HEAD` | Tag or protected branch; changes through PRs |
+
+### Check yourself
+1. What is the difference between `Synced` and `Healthy`?
+2. What do `prune: true` and `selfHeal: true` do?
+3. An HPA scales your Deployment, and Argo CD keeps showing OutOfSync. Why, and what do you do?
+4. Why should you never put a plain Kubernetes Secret in the Git repo Argo CD reads?
+
+<details><summary>Answer</summary>
+
+1. Synced = live objects match Git. Healthy = the app actually works (pods ready, etc.). You can be Synced but Degraded.
+2. prune deletes objects removed from Git. selfHeal reverts manual changes in the cluster.
+3. Git says `replicas: 2`, HPA set 5. Remove `replicas` from the manifest or add `ignoreDifferences` on `/spec/replicas`.
+4. Secrets are only base64-encoded, not encrypted. Anyone with repo access can read them. Use Sealed Secrets, SOPS, or External Secrets.
+</details>
+
+##MD
+---
+## 8. Flux CD (concept)
+
+### What is it?
+**Flux** is another CNCF GitOps tool. It has **no built-in UI** (you can add one). It is a set of small controllers:
+
+```
+source-controller     ── pulls Git repos, Helm repos, OCI artifacts
+kustomize-controller  ── applies Kustomize/YAML from a source
+helm-controller       ── installs Helm releases (HelmRelease objects)
+notification-controller ── alerts (Slack, Teams) and webhooks
+image-automation      ── optional: updates image tags in Git automatically
+```
+
+Example Flux objects (read only):
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata: { name: shop, namespace: flux-system }
+spec:
+  interval: 1m                 # Check Git every minute
+  url: https://github.com/example/shop-config
+  ref: { branch: main }
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: { name: shop-prod, namespace: flux-system }
+spec:
+  interval: 10m                # Re-apply (and fix drift) every 10 minutes
+  sourceRef: { kind: GitRepository, name: shop }
+  path: ./envs/prod
+  prune: true                  # Delete removed objects
+```
+
+### Argo CD vs Flux
+
+| | Argo CD | Flux |
+|---|---|---|
+| UI | Rich built-in web UI | CLI first; UI is an add-on |
+| Model | `Application` objects | `GitRepository` + `Kustomization` / `HelmRelease` |
+| Multi-cluster | One Argo CD can manage many clusters | Usually one Flux per cluster (also possible hub model) |
+| Multi-tenancy | AppProjects + RBAC + SSO | Kubernetes RBAC + namespaces |
+| Image auto-update | Argo CD Image Updater (add-on) | Built-in image automation controllers |
+| Good for | Teams who want visibility and a UI | Platform teams who want "pure Kubernetes" style |
+
+Both are good. Pick one per organisation and use it everywhere.
+
+### Check yourself
+1. Which Flux controller installs Helm charts?
+2. Name one reason a team might pick Argo CD over Flux.
+
+<details><summary>Answer</summary>
+
+1. helm-controller (with `HelmRelease` objects).
+2. The built-in UI, SSO + RBAC per project, or managing many clusters from one place.
+</details>
+
+##MD
+---
+## 9. Automated deployments and rolling updates
+
+### What is it?
+A **rolling update** replaces old pods with new pods a few at a time. It is the **default** strategy of a Deployment. Two fields control the speed:
+- `maxSurge` — how many **extra** pods can exist above the desired count during the update.
+- `maxUnavailable` — how many pods can be **missing** (not ready) during the update.
+
+### How it works internally
+The Deployment controller creates a **new ReplicaSet** for the new pod template and scales it up, while scaling the **old ReplicaSet** down. It only continues when new pods become **Ready** (readiness probe passes).
+
+```
+replicas: 4, maxSurge: 1, maxUnavailable: 0
+old RS: 4 ──▶ 4 ──▶ 3 ──▶ 3 ──▶ 2 ──▶ ... ──▶ 0
+new RS: 0 ──▶ 1 ──▶ 1 ──▶ 2 ──▶ 2 ──▶ ... ──▶ 4
+total never below 4 (no capacity loss), max 5 at a time
+```
+
+| Setting | Effect |
+|---|---|
+| `maxSurge: 1, maxUnavailable: 0` | Safest: never lose capacity, needs room for 1 extra pod |
+| `maxSurge: 0, maxUnavailable: 1` | No extra resources, but capacity drops by 1 during update |
+| `maxSurge: 100%` | Fastest: start all new pods at once (needs 2x resources) |
+
+### Lab: rolling update and rollback
+We use `hashicorp/http-echo`, a tiny web server that returns a text. The text = the version.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null)
+[ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx', not kind-learn"; exit 1; }
+echo "OK: using kind-learn"
+
+##CODE
+%%writefile labs/11/rolling.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+  namespace: lab-11
+  annotations:
+    kubernetes.io/change-cause: "v1 initial"   # Shown in rollout history
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5          # Keep 5 old ReplicaSets for rollback
+  selector:
+    matchLabels:
+      app: shop
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                  # At most 1 pod above 4 during update
+      maxUnavailable: 0            # Never go below 4 ready pods
+  template:
+    metadata:
+      labels:
+        app: shop
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=shop v1"]   # The response body = version
+          ports:
+            - containerPort: 5678
+          readinessProbe:          # Rolling update waits for this before continuing
+            httpGet:
+              path: /
+              port: 5678
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+  namespace: lab-11
+spec:
+  selector:
+    app: shop
+  ports:
+    - port: 80
+      targetPort: 5678
+
+##CODE
+%%bash
+kubectl apply -f labs/11/rolling.yaml
+kubectl -n lab-11 rollout status deploy/shop --timeout=120s
+kubectl -n lab-11 exec client -- curl -s http://shop
+
+##MD
+Now update to v2. We patch the args and set a new change-cause. While it rolls, we call the Service 15 times. You will see v1 and v2 mixed — both versions serve traffic during a rolling update. That is why **new versions must be backward compatible** (API and database).
+
+##CODE
+%%bash
+kubectl -n lab-11 patch deploy shop --type=json -p='[
+  {"op":"replace","path":"/spec/template/spec/containers/0/args","value":["-listen=:5678","-text=shop v2"]}]'
+kubectl -n lab-11 annotate deploy shop kubernetes.io/change-cause="v2 new text" --overwrite
+for i in $(seq 1 15); do kubectl -n lab-11 exec client -- curl -s http://shop; sleep 0.5; done
+kubectl -n lab-11 rollout status deploy/shop --timeout=120s
+kubectl -n lab-11 get rs -l app=shop
+
+##MD
+**Expected:** a mix of `shop v1` / `shop v2`, then two ReplicaSets: the new one with 4 pods, the old one with 0 (kept for rollback).
+
+### Rollbacks
+Now pretend v2 is broken. Look at history, then roll back.
+
+##CODE
+%%bash
+kubectl -n lab-11 rollout history deploy/shop
+kubectl -n lab-11 rollout undo deploy/shop            # Back to the previous revision
+kubectl -n lab-11 rollout status deploy/shop --timeout=120s
+kubectl -n lab-11 exec client -- curl -s http://shop
+kubectl -n lab-11 rollout history deploy/shop
+
+##MD
+**Expected:** response is `shop v1` again. History shows a new revision number (rollback creates a new revision from the old template).
+
+Other useful commands:
+```
+kubectl rollout undo deploy/shop --to-revision=2   # go to a specific revision
+kubectl rollout pause deploy/shop                  # stop in the middle (manual canary)
+kubectl rollout resume deploy/shop
+kubectl rollout restart deploy/shop                # new pods, same spec (e.g. reload config)
+```
+
+**GitOps note:** with Argo CD self-heal, `kubectl rollout undo` is reverted. In GitOps, roll back with `git revert` (or Argo CD's history/rollback with auto-sync disabled).
+
+### Troubleshooting rolling updates
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Rollout stuck, `rollout status` waits | New pods never become Ready | Check readiness probe and logs of new pods |
+| `ProgressDeadlineExceeded` condition | No progress in `progressDeadlineSeconds` (default 600) | Fix the pods, or `rollout undo` |
+| Errors during rollout | No readiness probe → traffic to pods that are not ready | Add readiness probe (see notebook 13, incident "downtime") |
+| Pending new pods | `maxSurge` needs extra capacity, cluster full | Add capacity, or use `maxSurge: 0, maxUnavailable: 1` |
+
+### Check yourself
+1. With `replicas: 10, maxSurge: 25%, maxUnavailable: 25%`, what is the max and min pod count during an update?
+2. Why does a rolling update need a readiness probe?
+3. What does Kubernetes keep so that `rollout undo` works?
+
+<details><summary>Answer</summary>
+
+1. maxSurge 25% of 10 = 2.5 → rounded **up** = 3, so max 13. maxUnavailable 25% = 2.5 → rounded **down** = 2, so min 8 ready.
+2. Without it, a pod is "ready" as soon as the container starts, so traffic is sent before the app can answer, and the rollout continues even if the new version is broken.
+3. Old ReplicaSets (scaled to 0), limited by `revisionHistoryLimit`.
+</details>
+
+##MD
+---
+## 10. Blue-green deployment (hands-on)
+
+### What is it?
+You run **two full environments**: **blue** (current) and **green** (new). Users go to blue. You test green fully. Then you **switch all traffic at once** by changing the Service selector. Rollback = switch back.
+
+```
+           Service "store" selector: version=blue
+                    │
+       ┌────────────┴───────────┐
+       ▼                        ✗ (no traffic yet)
+ Deployment blue (v1)     Deployment green (v2)  ← test it directly first
+```
+
+### Why?
+- No mixed versions (unlike rolling update).
+- Instant rollback.
+- Cost: you need **double capacity** during the switch.
+
+### Production scenario
+A payment provider integration changes. Mixed versions would send half the payments to the old API. The team uses blue-green: they deploy green, run smoke tests on a test Service, then switch at a quiet time. One problem appears; they switch back in 1 second.
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null)
+[ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx', not kind-learn"; exit 1; }
+echo "OK: using kind-learn"
+
+##CODE
+%%writefile labs/11/blue-green.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-blue
+  namespace: lab-11
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: store, version: blue}
+  template:
+    metadata:
+      labels: {app: store, version: blue}     # version label decides which Service sends traffic here
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=store BLUE v1"]
+          ports: [{containerPort: 5678}]
+          readinessProbe: {httpGet: {path: /, port: 5678}, periodSeconds: 2}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-green
+  namespace: lab-11
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: store, version: green}
+  template:
+    metadata:
+      labels: {app: store, version: green}
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=store GREEN v2"]
+          ports: [{containerPort: 5678}]
+          readinessProbe: {httpGet: {path: /, port: 5678}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store                 # The "live" Service users call
+  namespace: lab-11
+spec:
+  selector: {app: store, version: blue}   # <── THE SWITCH. Today: blue.
+  ports: [{port: 80, targetPort: 5678}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-preview         # Test Service: always points to green, for smoke tests
+  namespace: lab-11
+spec:
+  selector: {app: store, version: green}
+  ports: [{port: 80, targetPort: 5678}]
+
+##CODE
+%%bash
+kubectl apply -f labs/11/blue-green.yaml
+kubectl -n lab-11 rollout status deploy/store-blue --timeout=120s
+kubectl -n lab-11 rollout status deploy/store-green --timeout=120s
+echo "LIVE:    $(kubectl -n lab-11 exec client -- curl -s http://store)"
+echo "PREVIEW: $(kubectl -n lab-11 exec client -- curl -s http://store-preview)"
+
+##MD
+Green passed its "smoke test" on the preview Service. Now **switch**: patch the live Service selector to `version: green`.
+
+##CODE
+%%bash
+kubectl -n lab-11 patch service store -p '{"spec":{"selector":{"app":"store","version":"green"}}}'
+for i in 1 2 3 4 5; do kubectl -n lab-11 exec client -- curl -s http://store; done
+
+##MD
+**Expected:** all 5 responses are `store GREEN v2` — no mix.
+
+**Rollback** is the same patch with `blue`. Try it yourself in the next cell, then check. After a safe period, the old color is scaled to 0 or deleted, and it becomes the target for the next release.
+
+##CODE
+%%bash
+# Your turn: switch back to blue, then verify with curl.
+kubectl -n lab-11 patch service store -p '{"spec":{"selector":{"app":"store","version":"blue"}}}'
+kubectl -n lab-11 exec client -- curl -s http://store
+
+##MD
+### Troubleshooting blue-green
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| After switch: connection refused / empty | New selector matches no ready pods | `kubectl get endpointslices -l kubernetes.io/service-name=store` |
+| Some old responses after switch | Long-lived keep-alive connections still on old pods | Keep old pods a few minutes; drain connections |
+| DB errors after switch | Green changed DB schema, blue cannot read it | Use backward-compatible migrations (expand → migrate → contract) |
+
+### Lab vs production
+| Lab | Production |
+|---|---|
+| Switch with `kubectl patch` | Switch by Git commit (GitOps), Argo Rollouts `blueGreen` strategy, or load balancer / DNS switch |
+| 2 replicas each | Full production size for green, so it can take 100% traffic |
+
+### Check yourself
+1. What is the main cost of blue-green?
+2. How do you roll back in this lab?
+3. Why is a database schema change dangerous with blue-green?
+
+<details><summary>Answer</summary>
+
+1. Double capacity (both colors running at full size).
+2. Patch the Service selector back to `version: blue`.
+3. After rollback, blue (old code) must still work with the database. If green dropped or renamed columns, blue breaks.
+</details>
+
+##MD
+---
+## 11. Canary deployment (hands-on)
+
+### What is it?
+Send **a small part of traffic** (for example 10%) to the new version. Watch error rate and latency. If good, increase step by step (10% → 25% → 50% → 100%). If bad, send 0% and only a few users were affected.
+
+### Two ways
+1. **Replica ratio** (basic, no extra tools): stable and canary Deployments share the same Service label. 9 stable pods + 1 canary pod ≈ 10% canary. Coarse, and tied to replica count.
+2. **Weighted routing** at the ingress / service mesh / Gateway API: exact percentages, independent of replicas. Example: ingress-nginx canary annotations, Gateway API `HTTPRoute` weights, or **Argo Rollouts**.
+
+### Lab A: replica-ratio canary
+
+##CODE
+%%bash
+# GUARD
+ctx=$(kubectl config current-context 2>/dev/null)
+[ "$ctx" = "kind-learn" ] || { echo "STOP: context is '$ctx', not kind-learn"; exit 1; }
+echo "OK: using kind-learn"
+
+##CODE
+%%writefile labs/11/canary-ratio.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-stable
+  namespace: lab-11
+spec:
+  replicas: 9                         # 9 of 10 pods = ~90% traffic
+  selector:
+    matchLabels: {app: api, track: stable}
+  template:
+    metadata:
+      labels: {app: api, track: stable}
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=stable"]
+          ports: [{containerPort: 5678}]
+          resources: {requests: {cpu: 10m, memory: 16Mi}}   # Small, so 10 pods fit on kind
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-canary
+  namespace: lab-11
+spec:
+  replicas: 1                         # 1 of 10 pods = ~10% traffic
+  selector:
+    matchLabels: {app: api, track: canary}
+  template:
+    metadata:
+      labels: {app: api, track: canary}
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=CANARY"]
+          ports: [{containerPort: 5678}]
+          resources: {requests: {cpu: 10m, memory: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: lab-11
+spec:
+  selector: {app: api}                # Selects BOTH tracks (no "track" label here)
+  ports: [{port: 80, targetPort: 5678}]
+
+##MD
+Send 100 requests and count. kube-proxy picks a backend pod (roughly at random), so expect about 10 canary responses — not exactly 10.
+
+##CODE
+%%bash
+kubectl apply -f labs/11/canary-ratio.yaml
+kubectl -n lab-11 rollout status deploy/api-stable --timeout=180s
+kubectl -n lab-11 rollout status deploy/api-canary --timeout=120s
+kubectl -n lab-11 exec client -- sh -c 'for i in $(seq 1 100); do curl -s http://api; done' | sort | uniq -c
+
+##MD
+**Expected (numbers vary):**
+```
+  11 CANARY
+  89 stable
+```
+To promote: update `api-stable` to the new version and delete the canary. To abort: scale `api-canary` to 0.
+
+### Lab B: weighted canary with ingress-nginx annotations
+
+ingress-nginx can split traffic by **weight** between two Ingress objects for the same host. The second Ingress has `canary: "true"`.
+
+Note: the community **ingress-nginx project was retired in 2026** (no more fixes). It still works for learning. In production, use a maintained controller and prefer **Gateway API** `HTTPRoute` weights (notebook 04) or Argo Rollouts.
+
+First make sure the ingress controller from notebook 04 exists. This cell installs it only if missing.
+
+##CODE
+%%bash
+if kubectl get ns ingress-nginx >/dev/null 2>&1; then
+  echo "ingress-nginx already installed"
+else
+  kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+fi
+kubectl -n ingress-nginx wait --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=180s
+
+##CODE
+%%writefile labs/11/canary-ingress.yaml
+apiVersion: v1
+kind: Service
+metadata: {name: api-stable-svc, namespace: lab-11}
+spec:
+  selector: {app: api, track: stable}       # Only stable pods
+  ports: [{port: 80, targetPort: 5678}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api-canary-svc, namespace: lab-11}
+spec:
+  selector: {app: api, track: canary}       # Only canary pods
+  ports: [{port: 80, targetPort: 5678}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-main
+  namespace: lab-11
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.lab11.local                 # We send this Host header with curl
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: api-stable-svc, port: {number: 80}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-canary
+  namespace: lab-11
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"         # This Ingress is the canary of api-main
+    nginx.ingress.kubernetes.io/canary-weight: "20"    # 20% of requests go here
+    # Other options: canary-by-header: "X-Canary" (send only testers), canary-by-cookie
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.lab11.local                 # Same host as main Ingress
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: api-canary-svc, port: {number: 80}}}
+
+##MD
+Now the split is by weight, **not by pod count**. Even with 9 stable pods and 1 canary pod, the canary gets about 20%. We call through the ingress from your Mac (`localhost:80` is mapped into kind).
+
+##CODE
+%%bash
+kubectl apply -f labs/11/canary-ingress.yaml
+sleep 5
+for i in $(seq 1 100); do curl -s -H "Host: api.lab11.local" http://localhost/; done | sort | uniq -c
+
+##MD
+**Expected:** about 20 `CANARY`, 80 `stable`. Change `canary-weight` to `50`, re-apply, and run again.
+
+### Concept: Argo Rollouts (progressive delivery)
+**Argo Rollouts** replaces the Deployment with a `Rollout` object. It runs canary steps **automatically** and can **analyse metrics** (for example from Prometheus) and abort by itself.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: api}
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10            # 10% traffic to new version
+        - pause: {duration: 5m}    # watch metrics for 5 minutes
+        - analysis:                # run a Prometheus query; fail = automatic rollback
+            templates: [{templateName: error-rate-below-1pct}]
+        - setWeight: 50
+        - pause: {duration: 10m}
+        - setWeight: 100
+  selector: {matchLabels: {app: api}}
+  template: { ... same as a Deployment pod template ... }
+```
+
+### Troubleshooting canary
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Canary gets 0% via ingress | Canary Ingress host/path differs from main | Use exactly the same host and path |
+| Canary gets 50% with replica ratio | Service selects pods unevenly (few replicas) | Use more replicas or weighted routing |
+| Cannot tell if canary is bad | No metrics split by version | Add a `version`/`track` label to metrics (notebook 12) |
+
+### Check yourself
+1. Why is replica-ratio canary "coarse"?
+2. With ingress-nginx canary-weight 20, does pod count matter?
+3. What does Argo Rollouts add on top of manual canary?
+
+<details><summary>Answer</summary>
+
+1. The percentage depends on pod counts: to get 1% you need 99 stable + 1 canary pods.
+2. No. The ingress splits traffic by weight between the two Services.
+3. Automated steps, pauses, metric analysis, and automatic abort/rollback.
+</details>
+
+##MD
+---
+## 12. Deployment strategy comparison
+
+| Strategy | How | Mixed versions? | Extra capacity | Rollback speed | Risk | Use when |
+|---|---|---|---|---|---|---|
+| **Recreate** | Stop all old, then start new | No | None | Slow (redeploy) | Downtime | Dev, or app cannot run two versions at once |
+| **Rolling update** | Replace pods a few at a time | Yes, during rollout | Small (`maxSurge`) | Medium (`rollout undo`) | Low–medium | Default for most stateless apps |
+| **Blue-green** | Two full stacks, switch selector | No | 2x | Instant | Low | Big changes, need instant rollback |
+| **Canary** | Small % to new, increase step by step | Yes, on purpose | Small | Fast | Lowest blast radius | High-traffic, critical services with good metrics |
+
+---
+## 13. Interview and real-world questions
+
+1. Explain GitOps to a manager in two sentences.
+2. Your Argo CD app is `Synced` but `Degraded`. What do you check?
+3. A rollout is stuck at 2 of 4 new pods. What are the possible reasons?
+4. How do you handle secrets in a GitOps repo?
+5. How would you design CI/CD for 3 environments (dev, stage, prod) on OKE with Azure DevOps and Argo CD?
+6. Rolling update vs blue-green for a service that changes its database schema — which and why?
+
+<details><summary>Answer</summary>
+
+1. All changes to our systems are made in Git, reviewed, and recorded. A tool in the cluster keeps the cluster exactly equal to Git and fixes any manual changes.
+2. Argo CD only reports health. Check the pods: `kubectl describe`, events, logs, readiness probe. Synced only means the YAML matches Git.
+3. New pods Pending (no capacity for surge), CrashLoopBackOff, failing readiness, image pull errors, PDB or quota limits. Use `kubectl describe deploy`, `get rs`, `describe pod`.
+4. Never plain Secrets. Use Sealed Secrets (encrypted in Git, decrypted in cluster), SOPS with a KMS (e.g. OCI Vault), or External Secrets Operator reading from a vault.
+5. Azure DevOps: build, test, scan, push image to OCIR tagged with SHA, then update the image tag in a config repo (`envs/dev`). Argo CD auto-syncs dev. Promotion to stage/prod = pull request changing the tag in `envs/stage` / `envs/prod`, with approvals. Argo CD in each cluster (or one hub) with SSO and AppProjects.
+6. Either can work only with **backward-compatible migrations** (expand/contract). Blue-green gives instant rollback, but rollback still needs the old code to work with the new schema. Rolling has both versions live at the same time, so compatibility is mandatory.
+</details>
+
+##MD
+---
+## 14. Practical assignment
+
+**Scenario:** Your team's `checkout` service must move to GitOps. Rules:
+- The app must be deployed by Argo CD from a Git repo **you** own (a public GitHub repo is fine).
+- 3 replicas, rolling update that never loses capacity.
+- A change of replicas made by hand must be reverted automatically.
+- You must show a rollback done **the GitOps way**.
+
+**Success criteria**
+1. `kubectl -n argocd get application checkout` shows `Synced` and `Healthy`.
+2. Deployment has `maxUnavailable: 0`.
+3. `kubectl scale --replicas=1` is reverted to 3.
+4. You changed the text in Git to v2, saw it deployed, then went back to v1 with `git revert`.
+
+**Hints:** copy the `shop` Deployment and Service from section 9 into a folder `checkout/` in your repo. Use the `guestbook-app.yaml` as a template.
+
+<details><summary>Solution</summary>
+
+1. Create repo `k8s-gitops-lab` with `checkout/deployment.yaml` (from section 9: name `checkout`, `replicas: 3`, `maxSurge: 1`, `maxUnavailable: 0`, text `checkout v1`) and `checkout/service.yaml`.
+2. Application:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: {name: checkout, namespace: argocd}
+spec:
+  project: default
+  source: {repoURL: https://github.com/<you>/k8s-gitops-lab.git, targetRevision: main, path: checkout}
+  destination: {server: https://kubernetes.default.svc, namespace: lab-11-checkout}
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]
+```
+3. `kubectl -n lab-11-checkout scale deploy checkout --replicas=1` → watch it return to 3.
+4. Edit text to `checkout v2`, commit, push. Wait up to 3 minutes (or click Refresh). Then `git revert HEAD && git push`. Argo CD deploys v1 again. Git history shows both changes with authors and times.
+</details>
+
+##MD
+---
+## 15. Break it challenge
+
+Apply this. Then find out why the rollout never finishes, and fix it **without deleting the Deployment**.
+
+##CODE
+%%writefile labs/11/break-it.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-rollout
+  namespace: lab-11
+spec:
+  replicas: 3
+  progressDeadlineSeconds: 60
+  selector: {matchLabels: {app: broken-rollout}}
+  strategy:
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  template:
+    metadata: {labels: {app: broken-rollout}}
+    spec:
+      containers:
+        - name: web
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=v1"]
+          ports: [{containerPort: 5678}]
+          readinessProbe: {httpGet: {path: /, port: 5678}, periodSeconds: 2}
+
+##CODE
+%%bash
+kubectl apply -f labs/11/break-it.yaml
+kubectl -n lab-11 rollout status deploy/broken-rollout --timeout=90s
+# Now the "release":
+kubectl -n lab-11 patch deploy broken-rollout --type=json -p='[
+ {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/port","value":8080}]'
+kubectl -n lab-11 rollout status deploy/broken-rollout --timeout=90s || echo "ROLLOUT FAILED - investigate!"
+
+##MD
+Investigate with: `kubectl -n lab-11 get rs,pods -l app=broken-rollout`, `kubectl -n lab-11 describe pod <new-pod>`, `kubectl -n lab-11 describe deploy broken-rollout`.
+
+<details><summary>Solution</summary>
+
+- The new pod's readiness probe checks port **8080**, but the app listens on **5678**. Events show `Readiness probe failed: ... connection refused`.
+- Because `maxUnavailable: 0`, Kubernetes keeps all 3 old pods running. **Users had no outage** — this is why `maxUnavailable: 0` + readiness probes are safe.
+- After 60 s the Deployment gets condition `Progressing=False, reason ProgressDeadlineExceeded`.
+- Fix: `kubectl -n lab-11 rollout undo deploy/broken-rollout` (or patch the port back to 5678).
+</details>
+
+##MD
+---
+## 16. Cleanup
+
+This stops the port-forward, deletes the Argo CD application and its namespace, the lab namespace, and Argo CD itself. If you want to keep Argo CD for the assignment, skip the last two lines.
+
+##CODE
+%%bash
+[ -f labs/11/pf-argocd.pid ] && kill $(cat labs/11/pf-argocd.pid) 2>/dev/null; rm -f labs/11/pf-argocd.pid
+kubectl -n argocd delete application guestbook --ignore-not-found --wait=true
+kubectl delete namespace lab-11-guestbook --ignore-not-found
+kubectl delete namespace lab-11 --ignore-not-found
+# Remove Argo CD (skip these two lines to keep it):
+kubectl delete -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --ignore-not-found >/dev/null
+kubectl delete namespace argocd --ignore-not-found
+echo "Cleanup done."
+
+##MD
+**Next notebook:** [12-Observability.ipynb](12-Observability.ipynb) — logs, metrics, Prometheus, Grafana, Alertmanager, Loki, and tracing.
